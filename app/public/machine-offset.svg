@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 400" fill="none">
+  <!-- Stylized side-view: 4-unit offset press. 2px ink-700 strokes, CMYK dots on the four units -->
+  <g stroke="#343947" stroke-width="2" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M40 300l50-150h60l-30 150z" fill="#F4F1EA"/>
+    <line x1="80" y1="200" x2="130" y2="200"/>
+    <line x1="70" y1="250" x2="112" y2="250"/>
+    <rect x="150" y="150" width="90" height="150" rx="6" fill="#FBFAF6"/>
+    <rect x="250" y="150" width="90" height="150" rx="6" fill="#FBFAF6"/>
+    <rect x="350" y="150" width="90" height="150" rx="6" fill="#FBFAF6"/>
+    <rect x="450" y="150" width="90" height="150" rx="6" fill="#FBFAF6"/>
+    <line x1="150" y1="180" x2="540" y2="180"/>
+    <path d="M540 300l40-120h40l-20 120z" fill="#F4F1EA"/>
+    <line x1="600" y1="180" x2="548" y2="260"/>
+    <rect x="60" y="300" width="540" height="14" fill="#EAE6DA"/>
+    <line x1="30" y1="330" x2="620" y2="330" stroke-width="3"/>
+    <rect x="140" y="120" width="420" height="20" rx="6" fill="#EAE6DA"/>
+  </g>
+  <g>
+    <circle cx="195" cy="230" r="18" stroke="#343947" stroke-width="2" fill="none"/>
+    <circle cx="295" cy="230" r="18" stroke="#343947" stroke-width="2" fill="none"/>
+    <circle cx="395" cy="230" r="18" stroke="#343947" stroke-width="2" fill="none"/>
+    <circle cx="495" cy="230" r="18" stroke="#343947" stroke-width="2" fill="none"/>
+    <circle cx="195" cy="230" r="7" fill="#0284C7"/>
+    <circle cx="295" cy="230" r="7" fill="#DB2777"/>
+    <circle cx="395" cy="230" r="7" fill="#EAB308"/>
+    <circle cx="495" cy="230" r="7" fill="#15171E"/>
+  </g>
+  <path d="M92 288h100l60-40h240l64 52h40" fill="none" stroke="#0EA5E9" stroke-width="3" stroke-dasharray="10 8"/>
+</svg>

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 360" fill="none">
+  <!-- Flat: stack of paper sheets, cyan crop marks, magnifier, magenta dashed bleed on top sheet -->
+  <g stroke="#0284C7" stroke-width="4" stroke-linecap="round">
+    <path d="M96 52v34M62 86h34"/>
+    <path d="M384 52v34M418 86h-34"/>
+    <path d="M96 308v-34M62 274h34"/>
+    <path d="M384 308v-34M418 274h-34"/>
+  </g>
+  <rect x="142" y="118" width="196" height="150" rx="10" fill="#EAE6DA"/>
+  <rect x="132" y="104" width="196" height="150" rx="10" fill="#F4F1EA" stroke="#D4CFC0" stroke-width="2"/>
+  <rect x="122" y="90" width="196" height="150" rx="10" fill="#FFFFFF" stroke="#15171E" stroke-width="2.5"/>
+  <rect x="134" y="102" width="172" height="126" rx="6" stroke="#DB2777" stroke-width="2" stroke-dasharray="8 7"/>
+  <rect x="146" y="116" width="96" height="12" rx="6" fill="#0284C7" opacity="0.85"/>
+  <rect x="146" y="140" width="140" height="7" rx="3.5" fill="#E6E2D6"/>
+  <rect x="146" y="156" width="120" height="7" rx="3.5" fill="#E6E2D6"/>
+  <rect x="146" y="172" width="130" height="7" rx="3.5" fill="#E6E2D6"/>
+  <rect x="146" y="196" width="62" height="16" rx="8" fill="#E0F2FE"/>
+  <circle cx="330" cy="180" r="52" fill="#E0F2FE" fill-opacity="0.35" stroke="#15171E" stroke-width="6"/>
+  <line x1="368" y1="218" x2="404" y2="254" stroke="#15171E" stroke-width="12" stroke-linecap="round"/>
+  <circle cx="330" cy="180" r="30" stroke="#0284C7" stroke-width="3" stroke-dasharray="5 6"/>
+</svg>

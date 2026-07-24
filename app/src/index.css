@@ -1,0 +1,134 @@
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@200..1000&family=Space+Grotesk:wght@400..700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* --- ARTeam PrintFlow design tokens (design.md §2) --- */
+    --paper-50: #FBFAF6;
+    --paper-100: #F4F1EA;
+    --paper-200: #EAE6DA;
+    --surface: #FFFFFF;
+    --line: #E6E2D6;
+    --line-strong: #D4CFC0;
+    --ink-900: #15171E;
+    --ink-700: #343947;
+    --ink-500: #6B7280;
+    /* was #9AA1AF (~2.9:1 on white, below WCAG AA for small text) — raised to pass 4.5:1 */
+    --ink-400: #6B7280;
+    --sidebar-900: #0E1220;
+    --sidebar-800: #161B2E;
+    --cyan-600: #0284C7;
+    --cyan-500: #0EA5E9;
+    --cyan-100: #E0F2FE;
+    --cyan-50: #F0F9FF;
+    --magenta-600: #DB2777;
+    --yellow-500: #EAB308;
+    --success-600: #16A34A;
+    --warning-600: #D97706;
+    --danger-600: #DC2626;
+
+    /* elevation */
+    --shadow-card: 0 1px 2px rgba(21, 23, 30, 0.05), 0 10px 28px -14px rgba(21, 23, 30, 0.14);
+    --shadow-pop: 0 24px 64px -20px rgba(21, 23, 30, 0.3);
+    --shadow-focus: 0 0 0 3px rgba(2, 132, 199, 0.22);
+
+    /* shadcn compatibility tokens (light theme) */
+    --background: 43 33% 97%;
+    --foreground: 225 16% 10%;
+    --card: 0 0% 100%;
+    --card-foreground: 225 16% 10%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 225 16% 10%;
+    --primary: 199 98% 39%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 45 24% 94%;
+    --secondary-foreground: 225 16% 10%;
+    --muted: 45 24% 94%;
+    --muted-foreground: 220 9% 46%;
+    --accent: 204 100% 97%;
+    --accent-foreground: 199 98% 39%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 45 17% 87%;
+    --input: 42 13% 79%;
+    --ring: 199 98% 39%;
+    --radius: 0.625rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    font-family: 'Cairo', ui-sans-serif, system-ui, sans-serif;
+  }
+
+  body {
+    @apply text-[15px] leading-6;
+    background-color: var(--paper-50);
+    color: var(--ink-700);
+    /* subtle warm paper grain overlay */
+    background-image: url('/paper-grain.png');
+    background-size: 512px;
+  }
+
+  ::selection {
+    background: var(--cyan-100);
+  }
+
+  /* Global, clearly-visible focus ring for interactive elements (a11y) */
+  :where(a, button, input, select, textarea, summary, [role='button'], [role='switch'], [tabindex]):focus-visible {
+    outline: 2px solid var(--cyan-600);
+    outline-offset: 2px;
+  }
+
+  /* numeric / latin runs: Space Grotesk + tabular figures */
+  .font-latin {
+    font-family: 'Space Grotesk', ui-monospace, monospace;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    font-feature-settings: 'tnum';
+  }
+}
+
+@layer utilities {
+  /* halftone layer slow drift (welcome band) — GPU-only transform */
+  .halftone-drift {
+    animation: halftone-drift 14s ease-in-out infinite alternate;
+    will-change: transform;
+  }
+
+  @keyframes halftone-drift {
+    from {
+      transform: translateX(-8px);
+    }
+    to {
+      transform: translateX(8px);
+    }
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Respect prefers-reduced-motion: stop infinite/ambient CSS animations
+   and collapse transitions. JS counters (KpiCard / WasteMeter / Login motifs)
+   check matchMedia separately. */
+@media (prefers-reduced-motion: reduce) {
+  .halftone-drift {
+    animation: none;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

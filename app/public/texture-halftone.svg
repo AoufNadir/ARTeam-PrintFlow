@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- Halftone dot gradient tile: ink dots ramping 2.5px -> 0 left-to-right (tileable via pattern) -->
+  <defs>
+    <linearGradient id="ramp" x1="1" y1="0" x2="0" y2="0">
+      <stop offset="0" stop-color="#15171E" stop-opacity="1"/>
+      <stop offset="1" stop-color="#15171E" stop-opacity="0"/>
+    </linearGradient>
+    <mask id="fade">
+      <rect width="512" height="512" fill="url(#ramp)"/>
+    </mask>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="6" cy="6" r="2.5" fill="#15171E"/>
+      <circle cx="18" cy="18" r="2.5" fill="#15171E"/>
+    </pattern>
+  </defs>
+  <rect width="512" height="512" fill="url(#dots)" mask="url(#fade)"/>
+</svg>

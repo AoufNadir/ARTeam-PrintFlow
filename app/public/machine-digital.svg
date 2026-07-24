@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 400" fill="none">
+  <!-- Stylized side-view: digital production press. 2px ink-700 strokes, cyan paper path -->
+  <g stroke="#343947" stroke-width="2" stroke-linejoin="round" stroke-linecap="round">
+    <rect x="120" y="120" width="360" height="200" rx="10" fill="#FBFAF6"/>
+    <rect x="120" y="120" width="360" height="34" rx="10" fill="#EAE6DA"/>
+    <rect x="140" y="176" width="120" height="120" rx="6" fill="#F4F1EA"/>
+    <line x1="140" y1="206" x2="260" y2="206"/>
+    <line x1="140" y1="236" x2="260" y2="236"/>
+    <rect x="300" y="180" width="120" height="70" rx="6" fill="#E0F2FE" stroke="#0284C7"/>
+    <line x1="314" y1="200" x2="392" y2="200" stroke="#0284C7" stroke-width="3"/>
+    <line x1="314" y1="216" x2="372" y2="216" stroke="#0284C7" stroke-width="3"/>
+    <circle cx="450" cy="215" r="26"/>
+    <circle cx="450" cy="215" r="10"/>
+    <rect x="120" y="266" width="360" height="54" rx="6" fill="#F4F1EA"/>
+    <path d="M60 200h60v60H60z" fill="#F4F1EA"/>
+    <path d="M480 236l60-16v80l-60 16z" fill="#F4F1EA"/>
+    <line x1="520" y1="220" x2="480" y2="236"/>
+    <line x1="100" y1="340" x2="540" y2="340" stroke-width="3"/>
+    <line x1="160" y1="320" x2="160" y2="340"/>
+    <line x1="440" y1="320" x2="440" y2="340"/>
+  </g>
+  <path d="M84 230h76v-14h140l40 30h110v-20h66" fill="none" stroke="#0EA5E9" stroke-width="3" stroke-dasharray="10 8"/>
+  <circle cx="132" cy="137" r="4" fill="#0284C7"/>
+  <circle cx="148" cy="137" r="4" fill="#DB2777"/>
+  <circle cx="164" cy="137" r="4" fill="#EAB308"/>
+</svg>

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240">
+  <!-- Blueprint measurement grid: 24px light lines + stronger 120px lines, transparent bg -->
+  <g stroke="#15171E" stroke-opacity="0.35" stroke-width="0.75">
+    <path d="M24 0v240M48 0v240M72 0v240M96 0v240M144 0v240M168 0v240M192 0v240M216 0v240"/>
+    <path d="M0 24h240M0 48h240M0 72h240M0 96h240M0 144h240M0 168h240M0 192h240M0 216h240"/>
+  </g>
+  <g stroke="#15171E" stroke-opacity="0.7" stroke-width="1.25">
+    <path d="M0.5 0v240M120.5 0v240M0 0.5h240M0 120.5h240"/>
+  </g>
+</svg>
