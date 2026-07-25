@@ -1,0 +1,8 @@
+app/.env.local
+app/.env.*.local
+.tmp-test/
+.vscode/
+*.zip
+test-results/
+app/test-results/
+package-lock.json
