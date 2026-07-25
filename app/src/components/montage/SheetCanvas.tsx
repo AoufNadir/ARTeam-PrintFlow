@@ -501,11 +501,6 @@ export default function SheetCanvas(props: SheetCanvasProps) {
     return rectBounds(selectedEntries.map(({ piece }) => piece));
   }, [selectedEntries]);
 
-  const keyEntry = useMemo(
-    () => selectedEntries.find(({ id }) => id === keyObjectId) ?? null,
-    [selectedEntries, keyObjectId],
-  );
-
   const firstInvalidPiece = useCallback(
     (layout: PlacedPiece[]): PlacedPiece | null => {
       const rects = layout.map((piece) => ({ x: piece.x, y: piece.y, w: piece.w, h: piece.h }));
@@ -588,15 +583,32 @@ export default function SheetCanvas(props: SheetCanvasProps) {
   const alignSelection = useCallback(
     (command: AlignCommand) => {
       if (selectedEntries.length === 0) return;
-      const reference =
-        selectedEntries.length === 1
-          ? area
-          : keyEntry
-            ? { x: keyEntry.piece.x, y: keyEntry.piece.y, w: keyEntry.piece.w, h: keyEntry.piece.h }
-            : selectionBounds;
-      if (!reference) return;
-
       const ids = new Set(selectedIds);
+
+      // Multi-select / editor group: move the selection as one rigid body so
+      // align tools work after Ctrl+G (per-piece align stacked everything and
+      // was rejected as overlap).
+      if (selectedEntries.length > 1 && selectionBounds) {
+        let dx = 0;
+        let dy = 0;
+        if (command === 'left') dx = area.x - selectionBounds.x;
+        else if (command === 'centerX')
+          dx = area.x + area.w / 2 - (selectionBounds.x + selectionBounds.w / 2);
+        else if (command === 'right') dx = area.x + area.w - (selectionBounds.x + selectionBounds.w);
+        else if (command === 'top') dy = area.y - selectionBounds.y;
+        else if (command === 'centerY')
+          dy = area.y + area.h / 2 - (selectionBounds.y + selectionBounds.h / 2);
+        else if (command === 'bottom') dy = area.y + area.h - (selectionBounds.y + selectionBounds.h);
+        if (Math.abs(dx) < GEOMETRY_EPS && Math.abs(dy) < GEOMETRY_EPS) return;
+        const next = placed.map((piece, index) =>
+          ids.has(pieceEditorId(piece, index)) ? { ...piece, x: piece.x + dx, y: piece.y + dy } : piece,
+        );
+        commitValidatedEdit(next, selectedIds, 'تعذّرت المحاذاة: الوضعية الناتجة فيها تداخل أو خروج من مساحة الطباعة.');
+        return;
+      }
+
+      // Single piece: align to printable area
+      const reference = area;
       const next = placed.map((piece, index) => {
         if (!ids.has(pieceEditorId(piece, index))) return piece;
         let x = piece.x;
@@ -611,7 +623,7 @@ export default function SheetCanvas(props: SheetCanvasProps) {
       });
       commitValidatedEdit(next, selectedIds, 'تعذّرت المحاذاة: الوضعية الناتجة فيها تداخل أو خروج من مساحة الطباعة.');
     },
-    [selectedEntries, area, keyEntry, selectionBounds, selectedIds, placed, commitValidatedEdit],
+    [selectedEntries, area, selectionBounds, selectedIds, placed, commitValidatedEdit],
   );
 
   const distributeSelection = useCallback(
@@ -1283,7 +1295,7 @@ export default function SheetCanvas(props: SheetCanvasProps) {
               type="button"
               onClick={() => alignSelection('left')}
               disabled={selectedIds.size === 0}
-              title="محاذاة يسار — عنصر واحد مع الورقة، عدة عناصر مع مرجع التحديد"
+              title="محاذاة يسار — عنصر مع مساحة الطباعة، مجموعة ككتلة واحدة"
               className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
             >
               <AlignStartVertical size={14} />
@@ -1599,7 +1611,7 @@ export default function SheetCanvas(props: SheetCanvasProps) {
                 المساحة القابلة للطباعة
               </text>
 
-              {/* center cross (digital: montage is centered) */}
+              {/* registration cross at sheet center (digital) */}
               {machine.kind === 'digital' && (
                 <g stroke="var(--cyan-500)" strokeWidth={0.3} opacity={0.5}>
                   <line x1={area.x + area.w / 2 - 4} y1={area.y + area.h / 2} x2={area.x + area.w / 2 + 4} y2={area.y + area.h / 2} />

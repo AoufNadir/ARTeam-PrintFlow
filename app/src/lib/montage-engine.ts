@@ -1,4 +1,4 @@
-// ---------------------------------------------------------------------------
+﻿// ---------------------------------------------------------------------------
 // Smart imposition (مونتاج) engine.
 // Pure & deterministic. All coordinates in mm, sheet origin at top-left.
 //
@@ -26,8 +26,8 @@
 //    The larger dimension keeps the normal machine margins (+ prise de pince
 //    as before).
 //
-//  - machine constraints: digital (non-printable margins, layout centered in
-//    printable area) & offset (prise de pince strip on the LARGEST edge)
+//  - machine constraints: digital (margins, block fully centered in printable
+//    area) & offset (prise de pince + centered horizontally, gravity to grip)
 //  - both rotations tried per group; layout maximizes pieces/sheet and
 //    minimizes waste; alternatives = other sheet sizes ranked.
 // ---------------------------------------------------------------------------
@@ -1494,28 +1494,24 @@ function evaluateCandidates(
     if (seenPacks.has(packSig)) continue;
     seenPacks.add(packSig);
 
-    // الترسيخ على حافة المسكة بضغط الجاذبية (معتمد — انظر gravityCompact):
-    // بدل إزاحة البلوك الكلي كصندوق إحاطة واحد، تُسقَط كل قطعة عمودياً إلى
-    // أدنى موضع ممكن — قاع مساحة العمل أو قمة خلية تحتها — فترتكز كل كتلة/
-    // عمود على خط الأساس نفسه ويكون الفراغ الحر كله في الأعلى. أفقياً يبقى
-    // البلوك متمركزاً كما كان، وفي bascule/double-pince يُضغط النصف الأول هنا
-    // ثم تُشتق المرآة بعده (أدناه) فيبقى التماثل تاماً حول محور القلب.
+    // التوسيط: الرقمية مركز تام أفقياً وعمودياً داخل مساحة الطباعة (أوفست:
+    // توسيط أفقي فقط ثم جاذبية نحو المسكة).
     const blockW = Math.max(...pieces.map((p) => p.x + p.w));
-    const offX = workArea.x + (workArea.w - blockW) / 2;
-    let placed: PlacedPiece[] = gravityCompact(
-      pieces.map((p) => ({
-        x: p.x + offX,
-        y: p.y + workArea.y,
-        w: p.w,
-        h: p.h,
-        rotated: p.rotated,
-        groupId: p.groupId,
-        color: p.color,
-        ...(p.bleed ? { bleed: p.bleed } : {}),
-      })),
-      workArea,
-      gap,
-    );
+    const blockH = Math.max(...pieces.map((p) => p.y + p.h));
+    const digital = machine?.kind === 'digital';
+    const offX = anchorOffsetX(workArea, blockW);
+    const offY = anchorOffsetY(workArea, blockH, machine);
+    const localPlaced: PlacedPiece[] = pieces.map((p) => ({
+      x: p.x + offX,
+      y: p.y + offY,
+      w: p.w,
+      h: p.h,
+      rotated: p.rotated,
+      groupId: p.groupId,
+      color: p.color,
+      ...(p.bleed ? { bleed: p.bleed } : {}),
+    }));
+    let placed: PlacedPiece[] = digital ? localPlaced : gravityCompact(localPlaced, workArea, gap);
 
     if (halved && flip) {
       // mirror across the absolute sheet axis (midpoint of the smaller dim) —
@@ -2272,6 +2268,7 @@ function buildFixedSuggestion(
   flip: FlipAxisInfo | null,
   gap: GapFn = ZERO_GAP,
   opts?: { accept?: (pack: FixedPackPiece[]) => boolean; candidateMode?: FixedCandidateMode },
+  machine?: Machine,
 ): FixedMontageSuggestion | undefined {
   const sugNeed = new Map<string, number>();
   for (const g of groups) {
@@ -2301,7 +2298,7 @@ function buildFixedSuggestion(
   }
   if (!pack) return undefined;
 
-  const placed = finalizeFixedPlaced(pack, workArea, halved, flip, gap);
+  const placed = finalizeFixedPlaced(pack, workArea, halved, flip, gap, machine);
   const perGroup: Record<string, number> = {};
   for (const p of placed) perGroup[p.groupId] = (perGroup[p.groupId] ?? 0) + 1;
   let sheetsNeeded = 0;
@@ -2317,34 +2314,42 @@ function buildFixedSuggestion(
   };
 }
 
-/** Anchor a fixed pack to the grip edge via vertical gravity compaction, then mirror it for halved methods. */
+/** Horizontal anchor: centered in work area (digital & offset). */
+function anchorOffsetX(workArea: Rect, blockW: number): number {
+  return workArea.x + Math.max(0, workArea.w - blockW) / 2;
+}
+
+/** Vertical anchor: digital = centered; offset = top (gravity later drops to grip). */
+function anchorOffsetY(workArea: Rect, blockH: number, machine?: Machine): number {
+  if (machine?.kind === 'digital') return workArea.y + Math.max(0, workArea.h - blockH) / 2;
+  return workArea.y;
+}
+
+/** Place a fixed pack into the work area (digital fully centered / offset gravity to grip), then mirror if halved. */
 function finalizeFixedPlaced(
   pack: FixedPackPiece[],
   workArea: Rect,
   halved: boolean,
   flip: FlipAxisInfo | null,
   gap: GapFn = ZERO_GAP,
+  machine?: Machine,
 ): PlacedPiece[] {
   const blockW = Math.max(...pack.map((p) => p.x + p.w));
-  // الترسيخ بضغط الجاذبية (معتمد — انظر gravityCompact): كل قطعة تهبط عمودياً
-  // حتى قاع مساحة العمل أو قمة خلية تحتها — خط أساس واحد لكل الكتل والفراغ
-  // الحر في الأعلى؛ المرآة تُشتق بعد الضغط فيبقى التماثل تاماً، والـbleed
-  // (ضمن خلية التصادم) لا يدخل شريط المسكة ولا يخرج عن الورقة
-  const offX = workArea.x + (workArea.w - blockW) / 2;
-  let placed: PlacedPiece[] = gravityCompact(
-    pack.map((p) => ({
-      x: p.x + offX,
-      y: p.y + workArea.y,
-      w: p.w,
-      h: p.h,
-      rotated: p.rotated,
-      groupId: p.groupId,
-      color: p.color,
-      ...(p.bleed ? { bleed: p.bleed } : {}),
-    })),
-    workArea,
-    gap,
-  );
+  const blockH = Math.max(...pack.map((p) => p.y + p.h));
+  const digital = machine?.kind === 'digital';
+  const offX = anchorOffsetX(workArea, blockW);
+  const offY = anchorOffsetY(workArea, blockH, machine);
+  const localPlaced: PlacedPiece[] = pack.map((p) => ({
+    x: p.x + offX,
+    y: p.y + offY,
+    w: p.w,
+    h: p.h,
+    rotated: p.rotated,
+    groupId: p.groupId,
+    color: p.color,
+    ...(p.bleed ? { bleed: p.bleed } : {}),
+  }));
+  let placed: PlacedPiece[] = digital ? localPlaced : gravityCompact(localPlaced, workArea, gap);
   if (halved && flip) {
     placed = placed.concat(mirrorPieces(placed, flip.axis, flip.position));
   }
@@ -2394,7 +2399,7 @@ export function computeFixedMontage(input: FixedMontageInput, machine?: Machine)
   // القص الشريحي وقاعدة الترسيخ والترتيب الحجمي الصاعد بعد الترسيخ والمرآة.
   const guillotine = input.cutMethod === 'guillotine';
   const accept = (pack: FixedPackPiece[]) => {
-    const fin = finalizeFixedPlaced(pack, workArea, halved, flip, gap);
+    const fin = finalizeFixedPlaced(pack, workArea, halved, flip, gap, machine);
     if (!layoutGapsOk(fin, gap)) return false;
     if (!guillotine) return true;
     return assertCutPattern(fin, flip) !== 'invalid' && anchoredOrderOk(fin, workArea, flip);
@@ -2414,11 +2419,11 @@ export function computeFixedMontage(input: FixedMontageInput, machine?: Machine)
         ? 'الأعداد المطلوبة لا تسع بأنماط القص المستقيم (صفوف/أعمدة/بلوكات متجانسة) — قلّل الأعداد أو وسّع الورقة أو بدّل إلى القص بالقالب (die-cut).'
         : 'الأعداد المطلوبة لا تسع معاً في الورقة الواحدة — قلّل الأعداد أو وسّع الورقة أو غيّر طريقة الطباعة.',
       maxPerGroup,
-      suggestion: buildFixedSuggestion(workArea, full, groups, primaryNeed, maxPrimary, halved, flip, gap, packOpts),
+      suggestion: buildFixedSuggestion(workArea, full, groups, primaryNeed, maxPrimary, halved, flip, gap, packOpts, machine),
     };
   }
 
-  const placed = finalizeFixedPlaced(best, workArea, halved, flip, gap);
+  const placed = finalizeFixedPlaced(best, workArea, halved, flip, gap, machine);
   const cutPattern = guillotine ? assertCutPattern(placed, flip) : undefined;
   // دفاع أخير مستقل عن فلترة المرشحين: لا تُرجع نتيجة Guillotine غير مصنفة.
   if (cutPattern === 'invalid') {

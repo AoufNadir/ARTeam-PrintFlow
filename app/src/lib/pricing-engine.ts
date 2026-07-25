@@ -39,6 +39,8 @@ export interface PriceInput {
   rules: PricingRule[];
 }
 
+export const DESIGN_SIZE_FIELD = '__designSize';
+
 const EMPTY: PriceBreakdown = {
   paper: 0, printing: 0, cutting: 0, finishing: 0,
   waste: 0, overhead: 0, margin: 0, subtotal: 0, unitPrice: 0, total: 0,
@@ -286,6 +288,10 @@ export function priceItem(
       pieceSize = { widthMm: v.widthMm, heightMm: v.heightMm };
       pieceAreaM2 = (v.widthMm / 1000) * (v.heightMm / 1000);
     }
+  }
+  const detectedSize = fieldValues[DESIGN_SIZE_FIELD];
+  if (!pieceSize && isDimension(detectedSize)) {
+    pieceSize = { widthMm: detectedSize.widthMm, heightMm: detectedSize.heightMm };
   }
   if (!pieceSize && service.defaultPieceSize) {
     pieceSize = { ...service.defaultPieceSize };

@@ -4,6 +4,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import { Check, Eye, EyeOff } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { SESSION_KEY } from '@/lib/session';
+import { isSupabaseConfigured, signInWithSupabase } from '@/lib/supabase';
 
 const EASE = [0.22, 0.68, 0.26, 1] as [number, number, number, number];
 
@@ -127,6 +128,20 @@ export default function Login() {
     // distinct messages: missing fields vs. wrong credentials
     if (!identifier.trim() || !password.trim()) {
       flashError('هذه الحقول مطلوبة — أدخل بريدك الإلكتروني (أو هاتفك) وكلمة المرور للمتابعة.');
+      return;
+    }
+    if (isSupabaseConfigured) {
+      setLoading('form');
+      signInWithSupabase(identifier.trim(), password)
+        .then(() => {
+          setDone(true);
+          const from = (location.state as { from?: string } | null)?.from;
+          setTimeout(() => navigate(from && from !== '/login' ? from : '/'), 500);
+        })
+        .catch(() => {
+          flashError('تعذر تسجيل الدخول عبر Supabase — تحقق من البريد وكلمة المرور.');
+          setLoading(null);
+        });
       return;
     }
     go('form', () =>

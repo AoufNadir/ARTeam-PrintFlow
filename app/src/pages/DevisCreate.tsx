@@ -54,11 +54,22 @@ import {
 import { isSectionDisabled, isServiceDisabled } from '@/components/builder/meta';
 import { useUnit } from '@/components/layout-context';
 import DesignFileUploader from '@/components/montage/DesignFileUploader';
-import type { Sticker } from '@/components/montage/montage-data';
+import {
+  MONTAGE_MACHINES,
+  normalizeSheetForKind,
+  type CutMethod,
+  type MontageUIState,
+  type Sticker,
+} from '@/components/montage/montage-data';
 import { logAudit } from '@/components/settings/audit';
 import { designNameFromAsset, type DesignFileAsset } from '@/lib/design-file-types';
 import { computeMontage } from '@/lib/montage-engine';
-import { percentRule, priceItem, type FieldValues } from '@/lib/pricing-engine';
+import { DESIGN_SIZE_FIELD, percentRule, priceItem, type FieldValues } from '@/lib/pricing-engine';
+import {
+  consumeMontageCommit,
+  makeMontageSessionId,
+  saveMontageSession,
+} from '@/lib/montage-session';
 import { db, uid } from '@/lib/storage';
 import type {
   Client,
@@ -68,8 +79,10 @@ import type {
   DevisItem,
   DevisStatus,
   DimensionValue,
+  MachineKind,
   MontageResult,
   MontageState,
+  MontageInput,
   PreflightCheck,
   PrintMethod,
   Project,
@@ -82,12 +95,21 @@ import { formatDA, formatPercent, round2 } from '@/lib/units';
 import { cn } from '@/lib/utils';
 
 const EASE = [0.22, 0.68, 0.26, 1] as [number, number, number, number];
-const PHASES = ['العميل والعرض', 'الخدمات والتصاميم', 'التسعير والشروط', 'المراجعة'];
+const PHASES = ['البداية', 'التصميم', 'المونتاج', 'الإنتاج والسعر'];
 const QTY_PRESETS = [100, 250, 500, 1000, 2000];
 const QUANTITY_COMPARE = [500, 1000, 2000];
 const DRAFT_RESTORE_KEY = 'arteam-printflow:devis-active-draft';
 
 type SaveState = 'idle' | 'saving' | 'saved' | 'failed';
+
+interface DevisMontageSessionPayload {
+  sectionId: string | null;
+  serviceId: string | null;
+  fieldValues: FieldValues;
+  designAssets: DesignFileAsset[];
+  cutContourAssets: DesignFileAsset[];
+  cutContourLinks: Record<string, string>;
+}
 
 function isDim(v: unknown): v is DimensionValue {
   return typeof v === 'object' && v !== null && 'widthMm' in v && 'heightMm' in v;
@@ -173,9 +195,71 @@ function buildPreflight({
 
 function phaseForStep(step: number): number {
   if (step <= 2) return 0;
-  if (step <= 4) return 1;
-  if (step === 5) return 2;
+  if (step === 3) return 1;
+  if (step === 4) return 2;
   return 3;
+}
+
+function isDesignField(fieldId: string, type: Service['fields'][number]['type']): boolean {
+  return fieldId === 'quantity' || type === 'dimensions';
+}
+
+function serviceAllowsMultipleDesigns(service: Service | undefined): boolean {
+  if (!service) return false;
+  const key = `${service.id} ${service.name} ${service.latinName ?? ''} ${service.description ?? ''}`.toLowerCase();
+  return key.includes('etiquette') || key.includes('étiquette') || key.includes('ملصق') || key.includes('multi');
+}
+
+function serviceNeedsSheetMontage(service: Service | undefined): boolean {
+  if (!service) return false;
+  return service.pricingRuleIds.some((id) => id.includes('paper') || id.includes('sheet') || id.includes('cut'));
+}
+
+function machineKindFromSection(section: Section | undefined, service: Service | undefined): MachineKind {
+  const key = `${section?.id ?? service?.sectionId ?? ''} ${section?.name ?? ''} ${section?.latinName ?? ''}`.toLowerCase();
+  return key.includes('offset') || key.includes('أوفست') ? 'offset' : 'digital';
+}
+
+function defaultStudioMachine(kind: MachineKind) {
+  return MONTAGE_MACHINES.find((machine) => machine.kind === kind) ?? MONTAGE_MACHINES[0];
+}
+
+function defaultStudioSheet(kind: MachineKind) {
+  const machine = defaultStudioMachine(kind);
+  const preferred =
+    machine.sheetSizes.find((sheet) => (kind === 'digital' ? sheet.widthMm >= 300 && sheet.heightMm >= 440 : sheet.widthMm >= 350 && sheet.heightMm >= 500)) ??
+    machine.sheetSizes[0];
+  return normalizeSheetForKind(kind, preferred.widthMm, preferred.heightMm);
+}
+
+function cutMethodFromFields(fieldValues: FieldValues): CutMethod {
+  return fieldValues['contour-cut'] === true ? 'cutcontour' : 'guillotine';
+}
+
+function signatureFromMontageInput(input: MontageInput): string {
+  const groups =
+    input.groups && input.groups.length > 0
+      ? input.groups
+      : [
+          {
+            id: 'primary',
+            widthMm: input.pieceWidthMm ?? 0,
+            heightMm: input.pieceHeightMm ?? 0,
+            quantity: input.quantity,
+            bleedMm: input.bleedMm,
+          },
+        ];
+  return JSON.stringify({
+    method: input.method,
+    cutMethod: input.cutMethod,
+    groups: groups.map((group) => ({
+      id: group.id,
+      w: round2(group.widthMm),
+      h: round2(group.heightMm),
+      q: group.quantity,
+      bleed: group.bleedMm,
+    })),
+  });
 }
 
 function loadRestorableDraft(): Devis | null {
@@ -621,6 +705,7 @@ export default function DevisCreate() {
   const [fieldValues, setFieldValues] = useState<FieldValues>({});
   const [designAssets, setDesignAssets] = useState<DesignFileAsset[]>([]);
   const [cutContourAssets, setCutContourAssets] = useState<DesignFileAsset[]>([]);
+  const [cutContourLinks, setCutContourLinks] = useState<Record<string, string>>({});
 
   // step 5 — montage
   const [montage, setMontage] = useState<MontageResult | null>(null);
@@ -644,11 +729,24 @@ export default function DevisCreate() {
   const [removeItemId, setRemoveItemId] = useState<string | null>(null);
   const [editingItemId, setEditingItemId] = useState<string | null>(null);
   const [negativeMarginConfirm, setNegativeMarginConfirm] = useState(false);
+  const montageReturnHandledRef = useRef(false);
 
   const section = sectionId ? sections.find((s) => s.id === sectionId) : undefined;
   const service: Service | undefined = serviceId ? db.services.get(serviceId) : undefined;
   const client = clientId ? clients.find((c) => c.id === clientId) : undefined;
   const project: Project | undefined = projectId ? db.projects.get(projectId) : undefined;
+  const allowsMultipleDesigns = serviceAllowsMultipleDesigns(service);
+  const maxDesigns = allowsMultipleDesigns ? 12 : 1;
+  const requiresMontage = serviceNeedsSheetMontage(service);
+  const designFields = useMemo(
+    () => service?.fields.filter((field) => isDesignField(field.id, field.type)) ?? [],
+    [service],
+  );
+  const productionFields = useMemo(
+    () => service?.fields.filter((field) => !isDesignField(field.id, field.type)) ?? [],
+    [service],
+  );
+  const montageKind = useMemo(() => machineKindFromSection(section, service), [section, service]);
 
   const quantity = useMemo(() => {
     const q = fieldValues['quantity'];
@@ -659,16 +757,86 @@ export default function DevisCreate() {
     if (!service) return undefined;
     const df = service.fields.find((f) => f.type === 'dimensions');
     const v = df ? fieldValues[df.id] : undefined;
-    return isDim(v) ? v : service.defaultPieceSize;
-  }, [service, fieldValues]);
+    const detected = fieldValues[DESIGN_SIZE_FIELD];
+    if (isDim(v)) return v;
+    if (isDim(detected)) return detected;
+    if (designAssets[0]) return { widthMm: designAssets[0].widthMm, heightMm: designAssets[0].heightMm };
+    return service.defaultPieceSize;
+  }, [service, fieldValues, designAssets]);
 
   const currentMethod = useMemo((): PrintMethod => (fieldValues['faces'] === 'recto' ? 'recto' : 'recto-verso'), [fieldValues]);
 
   const currentSig = useMemo(
-    () => JSON.stringify({ q: quantity, w: currentDims?.widthMm, h: currentDims?.heightMm, m: currentMethod }),
-    [quantity, currentDims, currentMethod],
+    () =>
+      JSON.stringify({
+        method: currentMethod,
+        cutMethod: cutMethodFromFields(fieldValues),
+        designs:
+          designAssets.length > 0
+            ? designAssets.map((asset) => ({
+                id: designAssets.length > 1 ? asset.id : 'primary',
+                w: round2(asset.widthMm),
+                h: round2(asset.heightMm),
+                q: quantity,
+                bleed: asset.detectedBleedMm ?? {
+                  top: service?.defaultBleedMm ?? 2,
+                  bottom: service?.defaultBleedMm ?? 2,
+                  left: service?.defaultBleedMm ?? 2,
+                  right: service?.defaultBleedMm ?? 2,
+                },
+              }))
+            : currentDims
+              ? [
+                  {
+                    id: 'primary',
+                    w: round2(currentDims.widthMm),
+                    h: round2(currentDims.heightMm),
+                    q: quantity,
+                    bleed: {
+                      top: service?.defaultBleedMm ?? 2,
+                      bottom: service?.defaultBleedMm ?? 2,
+                      left: service?.defaultBleedMm ?? 2,
+                      right: service?.defaultBleedMm ?? 2,
+                    },
+                  },
+                ]
+              : [],
+      }),
+    [currentMethod, fieldValues, designAssets, currentDims, quantity, service],
   );
   const montageStale = montage !== null && montageSig !== currentSig;
+
+  const uploadStickers = useMemo<Sticker[]>(() => {
+    const bleed = service?.defaultBleedMm ?? 2;
+    if (designAssets.length > 0) {
+      return designAssets.map((asset) => ({
+        id: asset.id,
+        name: designNameFromAsset(asset),
+        widthMm: asset.widthMm,
+        heightMm: asset.heightMm,
+        bleed: asset.detectedBleedMm ?? { top: bleed, bottom: bleed, left: bleed, right: bleed },
+        bleedLinked: !asset.detectedBleedMm,
+        quantity,
+        asset,
+        cutContour: cutContourAssets.find((contour) => cutContourLinks[contour.id] === asset.id),
+      }));
+    }
+    if (currentDims) {
+      return [
+        {
+          id: 'request-size',
+          name: 'مقاس الطلب',
+          widthMm: currentDims.widthMm,
+          heightMm: currentDims.heightMm,
+          bleed: { top: bleed, bottom: bleed, left: bleed, right: bleed },
+          bleedLinked: true,
+          quantity,
+          cutContour: cutContourAssets[0],
+        },
+      ];
+    }
+    return [];
+  }, [service, designAssets, cutContourAssets, cutContourLinks, currentDims, quantity]);
 
   // pricing (re-totals on every change) — paper priced from the (possibly frozen) catalog
   const breakdown = useMemo(
@@ -694,6 +862,25 @@ export default function DevisCreate() {
     const margin = round2(total - breakdown.subtotal);
     return { ...breakdown, margin, total, unitPrice };
   }, [breakdown, effectiveMargin, manualPrice, quantity]);
+
+  const designPriceRows = useMemo(() => {
+    if (!final || uploadStickers.length === 0) return [];
+    const weights = uploadStickers.map((sticker) => Math.max(1, sticker.quantity) * sticker.widthMm * sticker.heightMm);
+    const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || uploadStickers.length;
+    let allocated = 0;
+    return uploadStickers.map((sticker, index) => {
+      const isLast = index === uploadStickers.length - 1;
+      const amount = isLast ? round2(final.total - allocated) : round2((final.total * weights[index]) / totalWeight);
+      allocated = round2(allocated + amount);
+      return {
+        id: sticker.id,
+        name: sticker.name ?? `تصميم ${index + 1}`,
+        quantity: sticker.quantity,
+        amount,
+        unitPrice: round2(amount / Math.max(1, sticker.quantity)),
+      };
+    });
+  }, [final, uploadStickers]);
 
   // manual price below production cost → negative margin (warn, never save silently)
   const negativeMargin = final !== null && final.margin < -0.005;
@@ -827,6 +1014,7 @@ export default function DevisCreate() {
     setOverrideReason('');
     setDesignAssets([]);
     setCutContourAssets([]);
+    setCutContourLinks({});
     window.setTimeout(() => {
       setStep(2);
       setMaxStep((m) => Math.max(m, 2));
@@ -834,7 +1022,7 @@ export default function DevisCreate() {
   };
 
   const goToPhase = (phase: number) => {
-    const target = [0, 3, 5, 6][phase] ?? 0;
+    const target = [0, 3, 4, 5][phase] ?? 0;
     if (phase <= phaseForStep(maxStep)) setStep(Math.min(target, maxStep));
   };
 
@@ -848,38 +1036,111 @@ export default function DevisCreate() {
       toast.error('أدخل كمية صحيحة');
       return;
     }
-    const n = Math.min(step + 1, 6);
+    const n = Math.min(step + 1, 7);
     setStep(n);
     setMaxStep((m) => Math.max(m, n));
   };
 
+  const buildCurrentMontageInput = (sheet?: { w: number; h: number; machineId?: string }): MontageInput | null => {
+    const primary = uploadStickers[0];
+    if (!service || !primary) return null;
+    const fallbackSheet = defaultStudioSheet(montageKind);
+    const fallbackMachine = defaultStudioMachine(montageKind);
+    return {
+      sheetWidthMm: sheet?.w ?? fallbackSheet.sheetW,
+      sheetHeightMm: sheet?.h ?? fallbackSheet.sheetH,
+      pieceWidthMm: primary.widthMm,
+      pieceHeightMm: primary.heightMm,
+      groups:
+        uploadStickers.length > 1
+          ? uploadStickers.map((sticker, index) => ({
+              id: sticker.id,
+              name: sticker.name ?? `تصميم ${index + 1}`,
+              widthMm: sticker.widthMm,
+              heightMm: sticker.heightMm,
+              quantity: sticker.quantity,
+              bleedMm: sticker.bleed,
+            }))
+          : undefined,
+      bleedMm: primary.bleed,
+      quantity: primary.quantity,
+      method: currentMethod,
+      gutterMm: 10,
+      gripMm: 10,
+      machineId: sheet?.machineId ?? fallbackMachine.id,
+      cutMethod: cutMethodFromFields(fieldValues),
+    };
+  };
+
+  const buildStudioState = (): MontageUIState | null => {
+    const input = buildCurrentMontageInput();
+    if (!input) return null;
+    const machine = defaultStudioMachine(montageKind);
+    const sheet = defaultStudioSheet(montageKind);
+    return {
+      kind: montageKind,
+      machineId: machine.id,
+      margins: { ...machine.margins },
+      pinceMm: machine.priseDePince ?? 12,
+      sheetW: sheet.sheetW,
+      sheetH: sheet.sheetH,
+      customSheet: false,
+      autoSuggest: true,
+      calcMode: 'quantity',
+      stickers: uploadStickers,
+      bleedShared: input.bleedMm,
+      method: currentMethod,
+      gutterMm: 10,
+      gripMm: 10,
+      cutMethod: cutMethodFromFields(fieldValues),
+      sharedCut: false,
+      doubleCut: true,
+      defaultGapMm: 0,
+      pairGaps: {},
+    };
+  };
+
+  const openStudio = () => {
+    const state = buildStudioState();
+    if (!state) {
+      toast.error('أضف مقاسًا أو ملف تصميم قبل فتح الاستوديو');
+      return;
+    }
+    const sessionId = makeMontageSessionId();
+    saveMontageSession<MontageUIState, DevisMontageSessionPayload>({
+      id: sessionId,
+      source: 'devis',
+      returnTo: `${window.location.pathname}${window.location.search}`,
+      createdAt: new Date().toISOString(),
+      state,
+      payload: {
+        sectionId,
+        serviceId,
+        fieldValues,
+        designAssets,
+        cutContourAssets,
+        cutContourLinks,
+      },
+    });
+    navigate(`/montage?session=${encodeURIComponent(sessionId)}`);
+  };
+
   const runMontage = (sheet?: { w: number; h: number; machineId?: string }) => {
-    if (!service || !currentDims) {
+    const input = buildCurrentMontageInput(sheet);
+    if (!input) {
       toast.error('حدّد مقاس المنتج أولًا');
       return;
     }
-    const bleed = service.defaultBleedMm ?? 2;
-    const method = currentMethod;
-    const dims = currentDims;
     setMontageLoading(true);
     window.setTimeout(() => {
-      const result = computeMontage({
-        sheetWidthMm: sheet?.w ?? 320,
-        sheetHeightMm: sheet?.h ?? 450,
-        pieceWidthMm: dims.widthMm,
-        pieceHeightMm: dims.heightMm,
-        bleedMm: { top: bleed, bottom: bleed, left: bleed, right: bleed },
-        quantity,
-        method,
-        machineId: sheet?.machineId ?? 'machine-digital-versant',
-      });
+      const result = computeMontage(input, MONTAGE_MACHINES);
       setMontageLoading(false);
       if (!result) {
         toast.error('تعذّر حساب المونتاج لهذه الأبعاد — جرّب سعرًا يدويًا');
         return;
       }
       setMontage(result);
-      setMontageSig(currentSig);
+      setMontageSig(signatureFromMontageInput(input));
       setManualPrice(null);
       toast.success('تم حساب المونتاج الذكي');
     }, 650);
@@ -930,7 +1191,7 @@ export default function DevisCreate() {
     const itemMontageState = montageStateFrom(montage, montageStale, manualPrice);
     const attachments = [
       ...designAssets.map((asset) => attachmentOf('artwork', asset)),
-      ...cutContourAssets.map((asset) => attachmentOf('cut-contour', asset, asset.match ? asset.id : undefined)),
+      ...cutContourAssets.map((asset) => attachmentOf('cut-contour', asset, cutContourLinks[asset.id])),
     ];
     const preflight = buildPreflight({
       dims: currentDims,
@@ -963,8 +1224,8 @@ export default function DevisCreate() {
       logAudit('margin', `تعديل سعر/هامش في ${saved.number}: ${overrideReason || 'بدون سبب مفصل'}`, saved.number);
     }
     flashSaved();
-    setStep(6);
-    setMaxStep(6);
+    setStep(7);
+    setMaxStep(7);
   };
 
   const removeItem = (id: string) => {
@@ -1046,6 +1307,7 @@ export default function DevisCreate() {
     setOverrideReason('');
     setDesignAssets([]);
     setCutContourAssets([]);
+    setCutContourLinks({});
     setStep(0);
     setMaxStep(2); // client info stays valid
   };
@@ -1227,6 +1489,37 @@ export default function DevisCreate() {
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editingItemId, items]);
+
+  useEffect(() => {
+    if (montageReturnHandledRef.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const sessionId = params.get('montageSession');
+    if (!sessionId) return;
+    montageReturnHandledRef.current = true;
+    const commit = consumeMontageCommit<MontageUIState, DevisMontageSessionPayload>(sessionId);
+    if (commit) {
+      const payload = commit.session.payload;
+      if (payload) {
+        setSectionId(payload.sectionId);
+        setServiceId(payload.serviceId);
+        setFieldValues(payload.fieldValues);
+        setDesignAssets(payload.designAssets);
+        setCutContourAssets(payload.cutContourAssets);
+        setCutContourLinks(payload.cutContourLinks ?? {});
+      }
+      setMontage({ ...commit.result, placed: commit.placed });
+      setMontageSig(signatureFromMontageInput(commit.input));
+      setManualPrice(null);
+      setStep(5);
+      setMaxStep((m) => Math.max(m, 5));
+      toast.success('تم اعتماد مخطط الاستوديو داخل العرض');
+    } else {
+      toast.error('تعذر استرجاع مخطط الاستوديو');
+    }
+    params.delete('montageSession');
+    const nextQuery = params.toString();
+    navigate(`${window.location.pathname}${nextQuery ? `?${nextQuery}` : ''}`, { replace: true });
+  }, [navigate]);
 
   // ------------------------------- step 0: section ---------------------------
 
@@ -1546,177 +1839,173 @@ export default function DevisCreate() {
 
   const setField = (id: string, v: FieldValues[string]) => setFieldValues((fv) => ({ ...fv, [id]: v }));
   const dimensionFieldId = firstDimensionFieldId(service);
-  const uploadStickers = useMemo<Sticker[]>(() => {
-    const bleed = service?.defaultBleedMm ?? 2;
-    if (designAssets.length > 0) {
-      return designAssets.map((asset) => ({
-        id: asset.id,
-        name: designNameFromAsset(asset),
-        widthMm: asset.widthMm,
-        heightMm: asset.heightMm,
-        bleed: asset.detectedBleedMm ?? { top: bleed, bottom: bleed, left: bleed, right: bleed },
-        bleedLinked: !asset.detectedBleedMm,
-        quantity,
-        asset,
-        cutContour: cutContourAssets.find((contour) => contour.match?.status || contour.fileName),
-      }));
-    }
-    if (currentDims) {
-      return [
-        {
-          id: 'request-size',
-          name: 'مقاس الطلب',
-          widthMm: currentDims.widthMm,
-          heightMm: currentDims.heightMm,
-          bleed: { top: bleed, bottom: bleed, left: bleed, right: bleed },
-          bleedLinked: true,
-          quantity,
-        },
-      ];
-    }
-    return [];
-  }, [service, designAssets, cutContourAssets, currentDims, quantity]);
 
   const addDesignFiles = (assets: DesignFileAsset[]) => {
     if (assets.length === 0) return;
-    setDesignAssets((prev) => [...prev, ...assets]);
+    const nextAssets = allowsMultipleDesigns ? assets : assets.slice(0, 1);
+    setDesignAssets((prev) => (allowsMultipleDesigns ? [...prev, ...nextAssets].slice(0, maxDesigns) : nextAssets));
     const first = assets[0];
-    if (dimensionFieldId) {
-      setField(dimensionFieldId, { widthMm: first.widthMm, heightMm: first.heightMm });
-      setMontage(null);
-      setMontageSig('');
-    }
+    const detectedSize = { widthMm: first.widthMm, heightMm: first.heightMm };
+    setField(dimensionFieldId ?? DESIGN_SIZE_FIELD, detectedSize);
+    setMontage(null);
+    setMontageSig('');
   };
 
-  const attachCutContour = (_stickerId: string, asset: DesignFileAsset) => {
+  const attachCutContour = (stickerId: string, asset: DesignFileAsset) => {
     setCutContourAssets((prev) => [...prev, asset]);
+    setCutContourLinks((prev) => ({ ...prev, [asset.id]: stickerId }));
   };
 
-  const stepFields = service && (
-    <SectionCard title={`حقول الخدمة — ${service.name}`}>
+  const renderServiceField = (f: Service['fields'][number], i: number) => {
+    const v = fieldValues[f.id];
+    const anim = {
+      initial: { opacity: 0, y: 16 },
+      animate: { opacity: 1, y: 0 },
+      transition: { delay: i * 0.05, duration: 0.3, ease: EASE },
+    } as const;
+    if (f.type === 'number') {
+      return (
+        <motion.div key={f.id} {...anim}>
+          <NumberField
+            label={f.required ? `${f.label} *` : f.label}
+            value={typeof v === 'number' ? v : Number(v) || undefined}
+            onChange={(n) => setField(f.id, n)}
+            min={f.min}
+            max={f.max}
+            step={f.step ?? 1}
+            unitSuffix={f.id === 'quantity' ? 'نسخة' : undefined}
+            presets={f.id === 'quantity' ? QTY_PRESETS : undefined}
+          />
+        </motion.div>
+      );
+    }
+    if (f.type === 'dimensions') {
+      return (
+        <motion.div key={f.id} {...anim}>
+          {f.id === 'format' && (
+            <p className="mb-1 text-[11px] text-[var(--ink-400)]">المقاس النهائي بعد القص، بدون Bleed.</p>
+          )}
+          <DimensionGroup
+            label={f.required ? `${f.label} *` : f.label}
+            value={isDim(v) ? v : currentDims ?? { widthMm: 0, heightMm: 0 }}
+            onChange={(d) => setField(f.id, d)}
+            unit={unit}
+            onUnitChange={setUnit}
+          />
+        </motion.div>
+      );
+    }
+    if (f.type === 'select' && f.options) {
+      if (f.id === 'faces') {
+        return (
+          <motion.div key={f.id} {...anim}>
+            {fieldLabel(f.label, f.required)}
+            <div className="flex flex-wrap gap-2">
+              {f.options.map((o) => {
+                const active = v === o.id;
+                return (
+                  <button
+                    key={o.id}
+                    type="button"
+                    onClick={() => setField(f.id, o.id)}
+                    className={cn(
+                      'flex items-center gap-2 rounded-[10px] border px-4 py-2.5 text-[14px] transition-all',
+                      active
+                        ? 'border-[var(--cyan-600)] bg-[var(--cyan-50)] font-semibold text-[var(--ink-900)]'
+                        : 'border-[var(--line-strong)] bg-white text-[var(--ink-700)] hover:border-[var(--cyan-500)]',
+                    )}
+                  >
+                    {active && <Check size={14} className="text-[var(--cyan-600)]" />}
+                    <span dir="ltr" className="font-latin">{o.latinLabel ?? o.label}</span>
+                    <span className="text-[13px] text-[var(--ink-500)]">{o.label}</span>
+                    {o.priceDelta !== 0 ? (
+                      <span dir="ltr" className="font-latin text-[13px] font-semibold text-[var(--cyan-600)]">
+                        +{o.priceDelta} دج/نسخة
+                      </span>
+                    ) : (
+                      <span className="text-[12px] text-[var(--ink-400)]">أساسي</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+            {montage && f.id === 'faces' && (
+              <p className="mt-2 text-[11px] text-[var(--ink-400)]">تغيير نوع الطباعة بعد المونتاج سيجعل المخطط يحتاج إعادة حساب.</p>
+            )}
+          </motion.div>
+        );
+      }
+      return (
+        <motion.div key={f.id} {...anim}>
+          <SelectWithPrice
+            label={f.required ? `${f.label} *` : f.label}
+            options={f.options}
+            value={typeof v === 'string' ? v : undefined}
+            onChange={(id) => setField(f.id, id)}
+          />
+        </motion.div>
+      );
+    }
+    if (f.type === 'yesno') {
+      const opt = f.options?.[0];
+      return (
+        <motion.div key={f.id} {...anim} className="rounded-[10px] border border-[var(--line)] px-4 py-3">
+          <YesNoToggle
+            checked={v === true}
+            onChange={(b) => setField(f.id, b)}
+            label={f.label}
+            latinLabel={f.latinName}
+            priceDelta={opt?.priceDelta}
+            deltaUnit={opt?.deltaUnit}
+          />
+          {montage && f.id.includes('contour') && (
+            <p className="mt-2 text-[11px] text-[var(--ink-400)]">تغيير طريقة القص بعد المونتاج يحتاج إعادة حساب للتأكد من صلاحية المخطط.</p>
+          )}
+        </motion.div>
+      );
+    }
+    return (
+      <motion.div key={f.id} {...anim}>
+        {fieldLabel(f.label, f.required)}
+        <input
+          value={typeof v === 'string' ? v : ''}
+          onChange={(e) => setField(f.id, e.target.value)}
+          placeholder={f.placeholder}
+          className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
+        />
+      </motion.div>
+    );
+  };
+
+  const stepDesign = service && (
+    <SectionCard
+      title={`التصاميم — ${service.name}`}
+      actions={
+        <span className="rounded-full bg-[var(--paper-100)] px-2.5 py-1 text-[11px] font-medium text-[var(--ink-500)]">
+          {allowsMultipleDesigns ? 'عدة تصاميم' : 'تصميم واحد'}
+        </span>
+      }
+    >
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_260px]">
         <div className="space-y-5">
-          {service.fields.map((f, i) => {
-            const v = fieldValues[f.id];
-            const anim = {
-              initial: { opacity: 0, y: 16 },
-              animate: { opacity: 1, y: 0 },
-              transition: { delay: i * 0.05, duration: 0.3, ease: EASE },
-            } as const;
-            if (f.type === 'number') {
-              return (
-                <motion.div key={f.id} {...anim}>
-                  <NumberField
-                    label={f.required ? `${f.label} *` : f.label}
-                    value={typeof v === 'number' ? v : Number(v) || undefined}
-                    onChange={(n) => setField(f.id, n)}
-                    min={f.min}
-                    max={f.max}
-                    step={f.step ?? 1}
-                    unitSuffix={f.id === 'quantity' ? 'نسخة' : undefined}
-                    presets={f.id === 'quantity' ? QTY_PRESETS : undefined}
-                  />
-                </motion.div>
-              );
-            }
-            if (f.type === 'dimensions') {
-              return (
-                <motion.div key={f.id} {...anim}>
-                  {f.id === 'format' && (
-                    <p className="mb-1 text-[11px] text-[var(--ink-400)]">المقاس النهائي بعد القص، بدون Bleed.</p>
-                  )}
-                  <DimensionGroup
-                    label={f.required ? `${f.label} *` : f.label}
-                    value={isDim(v) ? v : { widthMm: 0, heightMm: 0 }}
-                    onChange={(d) => setField(f.id, d)}
-                    unit={unit}
-                    onUnitChange={setUnit}
-                  />
-                </motion.div>
-              );
-            }
-            if (f.type === 'select' && f.options) {
-              // الوجوه (Recto / Recto Verso) render as radio cards, others as dropdown
-              if (f.id === 'faces') {
-                return (
-                  <motion.div key={f.id} {...anim}>
-                    {fieldLabel(f.label, f.required)}
-                    <div className="flex flex-wrap gap-2">
-                      {f.options.map((o) => {
-                        const active = v === o.id;
-                        return (
-                          <button
-                            key={o.id}
-                            type="button"
-                            onClick={() => setField(f.id, o.id)}
-                            className={cn(
-                              'flex items-center gap-2 rounded-[10px] border px-4 py-2.5 text-[14px] transition-all',
-                              active
-                                ? 'border-[var(--cyan-600)] bg-[var(--cyan-50)] font-semibold text-[var(--ink-900)]'
-                                : 'border-[var(--line-strong)] bg-white text-[var(--ink-700)] hover:border-[var(--cyan-500)]',
-                            )}
-                          >
-                            {active && <Check size={14} className="text-[var(--cyan-600)]" />}
-                            <span dir="ltr" className="font-latin">{o.latinLabel ?? o.label}</span>
-                            <span className="text-[13px] text-[var(--ink-500)]">{o.label}</span>
-                            {o.priceDelta !== 0 ? (
-                              <span dir="ltr" className="font-latin text-[13px] font-semibold text-[var(--cyan-600)]">
-                                +{o.priceDelta} دج/نسخة
-                              </span>
-                            ) : (
-                              <span className="text-[12px] text-[var(--ink-400)]">أساسي</span>
-                            )}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </motion.div>
-                );
-              }
-              return (
-                <motion.div key={f.id} {...anim}>
-                  <SelectWithPrice
-                    label={f.required ? `${f.label} *` : f.label}
-                    options={f.options}
-                    value={typeof v === 'string' ? v : undefined}
-                    onChange={(id) => setField(f.id, id)}
-                  />
-                </motion.div>
-              );
-            }
-            if (f.type === 'yesno') {
-              const opt = f.options?.[0];
-              return (
-                <motion.div key={f.id} {...anim} className="rounded-[10px] border border-[var(--line)] px-4 py-3">
-                  <YesNoToggle
-                    checked={v === true}
-                    onChange={(b) => setField(f.id, b)}
-                    label={f.label}
-                    latinLabel={f.latinName}
-                    priceDelta={opt?.priceDelta}
-                    deltaUnit={opt?.deltaUnit}
-                  />
-                </motion.div>
-              );
-            }
-            // text
-            return (
-              <motion.div key={f.id} {...anim}>
-                {fieldLabel(f.label, f.required)}
-                <input
-                  value={typeof v === 'string' ? v : ''}
-                  onChange={(e) => setField(f.id, e.target.value)}
-                  placeholder={f.placeholder}
-                  className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
-                />
-              </motion.div>
-            );
-          })}
-          <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: service.fields.length * 0.05, duration: 0.3, ease: EASE }}>
+          {designFields.map(renderServiceField)}
+          {!designFields.some((field) => field.type === 'dimensions') && currentDims && (
+            <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: designFields.length * 0.05, duration: 0.3, ease: EASE }}>
+              <p className="mb-1 text-[11px] text-[var(--ink-400)]">المقاس النهائي بعد القص، بدون Bleed.</p>
+              <DimensionGroup
+                label="مقاس التصميم *"
+                value={currentDims}
+                onChange={(d) => setField(DESIGN_SIZE_FIELD, d)}
+                unit={unit}
+                onUnitChange={setUnit}
+              />
+            </motion.div>
+          )}
+          <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: (designFields.length + 1) * 0.05, duration: 0.3, ease: EASE }}>
             {fieldLabel('ملفات التصميم و tracé découpe')}
             <DesignFileUploader
               stickers={uploadStickers}
-              maxDesigns={12}
+              maxDesigns={allowsMultipleDesigns ? maxDesigns : Math.max(1, uploadStickers.length + 1)}
               onAddDesigns={addDesignFiles}
               onAttachCutContour={attachCutContour}
             />
@@ -1741,7 +2030,7 @@ export default function DevisCreate() {
 
         {/* live price ticker */}
         <div className="border-t border-[var(--line)] pt-4 lg:border-s lg:border-t-0 lg:ps-6 lg:pt-0">
-          <div className="text-[11px] font-medium tracking-[0.04em] text-[var(--ink-400)]">السعر الحالي</div>
+          <div className="text-[11px] font-medium tracking-[0.04em] text-[var(--ink-400)]">تقدير السعر</div>
           <motion.div
             key={final ? Math.round(final.unitPrice * 100) : 0}
             initial={{ backgroundColor: '#E0F2FE' }}
@@ -1816,6 +2105,13 @@ export default function DevisCreate() {
             </button>
             <button
               type="button"
+              onClick={openStudio}
+              className="h-12 rounded-[10px] border border-[var(--line-strong)] bg-white px-4 text-[14px] font-medium text-[var(--ink-700)] transition-colors hover:bg-[var(--paper-100)]"
+            >
+              فتح Studio
+            </button>
+            <button
+              type="button"
               onClick={skipMontage}
               className="h-12 rounded-[10px] px-4 text-[14px] font-medium text-[var(--ink-500)] underline decoration-transparent underline-offset-4 transition-all hover:text-[var(--ink-700)] hover:decoration-[var(--ink-400)]"
             >
@@ -1870,12 +2166,13 @@ export default function DevisCreate() {
                   >
                     إعادة الحساب
                   </button>
-                  <Link
-                    to="/montage"
+                  <button
+                    type="button"
+                    onClick={openStudio}
                     className="flex h-9 items-center gap-1.5 rounded-[8px] border border-[var(--line-strong)] bg-white px-3 text-[13px] font-medium text-[var(--ink-700)] transition-colors hover:bg-[var(--paper-100)]"
                   >
                     تعديل في الاستوديو
-                  </Link>
+                  </button>
                   <button
                     type="button"
                     onClick={() => {
@@ -1936,7 +2233,80 @@ export default function DevisCreate() {
     </SectionCard>
   );
 
-  // ------------------------------- step 5: price review ----------------------
+  // ------------------------------- step 5: production ------------------------
+
+  const stepProduction = service && (
+    <SectionCard
+      title="الإنتاج — الورق والطباعة والتشطيب"
+      actions={
+        montage ? (
+          <span className="inline-flex items-center gap-1 rounded-full bg-[var(--cyan-50)] px-2.5 py-1 text-[11px] font-medium text-[var(--cyan-600)]">
+            <Sparkles size={12} />
+            {montage.sheetsNeeded} ورقة
+          </span>
+        ) : undefined
+      }
+    >
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_260px]">
+        <div className="space-y-5">
+          {montageStale && (
+            <div className="flex items-start gap-2 rounded-[10px] border border-[#F59E0B]/40 bg-[#FEF3C7] px-3 py-2.5 text-[12px] leading-5 text-[#92400E]">
+              <Info size={15} className="mt-0.5 shrink-0" />
+              <span>تغيّر خيار يؤثر على المونتاج. أعد الحساب قبل إضافة الخدمة إلى العرض.</span>
+            </div>
+          )}
+          {productionFields.length > 0 ? (
+            productionFields.map(renderServiceField)
+          ) : (
+            <EmptyState
+              title="لا توجد اختيارات إنتاج إضافية"
+              helper="هذه الخدمة تُسعّر من المقاس والكمية والمونتاج فقط."
+              className="py-8"
+            />
+          )}
+        </div>
+        <div className="border-t border-[var(--line)] pt-4 lg:border-s lg:border-t-0 lg:ps-6 lg:pt-0">
+          <div className="text-[11px] font-medium tracking-[0.04em] text-[var(--ink-400)]">نتيجة المونتاج</div>
+          {montage ? (
+            <div className="mt-3 space-y-3 rounded-[12px] border border-[var(--line)] bg-[var(--paper-50)] p-3 text-[12px] text-[var(--ink-600)]">
+              <MontageThumb result={montage} width={190} />
+              <div className="space-y-1.5">
+                <div className="flex justify-between">
+                  <span>مقاس الورقة</span>
+                  <span dir="ltr" className="font-latin font-semibold">{Math.round(montage.sheetWidthMm)}×{Math.round(montage.sheetHeightMm)} mm</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>نسخ/ورقة</span>
+                  <span dir="ltr" className="font-latin font-semibold">{montage.copiesPerSheet}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>الأوراق</span>
+                  <span dir="ltr" className="font-latin font-semibold">{montage.sheetsNeeded}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>الهدر</span>
+                  <span dir="ltr" className="font-latin font-semibold">{formatPercent(montage.wastePercent)}</span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={openStudio}
+                className="h-9 w-full rounded-[8px] border border-[var(--line-strong)] bg-white text-[13px] font-medium text-[var(--ink-700)] transition-colors hover:bg-[var(--paper-100)]"
+              >
+                تعديل في الاستوديو
+              </button>
+            </div>
+          ) : (
+            <div className="mt-3 rounded-[12px] border border-dashed border-[var(--line-strong)] bg-[var(--paper-100)] p-4 text-center text-[12px] text-[var(--ink-500)]">
+              لم يتم اعتماد مونتاج بعد.
+            </div>
+          )}
+        </div>
+      </div>
+    </SectionCard>
+  );
+
+  // ------------------------------- step 6: price review ----------------------
 
   const reviewLines = breakdown
     ? [
@@ -2111,6 +2481,28 @@ export default function DevisCreate() {
               ))}
             </div>
           </div>
+
+          {designPriceRows.length > 0 && (
+            <div className="mt-4 rounded-[12px] border border-[var(--line)] bg-white p-4">
+              <div className="mb-2 text-[13px] font-semibold text-[var(--ink-800)]">سعر كل تصميم</div>
+              <div className="space-y-2">
+                {designPriceRows.map((row) => (
+                  <div key={row.id} className="grid grid-cols-[minmax(0,1fr)_auto] gap-2 rounded-[8px] bg-[var(--paper-50)] px-3 py-2 text-[12px]">
+                    <div className="min-w-0">
+                      <div className="truncate font-medium text-[var(--ink-800)]">{row.name}</div>
+                      <div className="text-[11px] text-[var(--ink-400)]">
+                        <span dir="ltr" className="font-latin">{row.quantity}</span> نسخة
+                      </div>
+                    </div>
+                    <div className="text-end">
+                      <div dir="ltr" className="font-latin font-semibold text-[var(--ink-900)]">{formatDA(row.amount)}</div>
+                      <div dir="ltr" className="font-latin text-[11px] text-[var(--ink-400)]">{formatDA(row.unitPrice)} / نسخة</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </SectionCard>
@@ -2188,7 +2580,7 @@ export default function DevisCreate() {
     </div>
   );
 
-  const stepContent = [stepSection, stepService, stepInfo, stepFields, stepMontage, stepReview, stepDone][step];
+  const stepContent = [stepSection, stepService, stepInfo, stepDesign, stepMontage, stepProduction, stepReview, stepDone][step];
 
   // ------------------------------- render ------------------------------------
 
@@ -2212,7 +2604,7 @@ export default function DevisCreate() {
                 مسودة <span dir="ltr" className="font-latin font-semibold">{savedDevis.number}</span> — تُحفظ تلقائيًا
               </>
             ) : (
-              'سبع خطوات — والسعر بجانب كل خيار.'
+              'تصميم، مونتاج، إنتاج، ثم السعر.'
             )}
           </p>
         </div>
@@ -2273,7 +2665,7 @@ export default function DevisCreate() {
           </AnimatePresence>
 
           {/* nav */}
-          {step < 6 && step > 0 && (
+          {step < 7 && step > 0 && (
             <div className="mt-6 flex items-center justify-between">
               <button
                 type="button"
@@ -2302,8 +2694,24 @@ export default function DevisCreate() {
                       toast.error('تغيّرت الكمية أو المقاس بعد حساب المونتاج — أعد الحساب قبل المتابعة');
                       return;
                     }
-                    if (montage || manualPrice !== null) tryNext();
+                    if (montage || manualPrice !== null || !requiresMontage) tryNext();
                     else skipMontage();
+                  }}
+                  className="flex h-11 items-center gap-1.5 rounded-[10px] bg-[var(--cyan-600)] px-6 text-[14px] font-semibold text-white transition-all hover:-translate-y-px hover:bg-[var(--cyan-500)] active:translate-y-0 active:scale-[0.97]"
+                >
+                  التالي: الإنتاج
+                  <ChevronLeft size={16} />
+                </button>
+              )}
+              {step === 5 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (montageStale) {
+                      toast.error('أعد حساب المونتاج قبل مراجعة السعر');
+                      return;
+                    }
+                    tryNext();
                   }}
                   className="flex h-11 items-center gap-1.5 rounded-[10px] bg-[var(--cyan-600)] px-6 text-[14px] font-semibold text-white transition-all hover:-translate-y-px hover:bg-[var(--cyan-500)] active:translate-y-0 active:scale-[0.97]"
                 >
@@ -2311,7 +2719,7 @@ export default function DevisCreate() {
                   <ChevronLeft size={16} />
                 </button>
               )}
-              {step === 5 && (
+              {step === 6 && (
                 <button
                   type="button"
                   onClick={addItem}

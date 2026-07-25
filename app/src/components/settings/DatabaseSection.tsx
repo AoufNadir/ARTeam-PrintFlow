@@ -1,15 +1,28 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
-import { AlertTriangle, CheckCircle2, Copy, FileJson, Trash2 } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Cloud, Copy, FileJson, RefreshCw, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 import SectionCard from '@/components/ds/SectionCard';
 import { db } from '@/lib/storage';
+import { getSupabaseStatus, pushLocalSnapshotToSupabase, type SupabaseStatus } from '@/lib/supabase-sync';
 import { Btn, Chip, Modal } from './Overlay';
 import { logAudit } from './audit';
 import { ENTITIES, schemaJson } from './schema';
 
 /** Section 7 — قاعدة البيانات، جاهزية Supabase (#database). */
 export default function DatabaseSection() {
+  const [status, setStatus] = useState<SupabaseStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const refreshStatus = async () => {
+    const next = await getSupabaseStatus();
+    setStatus(next);
+  };
+
+  useEffect(() => {
+    void refreshStatus();
+  }, []);
+
   const exportJson = () => {
     const blob = new Blob([schemaJson()], { type: 'application/json' });
     const a = document.createElement('a');
@@ -25,11 +38,42 @@ export default function DatabaseSection() {
     toast.success('نُسخت أسماء الجداول');
   };
 
+  const pushToSupabase = async () => {
+    setBusy(true);
+    try {
+      const result = await pushLocalSnapshotToSupabase();
+      logAudit('catalog', `مزامنة ${result.count} سجل محلي إلى Supabase`, 'Supabase');
+      toast.success(`تمت مزامنة ${result.count} سجلًا إلى Supabase`);
+      await refreshStatus();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'تعذرت مزامنة Supabase');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <SectionCard title="قاعدة البيانات — جاهزية Supabase">
       <div className="mb-4 flex flex-wrap items-center gap-3 rounded-[12px] border border-[#16A34A]/25 bg-[#DCFCE7]/60 px-4 py-3">
-        <CheckCircle2 size={17} className="shrink-0 text-[var(--success-600)]" />
-        <p className="flex-1 text-[13px] font-medium text-[var(--ink-700)]">البنية جاهزة للربط مع Supabase</p>
+        {status?.configured && status.authenticated ? (
+          <CheckCircle2 size={17} className="shrink-0 text-[var(--success-600)]" />
+        ) : (
+          <Cloud size={17} className="shrink-0 text-[var(--cyan-600)]" />
+        )}
+        <p className="flex-1 text-[13px] font-medium text-[var(--ink-700)]">
+          {status?.message ?? 'جارٍ فحص اتصال Supabase…'}
+          {typeof status?.recordCount === 'number' && (
+            <span dir="ltr" className="font-latin ms-2 rounded-full bg-white/70 px-2 py-0.5 text-[11px] text-[var(--ink-500)]">
+              {status.recordCount} records
+            </span>
+          )}
+        </p>
+        <Btn variant="ghost" size="sm" onClick={() => void refreshStatus()}>
+          <RefreshCw size={14} /> فحص الاتصال
+        </Btn>
+        <Btn variant="primary" size="sm" onClick={pushToSupabase} disabled={busy || !status?.configured || !status?.authenticated}>
+          <Cloud size={14} /> {busy ? 'جارٍ المزامنة…' : 'مزامنة إلى Supabase'}
+        </Btn>
         <Btn variant="ghost" size="sm" onClick={exportJson}>
           <FileJson size={14} /> تصدير المخطط JSON
         </Btn>
@@ -80,8 +124,8 @@ export default function DatabaseSection() {
       </div>
 
       <div className="mt-4 flex items-center gap-2 text-[11px] text-[var(--ink-400)]">
-        <Chip>للقراءة فقط</Chip>
-        الربط الفعلي يتم في مرحلة لاحقة — هذه الصفحة توثّق البنية وتصدّرها.
+        <Chip>{status?.configured ? 'Supabase' : 'محلي'}</Chip>
+        المزامنة تحفظ نسخة سحابية آمنة لكل مستخدم، بينما يظل التطبيق سريعًا محليًا.
       </div>
 
       <ResetZone />

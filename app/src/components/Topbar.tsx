@@ -5,6 +5,7 @@ import { Bell, ChevronLeft, LogOut, Menu, Plus, Search } from 'lucide-react';
 import type { Unit } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import { SESSION_KEY } from '@/lib/session';
+import { signOutSupabase } from '@/lib/supabase';
 
 const ROUTE_TITLES: Record<string, string> = {
   '/': 'لوحة القيادة',
@@ -55,6 +56,7 @@ export default function Topbar({ unit, onUnitChange, onOpenPalette, onOpenSideba
     .join('');
 
   const signOut = () => {
+    void signOutSupabase();
     localStorage.removeItem(SESSION_KEY);
     setMenuOpen(false);
     navigate('/login', { replace: true });

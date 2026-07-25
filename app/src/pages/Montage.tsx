@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router';
 import { motion } from 'framer-motion';
 import { toast } from 'sonner';
 import ControlsPanel, { type SheetWasteInfo } from '@/components/montage/ControlsPanel';
@@ -27,6 +28,7 @@ import {
 } from '@/components/montage/montage-data';
 import { useUnit } from '@/components/layout-context';
 import { bestSheet, computeMontageVariants, type FixedMontageFailure, type MontageVariant } from '@/lib/montage-engine';
+import { appendQueryParam, commitMontageSession, getMontageSession } from '@/lib/montage-session';
 import { db } from '@/lib/storage';
 import { trimNumber } from '@/lib/units';
 import type { MachineKind, MontageResult, PlacedPiece, SheetAlternative } from '@/lib/types';
@@ -62,7 +64,13 @@ function normalizeState(st: MontageUIState): MontageUIState {
 
 export default function Montage() {
   const { unit, setUnit } = useUnit();
-  const [state, setState] = useState<MontageUIState>(loadStateDraft);
+  const navigate = useNavigate();
+  const [initialSessionId] = useState(() => new URLSearchParams(window.location.search).get('session'));
+  const sessionIdRef = useRef(initialSessionId);
+  const [state, setState] = useState<MontageUIState>(() => {
+    const session = getMontageSession<MontageUIState>(initialSessionId);
+    return session?.state ? normalizeState(session.state) : loadStateDraft();
+  });
   const [result, setResult] = useState<MontageResult | null>(null);
   const [fixedFailure, setFixedFailure] = useState<FixedMontageFailure | null>(null);
   const [suggestedCopies, setSuggestedCopies] = useState<Map<string, number>>(new Map());
@@ -380,13 +388,30 @@ export default function Montage() {
 
   const onAdopt = useCallback(() => {
     if (!result) return;
+    const sessionId = sessionIdRef.current;
+    if (sessionId) {
+      const committed = commitMontageSession<MontageUIState, unknown>(sessionId, {
+        result: { ...result, placed },
+        placed,
+        input: buildEngineInput(state),
+        state,
+        savedAt: new Date().toISOString(),
+      });
+      if (committed) {
+        toast.success('تم اعتماد المخطط — العودة إلى Devis');
+        navigate(appendQueryParam(committed.session.returnTo, 'montageSession', sessionId));
+        return;
+      }
+      toast.error('انتهت جلسة Devis — افتح الاستوديو من العرض مرة أخرى');
+      return;
+    }
     try {
       localStorage.setItem(DRAFT_KEY, JSON.stringify({ result, placed, input: buildEngineInput(state), savedAt: new Date().toISOString() }));
     } catch {
       /* storage full — non-blocking */
     }
     toast.success('تم اعتماد المخطط — سيُدرج في Devis الجديد');
-  }, [result, placed, state]);
+  }, [navigate, result, placed, state]);
 
   // --------------------------- keyboard ----------------------------------------
   // (اختصارات الوضع اليدوي — تراجع/حذف/تدوير/أسهم — تعيش داخل SheetCanvas)

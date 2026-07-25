@@ -163,6 +163,20 @@ export function resetAndReseed(): void {
   localStorage.setItem(SCHEMA_VERSION_KEY, String(DATA_VERSION));
 }
 
+export function exportLocalSnapshot() {
+  ensureSeeded();
+  return {
+    sections: list('sections'),
+    services: list('services'),
+    clients: list('clients'),
+    projects: list('projects'),
+    devis: list('devis').map(normalizeDevis),
+    pricingRuleVersions: list('pricingRuleVersions'),
+    machines: list('machines'),
+    papers: list('papers'),
+  };
+}
+
 // ------------------------------- migrations ----------------------------------
 
 function migrateItem(item: DevisItem, index: number): DevisItem {
