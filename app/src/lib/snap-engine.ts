@@ -61,6 +61,10 @@ export interface SnapContext {
 
 interface Candidate {
   delta: number;
+  /** Lower wins: physical edge contact, aligned anchors, then generic refs. */
+  priority: number;
+  /** Distance between the two ranges on the perpendicular axis. */
+  perpendicularGap: number;
   /** موضع خط الإرشاد (= موضع الهدف) */
   pos: number;
   /** امتداد القطعة المتحركة على المحور العمودي */
@@ -84,8 +88,20 @@ function bestCandidate(
   let best: Candidate | null = null;
   const consider = (cand: Candidate) => {
     if (Math.abs(cand.delta) > threshold + EPS) return;
-    if (!best || Math.abs(cand.delta) < Math.abs(best.delta) - EPS) best = cand;
+    if (
+      !best ||
+      cand.priority < best.priority ||
+      (cand.priority === best.priority &&
+        (Math.abs(cand.delta) < Math.abs(best.delta) - EPS ||
+          (Math.abs(Math.abs(cand.delta) - Math.abs(best.delta)) <= EPS &&
+            cand.perpendicularGap < best.perpendicularGap)))
+    ) {
+      best = cand;
+    }
   };
+  const intervalGap = (a1: number, a2: number, b1: number, b2: number) =>
+    Math.max(0, Math.max(a1, b1) - Math.min(a2, b2));
+
   for (const m of moving) {
     const mEdges =
       axis === 'x'
@@ -100,15 +116,61 @@ function bestCandidate(
           : ([s.y, s.y + s.h / 2, s.y + s.h] as const);
       const sFrom = axis === 'x' ? s.y : s.x;
       const sTo = axis === 'x' ? s.y + s.h : s.x + s.w;
-      for (const me of mEdges) {
-        for (const se of sEdges) {
-          consider({ delta: se - me, pos: se, mFrom, mTo, sFrom, sTo });
-        }
+      const perpendicularGap = intervalGap(mFrom, mTo, sFrom, sTo);
+
+      // Illustrator-like "attach beside": opposite outer edges have priority
+      // whenever the rectangles overlap (or nearly overlap) perpendicularly.
+      if (perpendicularGap <= threshold * 1.5 + EPS) {
+        consider({
+          delta: sEdges[0] - mEdges[2],
+          priority: 0,
+          perpendicularGap,
+          pos: sEdges[0],
+          mFrom,
+          mTo,
+          sFrom,
+          sTo,
+        });
+        consider({
+          delta: sEdges[2] - mEdges[0],
+          priority: 0,
+          perpendicularGap,
+          pos: sEdges[2],
+          mFrom,
+          mTo,
+          sFrom,
+          sTo,
+        });
+      }
+
+      // Anchor alignment: start↔start, center↔center, end↔end. Avoid the old
+      // every-edge-to-every-edge matrix, which could snap a left edge to an
+      // unrelated centre and made the piece jump unpredictably.
+      for (let edge = 0; edge < 3; edge += 1) {
+        consider({
+          delta: sEdges[edge] - mEdges[edge],
+          priority: 1,
+          perpendicularGap,
+          pos: sEdges[edge],
+          mFrom,
+          mTo,
+          sFrom,
+          sTo,
+        });
       }
     }
     for (const r of refs) {
       for (const me of mEdges) {
-        consider({ delta: r - me, pos: r, mFrom, mTo, sFrom: null, sTo: null });
+        consider({
+          delta: r - me,
+          priority: 2,
+          perpendicularGap: 0,
+          pos: r,
+          mFrom,
+          mTo,
+          sFrom: null,
+          sTo: null,
+        });
       }
     }
   }

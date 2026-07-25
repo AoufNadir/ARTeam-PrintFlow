@@ -193,9 +193,10 @@ export interface MontageInput {
   /** PAIR gap overrides (mm), keyed by pairGapKey(a,b) = the two group ids
    *  sorted alphabetically, joined with '|'. Priority: pair > intra > default. */
   pairGaps?: Record<string, number>;
-  /** Cut method of the job — guillotine biases the default (balanced) variant
-   *  toward shelf/regular-grid candidates with rectangular, straight-cuttable
-   *  blocks instead of free MaxRects arrangements. Absent = no bias. */
+  /** Cut method of the job. Guillotine restricts generation and final
+   *  validation to rows/columns/rectangular slicing blocks; free mixed
+   *  MaxRects candidates remain available only to die-cut/cutcontour.
+   *  Absent keeps the legacy free behavior. */
   cutMethod?: 'guillotine' | 'die-cut' | 'cutcontour';
 }
 
@@ -207,6 +208,12 @@ export interface PlacedPiece {
   rotated: boolean;
   groupId: string;
   color: string;
+  /** Stable identity used only by the manual layout editor. Engine layouts may
+   *  omit it; the editor assigns one on first entry. */
+  editorId?: string;
+  /** User-created editor group. Deliberately separate from `groupId`, which is
+   *  the immutable design/type identity used by production calculations. */
+  editorGroupId?: string;
   /** per-side bleed (mm) actually applied around the trim rect, in sheet space
    *  (already mirrored for the verso half). Present on engine-produced pieces;
    *  absent on legacy/manual ones. */
@@ -259,6 +266,8 @@ export interface MontageResult {
   /** bascule only: central gutter width (mm) actually applied around the flip
    *  axis — gutterBandOf derives its band from it (axis ± gutterMm/2) */
   gutterMm?: number;
+  /** Validated straight-cut family. Present on Guillotine results only. */
+  cutPattern?: 'rows' | 'columns' | 'blocks';
   alternatives: SheetAlternative[];
 }
 

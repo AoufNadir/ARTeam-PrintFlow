@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import {
   Check,
   ChevronDown,
+  FileText,
   Hash,
   Layers,
   Link2,
@@ -20,6 +21,7 @@ import DimensionGroup from '@/components/ds/DimensionGroup';
 import NumberField from '@/components/ds/NumberField';
 import SelectWithPrice from '@/components/ds/SelectWithPrice';
 import YesNoToggle from '@/components/ds/YesNoToggle';
+import DesignFileUploader from './DesignFileUploader';
 import StageCard from './StageCard';
 import {
   CUT_METHODS,
@@ -38,6 +40,8 @@ import {
   type MontageUIState,
 } from './montage-data';
 import type { MachineKind, PrintMethod, Unit } from '@/lib/types';
+import { deleteDesignFile } from '@/lib/design-file-storage';
+import { designNameFromAsset, type DesignFileAsset } from '@/lib/design-file-types';
 import { pairGapKey } from '@/lib/montage-engine';
 import { formatMeasure, formatPercent, trimNumber } from '@/lib/units';
 import { cn } from '@/lib/utils';
@@ -219,10 +223,10 @@ function MethodDiagram({ method, active }: { method: PrintMethod; active: boolea
       )}
       {method === 'bascule' && (
         <>
-          {/* sheet 38×24: smallest dimension is the height → flip axis is the
-              horizontal midline, so the flip strip must be horizontal too */}
+          {/* sheet 38×24: larger dimension is width → flip axis is the vertical
+              midline, so the central gutter strip is vertical */}
           <rect x="4" y="5" width="38" height="24" rx="2" stroke={stroke} strokeWidth="1.5" />
-          <rect x="4" y="15" width="38" height="4" fill={active ? 'var(--cyan-100)' : 'var(--paper-200)'} stroke={stroke} strokeWidth="1" />
+          <rect x="21" y="5" width="4" height="24" fill={active ? 'var(--cyan-100)' : 'var(--paper-200)'} stroke={stroke} strokeWidth="1" />
         </>
       )}
       {method === 'double-pince' && (
@@ -260,6 +264,78 @@ export default function ControlsPanel(props: ControlsPanelProps) {
 
   const updateSticker = (id: string, p: Partial<(typeof state.stickers)[number]>) => {
     patch({ stickers: state.stickers.map((s) => (s.id === id ? { ...s, ...p } : s)) });
+  };
+
+  const uploadedSticker = (asset: DesignFileAsset, quantity = 500) => {
+    const detectedBleed = asset.detectedBleedMm;
+    return {
+      id: `st-${crypto.randomUUID?.() ?? Date.now().toString(36)}`,
+      name: designNameFromAsset(asset),
+      widthMm: asset.widthMm,
+      heightMm: asset.heightMm,
+      bleed: detectedBleed ? { ...detectedBleed } : { ...state.bleedShared },
+      bleedLinked: !detectedBleed,
+      quantity,
+      asset,
+    };
+  };
+
+  /**
+   * The untouched first card is a placeholder, so the first uploaded page
+   * replaces it. Later uploads append new cards up to MAX_GROUPS.
+   */
+  const addUploadedDesigns = (assets: DesignFileAsset[]) => {
+    if (assets.length === 0) return;
+    let stickers = [...state.stickers];
+    let remaining = assets;
+    if (stickers.length === 1 && !stickers[0].asset) {
+      const first = assets[0];
+      const detectedBleed = first.detectedBleedMm;
+      stickers = [
+        {
+          ...stickers[0],
+          name: designNameFromAsset(first),
+          widthMm: first.widthMm,
+          heightMm: first.heightMm,
+          bleed: detectedBleed ? { ...detectedBleed } : stickers[0].bleed,
+          bleedLinked: detectedBleed ? false : stickers[0].bleedLinked,
+          asset: first,
+        },
+      ];
+      remaining = assets.slice(1);
+    }
+    stickers = [...stickers, ...remaining.map((asset) => uploadedSticker(asset))].slice(0, MAX_GROUPS);
+    patch({
+      stickers,
+      ...(assets.some((asset) => asset.hasEmbeddedCutContour) ? { cutMethod: 'cutcontour' as const } : {}),
+    });
+  };
+
+  const attachCutContour = (stickerId: string, asset: DesignFileAsset) => {
+    patch({
+      stickers: state.stickers.map((sticker) =>
+        sticker.id === stickerId ? { ...sticker, cutContour: asset } : sticker,
+      ),
+      cutMethod: 'cutcontour',
+    });
+  };
+
+  const storageUsedByAnotherCard = (storageKey: string, stickerId: string) =>
+    state.stickers.some(
+      (sticker) =>
+        sticker.id !== stickerId &&
+        (sticker.asset?.storageKey === storageKey || sticker.cutContour?.storageKey === storageKey),
+    );
+
+  const clearStoredAttachment = (stickerId: string, kind: 'asset' | 'cutContour') => {
+    const sticker = state.stickers.find((candidate) => candidate.id === stickerId);
+    const attachment = sticker?.[kind];
+    if (attachment && !storageUsedByAnotherCard(attachment.storageKey, stickerId)) {
+      void deleteDesignFile(attachment.storageKey).catch(() => {
+        /* Metadata removal remains valid even if browser storage cleanup fails. */
+      });
+    }
+    updateSticker(stickerId, kind === 'asset' ? { asset: undefined, name: undefined } : { cutContour: undefined });
   };
 
   /** All design pairs (i < j) with their canonical engine key, for the pair-gap table. */
@@ -306,6 +382,14 @@ export default function ControlsPanel(props: ControlsPanelProps) {
   };
 
   const removeSticker = (id: string) => {
+    const removed = state.stickers.find((sticker) => sticker.id === id);
+    for (const attachment of [removed?.asset, removed?.cutContour]) {
+      if (attachment && !storageUsedByAnotherCard(attachment.storageKey, id)) {
+        void deleteDesignFile(attachment.storageKey).catch(() => {
+          /* Orphan cleanup is best-effort and never blocks removing the card. */
+        });
+      }
+    }
     patch({ stickers: state.stickers.filter((s) => s.id !== id) });
   };
 
@@ -528,6 +612,13 @@ export default function ControlsPanel(props: ControlsPanelProps) {
             <p className="mt-1.5 text-[11px] text-[var(--ink-400)]">التصاميم المربوطة تتبع هذا الـBleed تلقائيًا — افك الربط لتخصيص Bleed خاص.</p>
           </div>
 
+          <DesignFileUploader
+            stickers={state.stickers}
+            maxDesigns={MAX_GROUPS}
+            onAddDesigns={addUploadedDesigns}
+            onAttachCutContour={attachCutContour}
+          />
+
           <AnimatePresence initial={false}>
             {state.stickers.map((s, i) => (
               <motion.div
@@ -548,7 +639,7 @@ export default function ControlsPanel(props: ControlsPanelProps) {
                       className="h-3 w-3 rounded-full"
                       style={{ backgroundColor: GROUP_COLORS[i % GROUP_COLORS.length] }}
                     />
-                    تصميم {i + 1}
+                    {s.name || `تصميم ${i + 1}`}
                   </span>
                   <div className="flex items-center gap-1">
                     <button
@@ -562,18 +653,87 @@ export default function ControlsPanel(props: ControlsPanelProps) {
                     >
                       {s.bleedLinked ? <Link2 size={14} /> : <Unlink2 size={14} />}
                     </button>
-                    {i > 0 && (
-                      <button
-                        type="button"
-                        aria-label="حذف التصميم"
-                        onClick={() => removeSticker(s.id)}
-                        className="grid h-7 w-7 place-items-center rounded-[6px] text-[var(--ink-400)] transition-colors hover:bg-[var(--paper-200)] hover:text-[var(--danger-600)]"
-                      >
-                        <X size={14} />
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      aria-label="حذف التصميم"
+                      onClick={() => removeSticker(s.id)}
+                      className="grid h-7 w-7 place-items-center rounded-[6px] text-[var(--ink-400)] transition-colors hover:bg-[var(--paper-200)] hover:text-[var(--danger-600)]"
+                    >
+                      <X size={14} />
+                    </button>
                   </div>
                 </div>
+                {s.asset && (
+                  <div className="mb-2 rounded-[9px] border border-[var(--line)] bg-white p-2">
+                    <div className="flex items-center gap-2">
+                      <div className="grid h-11 w-11 shrink-0 place-items-center overflow-hidden rounded-[7px] border border-[var(--line)] bg-[var(--paper-100)]">
+                        {s.asset.previewDataUrl ? (
+                          <img src={s.asset.previewDataUrl} alt="" className="h-full w-full object-contain" />
+                        ) : (
+                          <FileText size={18} className="text-[var(--ink-300)]" />
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p dir="ltr" className="font-latin truncate text-[11px] font-semibold text-[var(--ink-700)]">
+                          {s.asset.fileName}
+                        </p>
+                        <p className="mt-0.5 text-[10px] text-[var(--ink-400)]">
+                          {s.asset.format.toUpperCase()}
+                          {s.asset.pageCount && s.asset.pageCount > 1 ? ` · صفحة ${s.asset.pageNumber}/${s.asset.pageCount}` : ''}
+                          {' · '}{s.asset.measurementSource}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        title="فصل ملف التصميم مع إبقاء القياسات"
+                        onClick={() => clearStoredAttachment(s.id, 'asset')}
+                        className="grid h-7 w-7 shrink-0 place-items-center rounded-[6px] text-[var(--ink-400)] hover:bg-[var(--paper-200)] hover:text-[var(--danger-600)]"
+                      >
+                        <X size={13} />
+                      </button>
+                    </div>
+                    {s.asset.warnings.length > 0 && (
+                      <p className="mt-1.5 flex items-start gap-1 text-[10px] leading-4 text-amber-700">
+                        <TriangleAlert size={11} className="mt-0.5 shrink-0" />
+                        {s.asset.warnings[0]}
+                      </p>
+                    )}
+                  </div>
+                )}
+                {s.cutContour && (
+                  <div
+                    className={cn(
+                      'mb-2 rounded-[8px] border px-2.5 py-2',
+                      s.cutContour.match?.status === 'matched' && 'border-emerald-200 bg-emerald-50',
+                      s.cutContour.match?.status === 'review' && 'border-amber-200 bg-amber-50',
+                      s.cutContour.match?.status === 'mismatch' && 'border-red-200 bg-red-50',
+                    )}
+                  >
+                    <div className="flex items-center gap-2">
+                      <Scissors size={13} className="shrink-0 text-[var(--ink-500)]" />
+                      <div className="min-w-0 flex-1">
+                        <p dir="ltr" className="font-latin truncate text-[10px] font-semibold text-[var(--ink-700)]">
+                          {s.cutContour.fileName}
+                        </p>
+                        <p className="mt-0.5 text-[10px] text-[var(--ink-500)]">
+                          {s.cutContour.match?.status === 'matched'
+                            ? 'مسار القص مطابق للقياس'
+                            : s.cutContour.match?.status === 'review'
+                              ? 'فرق صغير — يحتاج مراجعة'
+                              : 'تحذير: قياس مسار القص مختلف'}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        title="إزالة مسار القص"
+                        onClick={() => clearStoredAttachment(s.id, 'cutContour')}
+                        className="grid h-7 w-7 shrink-0 place-items-center rounded-[6px] text-[var(--ink-400)] hover:bg-white/70 hover:text-[var(--danger-600)]"
+                      >
+                        <X size={13} />
+                      </button>
+                    </div>
+                  </div>
+                )}
                 <DimensionGroup
                   value={{ widthMm: s.widthMm, heightMm: s.heightMm }}
                   onChange={(v) => updateSticker(s.id, { widthMm: v.widthMm, heightMm: v.heightMm })}
@@ -838,6 +998,9 @@ export default function ControlsPanel(props: ControlsPanelProps) {
           )}
         </button>
         {!canCompute && <p className="mt-1.5 text-center text-[11px] text-[var(--ink-400)]">أدخل مقاس التصميم والكمية أولًا</p>}
+        <p className="mt-2 text-center text-[10px] tracking-wide text-[var(--ink-300)]" dir="ltr">
+          ARTeam PrintFlow · engine v13.1 · 2026-07-24 20:10
+        </p>
       </div>
     </div>
   );

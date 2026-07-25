@@ -21,6 +21,11 @@ import {
 import type { PricingRule } from '@/lib/types';
 
 const EASE = [0.22, 0.68, 0.26, 1] as [number, number, number, number];
+const CUT_PATTERN_LABEL: Record<NonNullable<MontageResult['cutPattern']>, string> = {
+  rows: 'قص أفقي',
+  columns: 'قص عمودي',
+  blocks: 'قص بلوكات',
+};
 
 export interface ResultsPanelProps {
   state: MontageUIState;
@@ -177,6 +182,11 @@ export default function ResultsPanel(props: ResultsPanelProps) {
                   <span className="min-w-0 flex-1">
                     <span className="flex items-center gap-1.5 text-[13px] font-bold text-[var(--ink-900)]">
                       {v.label}
+                      {v.result.cutPattern && (
+                        <span className="rounded-full border border-[var(--cyan-600)]/25 bg-white px-1.5 py-px text-[10px] font-semibold text-[var(--cyan-600)]">
+                          {CUT_PATTERN_LABEL[v.result.cutPattern]}
+                        </span>
+                      )}
                       {i === 0 && (
                         <span className="rounded-full bg-[var(--cyan-600)]/10 px-1.5 py-px text-[10px] font-semibold text-[var(--cyan-600)]">افتراضي</span>
                       )}
@@ -233,6 +243,11 @@ export default function ResultsPanel(props: ResultsPanelProps) {
         <header className="mb-2 flex items-center gap-2">
           <Sparkles size={17} className="text-[var(--cyan-600)]" />
           <h3 className="text-[17px] leading-[26px] font-semibold text-[var(--ink-900)]">التوصية الذكية</h3>
+          {result.cutPattern && (
+            <span className="rounded-full border border-[var(--cyan-600)]/25 bg-white px-2 py-0.5 text-[11px] font-semibold text-[var(--cyan-600)]">
+              {CUT_PATTERN_LABEL[result.cutPattern]}
+            </span>
+          )}
         </header>
 
         {/* verdict */}

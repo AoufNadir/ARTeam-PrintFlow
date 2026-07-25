@@ -70,8 +70,6 @@ export default function Montage() {
   const [editing, setEditing] = useState(false);
   const [variants, setVariants] = useState<MontageVariant[]>([]);
   const [selectedVariant, setSelectedVariant] = useState(0);
-  const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
-  const [selectedPiece, setSelectedPiece] = useState<number | null>(null);
   const [verso, setVerso] = useState(false);
   const [showCutMarks, setShowCutMarks] = useState(true);
   const [pdfOpen, setPdfOpen] = useState(false);
@@ -181,7 +179,6 @@ export default function Montage() {
         }
       }
       setManualPlaced(null);
-      setSelectedPiece(null);
       window.setTimeout(() => setComputing(false), 320);
     },
     [],
@@ -259,7 +256,6 @@ export default function Montage() {
 
   const resetManual = useCallback(() => {
     setManualPlaced(null);
-    setSelectedPiece(null);
     toast.info('عاد المخطط إلى اقتراح النظام');
   }, []);
 
@@ -270,7 +266,6 @@ export default function Montage() {
       setSelectedVariant(i);
       setResult((prev) => ({ ...v.result, alternatives: prev?.alternatives ?? [] }));
       setManualPlaced(null);
-      setSelectedPiece(null);
     },
     [variants],
   );
@@ -437,10 +432,6 @@ export default function Montage() {
           onUnitChange={setUnit}
           verso={verso}
           onVersoChange={setVerso}
-          selectedGroupId={selectedGroupId}
-          onSelectGroup={setSelectedGroupId}
-          selectedPiece={selectedPiece}
-          onSelectPiece={setSelectedPiece}
           showCutMarks={showCutMarks}
           onToggleCutMarks={() => setShowCutMarks((v) => !v)}
           onSaveManual={saveManual}

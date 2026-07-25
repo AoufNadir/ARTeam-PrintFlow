@@ -1,9 +1,34 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { Crosshair, Eye, EyeOff, Minus, Plus, RotateCw, ZoomIn } from 'lucide-react';
+import {
+  AlignCenterHorizontal,
+  AlignCenterVertical,
+  AlignEndHorizontal,
+  AlignEndVertical,
+  AlignHorizontalSpaceBetween,
+  AlignStartHorizontal,
+  AlignStartVertical,
+  AlignVerticalSpaceBetween,
+  CopyPlus,
+  Crosshair,
+  Eye,
+  EyeOff,
+  Group,
+  Magnet,
+  Minus,
+  Plus,
+  Redo2,
+  RotateCcw,
+  RotateCw,
+  Trash2,
+  Undo2,
+  Ungroup,
+  ZoomIn,
+} from 'lucide-react';
+import { toast } from 'sonner';
 import { computeCutMarks } from '@/lib/cut-marks';
-import { printableArea } from '@/lib/montage-engine';
-import { computeSnap, SNAP_THRESHOLD_MM, type SnapOutcome } from '@/lib/snap-engine';
+import { assertCutPattern, printableArea } from '@/lib/montage-engine';
+import { computeSnap, type SnapOutcome } from '@/lib/snap-engine';
 import type { Machine, MontageResult, PlacedPiece, Unit } from '@/lib/types';
 import { formatMeasure, trimNumber } from '@/lib/units';
 import { cn } from '@/lib/utils';
@@ -21,6 +46,33 @@ import {
 import type { BleedValue } from '@/components/ds/BleedGroup';
 
 const SPRING_FLIP = { type: 'spring', stiffness: 260, damping: 30 } as const;
+const SNAP_THRESHOLD_PX = 8;
+const GEOMETRY_EPS = 0.01;
+
+type AlignCommand = 'left' | 'centerX' | 'right' | 'top' | 'centerY' | 'bottom';
+type DistributeAxis = 'x' | 'y';
+type RotateDirection = 1 | -1;
+
+function makeEditorId(prefix: 'piece' | 'group'): string {
+  return `${prefix}-${crypto.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`}`;
+}
+
+function pieceEditorId(piece: PlacedPiece, index: number): string {
+  return piece.editorId ?? `legacy-${index}-${piece.groupId}-${piece.x}-${piece.y}`;
+}
+
+function cloneLayout(pieces: PlacedPiece[]): PlacedPiece[] {
+  return pieces.map((piece) => ({ ...piece, bleed: piece.bleed ? { ...piece.bleed } : undefined }));
+}
+
+function rectBounds(rects: Rect[]): Rect | null {
+  if (rects.length === 0) return null;
+  const x = Math.min(...rects.map((r) => r.x));
+  const y = Math.min(...rects.map((r) => r.y));
+  const right = Math.max(...rects.map((r) => r.x + r.w));
+  const bottom = Math.max(...rects.map((r) => r.y + r.h));
+  return { x, y, w: right - x, h: bottom - y };
+}
 
 export interface SheetCanvasProps {
   state: MontageUIState;
@@ -35,10 +87,6 @@ export interface SheetCanvasProps {
   onUnitChange: (u: Unit) => void;
   verso: boolean;
   onVersoChange: (v: boolean) => void;
-  selectedGroupId: string | null;
-  onSelectGroup: (id: string | null) => void;
-  selectedPiece: number | null;
-  onSelectPiece: (i: number | null) => void;
   showCutMarks: boolean;
   onToggleCutMarks: () => void;
   onSaveManual: () => void;
@@ -46,23 +94,39 @@ export interface SheetCanvasProps {
 }
 
 interface DragCtx {
-  index: number;
+  pointerId: number;
+  anchorId: string;
+  sourceIds: string[];
+  startClientX: number;
+  startClientY: number;
   valid: boolean;
   dxMm: number;
   dyMm: number;
-  /** Alt + سحب: نسخ القطعة/المجموعة بدل تحريكها */
+  /** Once Alt is seen during a drag, duplication remains locked until drop. */
   duplicate: boolean;
-  /** مرجع القطعة عند بدء السحب — يثبّت هويتها إن استُبدل placed أثناء سحب بطيء */
-  piece: PlacedPiece;
+}
+
+interface MarqueeCtx {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  currentX: number;
+  currentY: number;
+  baseSelection: Set<string>;
+  containOnly: boolean;
 }
 
 export default function SheetCanvas(props: SheetCanvasProps) {
-  const { state, machine, result, placed, manualMode, unit, verso } = props;
+  const { state, machine, result, placed, manualMode, unit, verso, onCommitPieces, onResetManual } = props;
   const wrapRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 800, h: 520 });
   const [zoom, setZoom] = useState(1);
   const [hovered, setHovered] = useState<number | null>(null);
   const [dragCtx, setDragCtx] = useState<DragCtx | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [keyObjectId, setKeyObjectId] = useState<string | null>(null);
+  const [marquee, setMarquee] = useState<MarqueeCtx | null>(null);
+  const [snapEnabled, setSnapEnabled] = useState(true);
   const [invalidFlash, setInvalidFlash] = useState<Rect | null>(null);
   // render-phase flag: has the first calculation already played its draw-in?
   const [calcPlayed, setCalcPlayed] = useState(false);
@@ -107,6 +171,26 @@ export default function SheetCanvas(props: SheetCanvasProps) {
   }, [machine, sheetW, sheetH, state.method]);
 
   const groups = useMemo(() => groupBounds(placed), [placed]);
+  const editorGroups = useMemo(() => {
+    const map = new Map<string, Rect & { ids: string[] }>();
+    placed.forEach((piece, index) => {
+      if (!piece.editorGroupId) return;
+      const id = pieceEditorId(piece, index);
+      const current = map.get(piece.editorGroupId);
+      if (!current) {
+        map.set(piece.editorGroupId, { x: piece.x, y: piece.y, w: piece.w, h: piece.h, ids: [id] });
+        return;
+      }
+      const right = Math.max(current.x + current.w, piece.x + piece.w);
+      const bottom = Math.max(current.y + current.h, piece.y + piece.h);
+      current.x = Math.min(current.x, piece.x);
+      current.y = Math.min(current.y, piece.y);
+      current.w = right - current.x;
+      current.h = bottom - current.y;
+      current.ids.push(id);
+    });
+    return map;
+  }, [placed]);
   const legend = useMemo(() => {
     return state.stickers.map((s) => {
       const b = groups.get(s.id);
@@ -127,81 +211,112 @@ export default function SheetCanvas(props: SheetCanvasProps) {
   }, []);
 
   // ----------------------- undo/redo (الوضع اليدوي) ---------------------------
-  // سجل محدود (~50 خطوة) لتعديلات المخطط اليدوي: تحريك/نسخ/حذف/تدوير/أسهم.
-  // اللقطات تُدفع قبل كل commit، والاسترجاع يمر عبر onCommitPieces للأب.
   const undoStack = useRef<PlacedPiece[][]>([]);
   const redoStack = useRef<PlacedPiece[][]>([]);
-  // عدّاد يجبر إعادة الرسم لعرض عمق السجل في شريط الوضع اليدوي
-  const [histDepth, setHistDepth] = useState(0);
-  useLayoutEffect(() => {
-    if (!manualMode) {
-      undoStack.current = [];
-      redoStack.current = [];
-      setHistDepth(0);
-    }
-  }, [manualMode]);
+  const lastLocalCommit = useRef<PlacedPiece[] | null>(null);
+  const [historyDepth, setHistoryDepth] = useState({ undo: 0, redo: 0 });
 
-  const pushUndo = useCallback(() => {
-    undoStack.current = [...undoStack.current.slice(-49), placed];
+  const syncHistoryDepth = useCallback(() => {
+    setHistoryDepth({ undo: undoStack.current.length, redo: redoStack.current.length });
+  }, []);
+
+  const commitWithoutHistory = useCallback(
+    (next: PlacedPiece[]) => {
+      const committed = cloneLayout(next);
+      lastLocalCommit.current = committed;
+      onCommitPieces(committed);
+    },
+    [onCommitPieces],
+  );
+
+  const commitEdit = useCallback(
+    (next: PlacedPiece[], nextSelection?: Iterable<string>, silent = false) => {
+      if (
+        state.cutMethod === 'guillotine' &&
+        next.length > 0 &&
+        assertCutPattern(next, result?.flipAxis ?? null) === 'invalid'
+      ) {
+        if (!silent) toast.error('رُفض التعديل: المخطط الناتج لا يمكن فصله بضربات قص مستقيمة آمنة.');
+        return false;
+      }
+      undoStack.current = [...undoStack.current.slice(-49), cloneLayout(placed)];
+      redoStack.current = [];
+      const committed = cloneLayout(next);
+      lastLocalCommit.current = committed;
+      onCommitPieces(committed);
+      if (nextSelection) setSelectedIds(new Set(nextSelection));
+      syncHistoryDepth();
+      return true;
+    },
+    [state.cutMethod, result?.flipAxis, placed, onCommitPieces, syncHistoryDepth],
+  );
+
+  // Engine pieces do not carry editor identities. Assign them once when the
+  // user enters manual mode; selection and grouping then remain stable across
+  // copy/delete/undo instead of following fragile array indices.
+  useEffect(() => {
+    if (!manualMode || placed.every((piece) => piece.editorId)) return;
+    commitWithoutHistory(
+      placed.map((piece) => (piece.editorId ? piece : { ...piece, editorId: makeEditorId('piece') })),
+    );
+  }, [manualMode, placed, commitWithoutHistory]);
+
+  // A layout coming from the engine/variant picker invalidates editor history.
+  // Local commits preserve it because the parent keeps the committed reference.
+  useEffect(() => {
+    if (lastLocalCommit.current === placed) {
+      lastLocalCommit.current = null;
+      return;
+    }
+    undoStack.current = [];
     redoStack.current = [];
-    setHistDepth(undoStack.current.length);
+    setSelectedIds(new Set());
+    setKeyObjectId(null);
+    syncHistoryDepth();
+  }, [placed, syncHistoryDepth]);
+
+  useEffect(() => {
+    const available = new Set(placed.map((piece, index) => pieceEditorId(piece, index)));
+    setSelectedIds((current) => {
+      const filtered = new Set([...current].filter((id) => available.has(id)));
+      return filtered.size === current.size ? current : filtered;
+    });
+    setKeyObjectId((current) => (current && available.has(current) ? current : null));
   }, [placed]);
 
   const doUndo = useCallback(() => {
     const stack = undoStack.current;
     if (stack.length === 0) return;
-    const prev = stack[stack.length - 1];
+    const prev = cloneLayout(stack[stack.length - 1]);
     undoStack.current = stack.slice(0, -1);
-    redoStack.current = [...redoStack.current, placed];
-    setHistDepth(undoStack.current.length);
-    props.onCommitPieces(prev);
-  }, [placed, props]);
+    redoStack.current = [...redoStack.current.slice(-49), cloneLayout(placed)];
+    setSelectedIds(new Set());
+    setKeyObjectId(null);
+    commitWithoutHistory(prev);
+    syncHistoryDepth();
+  }, [placed, commitWithoutHistory, syncHistoryDepth]);
 
   const doRedo = useCallback(() => {
     const stack = redoStack.current;
     if (stack.length === 0) return;
-    const next = stack[stack.length - 1];
+    const next = cloneLayout(stack[stack.length - 1]);
     redoStack.current = stack.slice(0, -1);
-    undoStack.current = [...undoStack.current, placed];
-    setHistDepth(undoStack.current.length);
-    props.onCommitPieces(next);
-  }, [placed, props]);
+    undoStack.current = [...undoStack.current.slice(-49), cloneLayout(placed)];
+    setSelectedIds(new Set());
+    setKeyObjectId(null);
+    commitWithoutHistory(next);
+    syncHistoryDepth();
+  }, [placed, commitWithoutHistory, syncHistoryDepth]);
 
   // --------------------------- drag handlers --------------------------------
 
-  /**
-   * هوية القطعة المسحوبة بمرجعها لا بفهرسها: placed قد يُستبدل أثناء سحب بطيء
-   * (إعادة حساب مؤجَّلة في الصفحة الأم) فيزاح الفهرس عن قطعته. الترتيب: نفس
-   * المرجع عند التلميح، ثم بحث بالمرجع، ثم ببصمة هندسية كاملة، وإلا −1
-   * (يرفض المستدعي بأمان ولا يطبَّق السحب على قطعة أخرى).
-   */
-  const findPieceIndex = useCallback(
-    (hint: number, ref: PlacedPiece | null): number => {
-      if (!ref) return placed[hint] ? hint : -1;
-      if (placed[hint] === ref) return hint;
-      const byRef = placed.indexOf(ref);
-      if (byRef >= 0) return byRef;
-      return placed.findIndex(
-        (p) => p.groupId === ref.groupId && p.x === ref.x && p.y === ref.y && p.w === ref.w && p.h === ref.h,
-      );
-    },
-    [placed],
-  );
-
-  /**
-   * Rigid shared offset for a drag: when a whole group is dragged, ONE common
-   * (dx, dy) is clamped against the group's bounding box — never per piece —
-   * so the group moves as a single block and cannot stretch or collapse.
-   * Returns the clamp bounds too so resolveSnap can re-clamp AFTER snapping.
-   */
   const resolveDrag = useCallback(
-    (index: number, dxMm: number, dyMm: number) => {
-      const piece = placed[index];
-      if (!piece) return null;
-      const isGroupDrag = props.selectedGroupId !== null && piece.groupId === props.selectedGroupId;
-      const targets = isGroupDrag
-        ? placed.map((p, i) => ({ p, i })).filter(({ p }) => p.groupId === piece.groupId)
-        : [{ p: piece, i: index }];
+    (sourceIds: string[], dxMm: number, dyMm: number) => {
+      const wanted = new Set(sourceIds);
+      const targets = placed
+        .map((p, i) => ({ p, i, id: pieceEditorId(p, i) }))
+        .filter(({ id }) => wanted.has(id));
+      if (targets.length === 0) return null;
       const minX = Math.min(...targets.map((t) => t.p.x));
       const minY = Math.min(...targets.map((t) => t.p.y));
       const maxX = Math.max(...targets.map((t) => t.p.x + t.p.w));
@@ -210,10 +325,9 @@ export default function SheetCanvas(props: SheetCanvasProps) {
       const dy = Math.min(Math.max(dyMm, area.y - minY), area.y + area.h - maxY);
       return { targets, dx, dy, minX, minY, maxX, maxY };
     },
-    [placed, area, props.selectedGroupId],
+    [placed, area],
   );
 
-  /** نتيجة «بلا التصاق» — تحتفظ بقياسات المسافات الحية حتى عند تجاهل الالتصاق */
   const noSnap = (measures: SnapOutcome['measures']): SnapOutcome => ({
     dx: 0,
     dy: 0,
@@ -223,30 +337,18 @@ export default function SheetCanvas(props: SheetCanvasProps) {
     measures,
   });
 
-  /**
-   * resolveDrag + الالتصاق (Smart Guides): الإزاحة المشتركة الصارمة تلتصق
-   * كوحدة واحدة على حواف/مراكز القطع الثابتة والمراجع (منطقة الطباعة، محور
-   * القلب، حواف الأشرطة). قواعد معتمدة:
-   *  1. بعد تطبيق تصحيح الالتصاق تُعاد التقييدات نفسها (clamp) — ناتج snap
-   *     لا يخرج أبداً عن حدود منطقة الطباعة لصندوق التحريك.
-   *  2. الموضع الصالح أولاً: إن كان الموضع الملتصق غير صالح (تداخل/شريط/حد)
-   *     بينما غير الملتصق صالح ← يُتجاهل الالتصاق كلياً ويُعتمد الموضع الصالح.
-   *  3. عند النسخ (Alt) تُستبعد القطع المصدر من الثوابت — وإلا انجذبت النسخة
-   *     إلى موضع الأصل (dx≈0) فأُلغيت عند التحقق.
-   * liveCheck/commitDrag يعملان على الموضع النهائي الملتصق المقيّد.
-   */
   const resolveSnap = useCallback(
-    (index: number, dxMm: number, dyMm: number, duplicate: boolean, pieceRef?: PlacedPiece) => {
-      const idx = findPieceIndex(index, pieceRef ?? null);
-      if (idx < 0) return null;
-      const drag = resolveDrag(idx, dxMm, dyMm);
+    (sourceIds: string[], dxMm: number, dyMm: number, duplicate: boolean) => {
+      const drag = resolveDrag(sourceIds, dxMm, dyMm);
       if (!drag) return null;
       const { targets, dx, dy, minX, minY, maxX, maxY } = drag;
       const movedIdx = new Set(targets.map((t) => t.i));
       const moving = targets.map((t) => ({ x: t.p.x + dx, y: t.p.y + dy, w: t.p.w, h: t.p.h }));
-      // الثوابت: كل القطع عدا المتحركة — المصادر تُستبعد أيضاً في وضع النسخ
+
+      // A duplicate is a new moving object, therefore its originals remain
+      // static snap/overlap targets. A regular move excludes its own sources.
       const statics = placed
-        .filter((_, j) => !movedIdx.has(j))
+        .filter((_, j) => duplicate || !movedIdx.has(j))
         .map((p) => ({ x: p.x, y: p.y, w: p.w, h: p.h }));
       const refsV: number[] = [area.x, area.x + area.w];
       const refsH: number[] = [area.y, area.y + area.h];
@@ -258,51 +360,62 @@ export default function SheetCanvas(props: SheetCanvasProps) {
         refsV.push(b.x, b.x + b.w);
         refsH.push(b.y, b.y + b.h);
       }
-      const snap = computeSnap(moving, statics, { refsV, refsH, area }, SNAP_THRESHOLD_MM);
-      // 1) إعادة التقييد بعد التصحيح — نفس حدود resolveDrag تماماً
+      const thresholdMm = Math.min(5, Math.max(0.8, SNAP_THRESHOLD_PX / Math.max(s, 0.1)));
+      const snap = snapEnabled
+        ? computeSnap(moving, statics, { refsV, refsH, area }, thresholdMm)
+        : noSnap([]);
       let fdx = Math.min(Math.max(dx + snap.dx, area.x - minX), area.x + area.w - maxX);
       let fdy = Math.min(Math.max(dy + snap.dy, area.y - minY), area.y + area.h - maxY);
-      let effSnap: SnapOutcome =
-        Math.abs(fdx - dx) > 1e-9 || Math.abs(fdy - dy) > 1e-9
-          ? { ...snap, dx: fdx - dx, dy: fdy - dy, snappedX: Math.abs(fdx - dx) > 1e-6 && snap.snappedX, snappedY: Math.abs(fdy - dy) > 1e-6 && snap.snappedY }
-          : noSnap(snap.measures);
-      // 2) الموضع الصالح أولاً: ملتصق غير صالح + غير ملتصق صالح ← تجاهل الالتصاق
-      if (effSnap.snappedX || effSnap.snappedY) {
-        const validAt = (ox: number, oy: number) => {
-          if (duplicate) {
-            const copies = targets.map(({ p }) => ({ x: p.x + ox, y: p.y + oy, w: p.w, h: p.h }));
-            const base = placed.map((p) => ({ x: p.x, y: p.y, w: p.w, h: p.h }));
-            return copies.every((cand, k) => {
-              const others = [...base, ...copies.filter((_, j) => j !== k)];
-              return placementValid(cand, others, area, bands);
-            });
-          }
-          return targets.every(({ p }) => {
-            const cand = { x: p.x + ox, y: p.y + oy, w: p.w, h: p.h };
-            const others = placed.filter((_, j) => !movedIdx.has(j)).map((o) => ({ x: o.x, y: o.y, w: o.w, h: o.h }));
-            return placementValid(cand, others, area, bands);
-          });
-        };
-        if (!validAt(fdx, fdy) && validAt(dx, dy)) {
-          fdx = dx;
-          fdy = dy;
-          effSnap = noSnap(snap.measures);
+      const keepsV = Math.abs(fdx - dx - snap.dx) <= 0.02;
+      const keepsH = Math.abs(fdy - dy - snap.dy) <= 0.02;
+      let effSnap: SnapOutcome = {
+        ...snap,
+        dx: fdx - dx,
+        dy: fdy - dy,
+        snappedX: keepsV && snap.guides.some((guide) => guide.axis === 'v'),
+        snappedY: keepsH && snap.guides.some((guide) => guide.axis === 'h'),
+        guides: snap.guides.filter((guide) => (guide.axis === 'v' ? keepsV : keepsH)),
+      };
+
+      const validAt = (offsetX: number, offsetY: number) => {
+        if (duplicate) {
+          const copies = targets.map(({ p }) => ({ x: p.x + offsetX, y: p.y + offsetY, w: p.w, h: p.h }));
+          const base = placed.map((p) => ({ x: p.x, y: p.y, w: p.w, h: p.h }));
+          return copies.every((candidate, copyIndex) =>
+            placementValid(
+              candidate,
+              [...base, ...copies.filter((_, index) => index !== copyIndex)],
+              area,
+              bands,
+            ),
+          );
         }
+        const fixed = placed
+          .filter((_, index) => !movedIdx.has(index))
+          .map((piece) => ({ x: piece.x, y: piece.y, w: piece.w, h: piece.h }));
+        return targets.every(({ p }) =>
+          placementValid({ x: p.x + offsetX, y: p.y + offsetY, w: p.w, h: p.h }, fixed, area, bands),
+        );
+      };
+
+      // Prefer a valid raw position over a snap that would create an overlap.
+      if (!validAt(fdx, fdy) && validAt(dx, dy)) {
+        fdx = dx;
+        fdy = dy;
+        effSnap = noSnap(snap.measures);
       }
       return { targets, movedIdx, dx: fdx, dy: fdy, snap: effSnap };
     },
-    [findPieceIndex, resolveDrag, placed, area, bands, result],
+    [resolveDrag, placed, area, bands, result, s, snapEnabled],
   );
 
   const commitDrag = useCallback(
-    (index: number, dxMm: number, dyMm: number, duplicate: boolean, pieceRef?: PlacedPiece) => {
-      // نقرة بلا سحب فعلي — لا شيء يُلتزم ولا خطوة تراجع
-      if (!duplicate && Math.abs(dxMm) < 0.05 && Math.abs(dyMm) < 0.05) return;
-      const r = resolveSnap(index, dxMm, dyMm, duplicate, pieceRef);
-      if (!r) return;
+    (sourceIds: string[], dxMm: number, dyMm: number, duplicate: boolean, silent = false) => {
+      if (!duplicate && Math.abs(dxMm) < 0.05 && Math.abs(dyMm) < 0.05) return false;
+      const r = resolveSnap(sourceIds, dxMm, dyMm, duplicate);
+      if (!r) return false;
       const { targets, movedIdx, dx, dy } = r;
-      // حارس النقرة للنسخ يفحص الإزاحة النهائية (بعد التقييد والالتصاق) لا الخام
-      if (duplicate && Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+      if (duplicate && Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return false;
 
       if (!duplicate) {
         const next = placed.map((p) => ({ ...p }));
@@ -316,33 +429,45 @@ export default function SheetCanvas(props: SheetCanvasProps) {
           const cand = next[i];
           if (!placementValid(cand, others, area, bands)) {
             flashInvalid(cand);
-            return; // reject → framer springs the dragged piece back
+            return false;
           }
         }
-        pushUndo();
-        props.onCommitPieces(next);
-        return;
+        return commitEdit(next, sourceIds, silent);
       }
 
-      // Alt + سحب: الأصل يبقى في مكانه؛ النسخ تُتحقق ضد كل القطع + بعضها
-      const copies = targets.map(({ p }) => ({ ...p, x: p.x + dx, y: p.y + dy }));
+      const duplicatedGroups = new Map<string, string>();
+      const copies = targets.map(({ p }) => {
+        const editorGroupId = p.editorGroupId
+          ? duplicatedGroups.get(p.editorGroupId) ?? (() => {
+              const groupId = makeEditorId('group');
+              duplicatedGroups.set(p.editorGroupId!, groupId);
+              return groupId;
+            })()
+          : undefined;
+        return {
+          ...p,
+          editorId: makeEditorId('piece'),
+          editorGroupId,
+          x: p.x + dx,
+          y: p.y + dy,
+        };
+      });
       const base = placed.map((p) => ({ x: p.x, y: p.y, w: p.w, h: p.h }));
       for (let k = 0; k < copies.length; k++) {
         const others = [...base, ...copies.filter((_, j) => j !== k).map((p) => ({ x: p.x, y: p.y, w: p.w, h: p.h }))];
         if (!placementValid(copies[k], others, area, bands)) {
           flashInvalid(copies[k]);
-          return; // موضع غير صالح → تُلغى النسخة ويرتد الأصل
+          return false;
         }
       }
-      pushUndo();
-      props.onCommitPieces([...placed, ...copies]);
+      return commitEdit([...placed, ...copies], copies.map((piece) => piece.editorId!), silent);
     },
-    [placed, area, bands, props, flashInvalid, resolveSnap, pushUndo],
+    [placed, area, bands, flashInvalid, resolveSnap, commitEdit],
   );
 
   const liveCheck = useCallback(
-    (index: number, dxMm: number, dyMm: number, duplicate: boolean, pieceRef?: PlacedPiece): boolean => {
-      const r = resolveSnap(index, dxMm, dyMm, duplicate, pieceRef);
+    (sourceIds: string[], dxMm: number, dyMm: number, duplicate: boolean): boolean => {
+      const r = resolveSnap(sourceIds, dxMm, dyMm, duplicate);
       if (!r) return true;
       const { targets, movedIdx, dx, dy } = r;
       if (!duplicate) {
@@ -365,77 +490,228 @@ export default function SheetCanvas(props: SheetCanvasProps) {
 
   // --------------------- عمليات التحرير (تدوير/حذف/أسهم) ----------------------
 
-  /** R — تدوير القطعة المحددة 90° حول مركزها؛ تُرفض بومضة إن اصطدمت */
-  const rotateLocal = useCallback(() => {
-    if (props.selectedPiece === null) return;
-    const p = placed[props.selectedPiece];
-    if (!p) return;
-    const cx = p.x + p.w / 2;
-    const cy = p.y + p.h / 2;
-    const cand: PlacedPiece = { ...p, x: cx - p.h / 2, y: cy - p.w / 2, w: p.h, h: p.w, rotated: !p.rotated };
-    const others = placed.filter((_, j) => j !== props.selectedPiece).map((o) => ({ x: o.x, y: o.y, w: o.w, h: o.h }));
-    if (!placementValid(cand, others, area, bands)) {
-      flashInvalid(cand);
-      return;
-    }
-    pushUndo();
-    props.onCommitPieces(placed.map((o, j) => (j === props.selectedPiece ? cand : o)));
-  }, [props, placed, area, bands, flashInvalid, pushUndo]);
+  const selectedEntries = useMemo(
+    () =>
+      placed
+        .map((piece, index) => ({ piece, index, id: pieceEditorId(piece, index) }))
+        .filter(({ id }) => selectedIds.has(id)),
+    [placed, selectedIds],
+  );
+  const selectionBounds = useMemo(() => {
+    return rectBounds(selectedEntries.map(({ piece }) => piece));
+  }, [selectedEntries]);
 
-  /** Delete/Backspace — حذف القطعة المحددة، أو المجموعة بعد تأكيد بسيط */
-  const deleteSelection = useCallback(() => {
-    if (props.selectedPiece !== null && placed[props.selectedPiece]) {
-      pushUndo();
-      props.onCommitPieces(placed.filter((_, j) => j !== props.selectedPiece));
-      props.onSelectPiece(null);
-      return;
-    }
-    if (props.selectedGroupId) {
-      const gid = props.selectedGroupId;
-      const count = placed.filter((p) => p.groupId === gid).length;
-      if (count === 0) return;
-      if (!window.confirm(`حذف ${count} قطعة من هذه المجموعة؟`)) return;
-      pushUndo();
-      props.onCommitPieces(placed.filter((p) => p.groupId !== gid));
-      props.onSelectGroup(null);
-    }
-  }, [props, placed, pushUndo]);
-
-  /** الأسهم — تحريك القطعة/المجموعة المحددة step مم (Shift = ×10) مع نفس التحقق */
-  const nudgeSelection = useCallback(
-    (dxMm: number, dyMm: number) => {
-      const isGroup = props.selectedPiece === null && props.selectedGroupId !== null;
-      const anchorIdx =
-        props.selectedPiece ?? (props.selectedGroupId ? placed.findIndex((p) => p.groupId === props.selectedGroupId) : -1);
-      if (anchorIdx < 0 || !placed[anchorIdx]) return;
-      const targets = isGroup
-        ? placed.map((p, i) => ({ p, i })).filter(({ p }) => p.groupId === props.selectedGroupId)
-        : [{ p: placed[anchorIdx], i: anchorIdx }];
-      // إزاحة صارمة مشتركة مقيّدة بصندوق التحريك (نفس منطق resolveDrag)
-      const minX = Math.min(...targets.map((t) => t.p.x));
-      const minY = Math.min(...targets.map((t) => t.p.y));
-      const maxX = Math.max(...targets.map((t) => t.p.x + t.p.w));
-      const maxY = Math.max(...targets.map((t) => t.p.y + t.p.h));
-      const dx = Math.min(Math.max(dxMm, area.x - minX), area.x + area.w - maxX);
-      const dy = Math.min(Math.max(dyMm, area.y - minY), area.y + area.h - maxY);
-      if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return; // عند الحد — بصمت
-      const movedIdx = new Set(targets.map((t) => t.i));
-      const next = placed.map((p) => ({ ...p }));
-      for (const { i } of targets) next[i] = { ...next[i], x: next[i].x + dx, y: next[i].y + dy };
-      for (const { i } of targets) {
-        const others = next.filter((_, j) => !movedIdx.has(j)).map((p) => ({ x: p.x, y: p.y, w: p.w, h: p.h }));
-        if (!placementValid(next[i], others, area, bands)) {
-          flashInvalid(next[i]);
-          return;
-        }
-      }
-      pushUndo();
-      props.onCommitPieces(next);
-    },
-    [props, placed, area, bands, flashInvalid, pushUndo],
+  const keyEntry = useMemo(
+    () => selectedEntries.find(({ id }) => id === keyObjectId) ?? null,
+    [selectedEntries, keyObjectId],
   );
 
-  // اختصارات لوحة المفاتيح — الوضع اليدوي ووجه Recto فقط، وبعيداً عن حقول الإدخال
+  const firstInvalidPiece = useCallback(
+    (layout: PlacedPiece[]): PlacedPiece | null => {
+      const rects = layout.map((piece) => ({ x: piece.x, y: piece.y, w: piece.w, h: piece.h }));
+      for (let index = 0; index < layout.length; index++) {
+        const others = rects.filter((_, otherIndex) => otherIndex !== index);
+        if (!placementValid(rects[index], others, area, bands)) return layout[index];
+      }
+      return null;
+    },
+    [area, bands],
+  );
+
+  const commitValidatedEdit = useCallback(
+    (next: PlacedPiece[], nextSelection: Iterable<string>, invalidMessage: string) => {
+      const invalid = firstInvalidPiece(next);
+      if (invalid) {
+        flashInvalid(invalid);
+        toast.error(invalidMessage);
+        return false;
+      }
+      return commitEdit(next, nextSelection);
+    },
+    [firstInvalidPiece, flashInvalid, commitEdit],
+  );
+
+  const fitSelectionIntoArea = useCallback(
+    (layout: PlacedPiece[], ids: Set<string>) => {
+      const selected = layout
+        .map((piece, index) => ({ piece, id: pieceEditorId(piece, index) }))
+        .filter(({ id }) => ids.has(id))
+        .map(({ piece }) => piece);
+      const bounds = rectBounds(selected);
+      if (!bounds || bounds.w > area.w + GEOMETRY_EPS || bounds.h > area.h + GEOMETRY_EPS) return layout;
+
+      let dx = 0;
+      let dy = 0;
+      if (bounds.x < area.x) dx = area.x - bounds.x;
+      else if (bounds.x + bounds.w > area.x + area.w) dx = area.x + area.w - bounds.x - bounds.w;
+      if (bounds.y < area.y) dy = area.y - bounds.y;
+      else if (bounds.y + bounds.h > area.y + area.h) dy = area.y + area.h - bounds.y - bounds.h;
+      if (Math.abs(dx) < GEOMETRY_EPS && Math.abs(dy) < GEOMETRY_EPS) return layout;
+      return layout.map((piece, index) =>
+        ids.has(pieceEditorId(piece, index)) ? { ...piece, x: piece.x + dx, y: piece.y + dy } : piece,
+      );
+    },
+    [area],
+  );
+
+  const rotateSelection = useCallback(
+    (direction: RotateDirection = 1) => {
+      if (selectedEntries.length === 0 || !selectionBounds) return;
+      const ids = new Set(selectedIds);
+      const cx = selectionBounds.x + selectionBounds.w / 2;
+      const cy = selectionBounds.y + selectionBounds.h / 2;
+      const next = placed.map((piece, index) => {
+        if (!ids.has(pieceEditorId(piece, index))) return piece;
+        const pcx = piece.x + piece.w / 2;
+        const pcy = piece.y + piece.h / 2;
+        const relX = pcx - cx;
+        const relY = pcy - cy;
+        const nextRelX = direction === 1 ? -relY : relY;
+        const nextRelY = direction === 1 ? relX : -relX;
+        const nextW = piece.h;
+        const nextH = piece.w;
+        return {
+          ...piece,
+          x: cx + nextRelX - nextW / 2,
+          y: cy + nextRelY - nextH / 2,
+          w: nextW,
+          h: nextH,
+          rotated: !piece.rotated,
+        };
+      });
+      const fitted = fitSelectionIntoArea(next, ids);
+      commitValidatedEdit(fitted, selectedIds, 'تعذّر التدوير: توجد قطعة خارج الورقة أو فوق قطعة أخرى.');
+    },
+    [selectedEntries, selectionBounds, selectedIds, placed, fitSelectionIntoArea, commitValidatedEdit],
+  );
+
+  const alignSelection = useCallback(
+    (command: AlignCommand) => {
+      if (selectedEntries.length === 0) return;
+      const reference =
+        selectedEntries.length === 1
+          ? area
+          : keyEntry
+            ? { x: keyEntry.piece.x, y: keyEntry.piece.y, w: keyEntry.piece.w, h: keyEntry.piece.h }
+            : selectionBounds;
+      if (!reference) return;
+
+      const ids = new Set(selectedIds);
+      const next = placed.map((piece, index) => {
+        if (!ids.has(pieceEditorId(piece, index))) return piece;
+        let x = piece.x;
+        let y = piece.y;
+        if (command === 'left') x = reference.x;
+        else if (command === 'centerX') x = reference.x + reference.w / 2 - piece.w / 2;
+        else if (command === 'right') x = reference.x + reference.w - piece.w;
+        else if (command === 'top') y = reference.y;
+        else if (command === 'centerY') y = reference.y + reference.h / 2 - piece.h / 2;
+        else if (command === 'bottom') y = reference.y + reference.h - piece.h;
+        return { ...piece, x, y };
+      });
+      commitValidatedEdit(next, selectedIds, 'تعذّرت المحاذاة: الوضعية الناتجة فيها تداخل أو خروج من مساحة الطباعة.');
+    },
+    [selectedEntries, area, keyEntry, selectionBounds, selectedIds, placed, commitValidatedEdit],
+  );
+
+  const distributeSelection = useCallback(
+    (axis: DistributeAxis) => {
+      if (selectedEntries.length < 3 || !selectionBounds) return;
+      const sorted = [...selectedEntries].sort((a, b) =>
+        axis === 'x' ? a.piece.x - b.piece.x : a.piece.y - b.piece.y,
+      );
+      const span = axis === 'x' ? selectionBounds.w : selectionBounds.h;
+      const used = sorted.reduce((sum, entry) => sum + (axis === 'x' ? entry.piece.w : entry.piece.h), 0);
+      const gap = (span - used) / (sorted.length - 1);
+      if (gap < -GEOMETRY_EPS) {
+        toast.error('لا توجد مساحة كافية لتوزيع العناصر بدون تداخل.');
+        return;
+      }
+
+      const positions = new Map<string, number>();
+      let cursor = axis === 'x' ? selectionBounds.x : selectionBounds.y;
+      for (const entry of sorted) {
+        positions.set(entry.id, cursor);
+        cursor += (axis === 'x' ? entry.piece.w : entry.piece.h) + gap;
+      }
+
+      const next = placed.map((piece, index) => {
+        const id = pieceEditorId(piece, index);
+        const pos = positions.get(id);
+        if (pos === undefined) return piece;
+        return axis === 'x' ? { ...piece, x: pos } : { ...piece, y: pos };
+      });
+      commitValidatedEdit(next, selectedIds, 'تعذّر التوزيع: الوضعية الناتجة فيها تداخل أو خروج من مساحة الطباعة.');
+    },
+    [selectedEntries, selectionBounds, placed, selectedIds, commitValidatedEdit],
+  );
+
+  const deleteSelection = useCallback(() => {
+    if (selectedIds.size === 0) return;
+    setKeyObjectId(null);
+    commitEdit(
+      placed.filter((piece, index) => !selectedIds.has(pieceEditorId(piece, index))),
+      [],
+    );
+  }, [placed, selectedIds, commitEdit]);
+
+  const nudgeSelection = useCallback(
+    (dxMm: number, dyMm: number) => {
+      if (selectedIds.size === 0) return;
+      commitDrag([...selectedIds], dxMm, dyMm, false);
+    },
+    [selectedIds, commitDrag],
+  );
+
+  const createEditorGroup = useCallback(() => {
+    if (selectedIds.size < 2) {
+      toast.info('حدد ملصقين أو أكثر باستعمال Shift ثم أنشئ المجموعة.');
+      return;
+    }
+    const editorGroupId = makeEditorId('group');
+    commitEdit(
+      placed.map((piece, index) =>
+        selectedIds.has(pieceEditorId(piece, index)) ? { ...piece, editorGroupId } : piece,
+      ),
+      selectedIds,
+    );
+  }, [placed, selectedIds, commitEdit]);
+
+  const ungroupSelection = useCallback(() => {
+    const hasGroup = selectedEntries.some(({ piece }) => piece.editorGroupId);
+    if (!hasGroup) return;
+    commitEdit(
+      placed.map((piece, index) =>
+        selectedIds.has(pieceEditorId(piece, index)) ? { ...piece, editorGroupId: undefined } : piece,
+      ),
+      selectedIds,
+    );
+  }, [placed, selectedIds, selectedEntries, commitEdit]);
+
+  const duplicateSelection = useCallback(() => {
+    if (selectedEntries.length === 0) return;
+    const ids = [...selectedIds];
+    const minX = Math.min(...selectedEntries.map(({ piece }) => piece.x));
+    const minY = Math.min(...selectedEntries.map(({ piece }) => piece.y));
+    const maxX = Math.max(...selectedEntries.map(({ piece }) => piece.x + piece.w));
+    const maxY = Math.max(...selectedEntries.map(({ piece }) => piece.y + piece.h));
+    const width = maxX - minX;
+    const height = maxY - minY;
+    const gap = Math.max(0, state.defaultGapMm);
+    const candidates: [number, number][] = [
+      [width + gap, 0],
+      [-(width + gap), 0],
+      [0, height + gap],
+      [0, -(height + gap)],
+      [width + gap, height + gap],
+      [-(width + gap), height + gap],
+    ];
+    for (const [dx, dy] of candidates) {
+      if (commitDrag(ids, dx, dy, true, true)) return;
+    }
+    toast.error('لا توجد وضعية صالحة وآمنة لنسخ التحديد داخل الورقة.');
+  }, [selectedEntries, selectedIds, state.defaultGapMm, commitDrag]);
+
   useEffect(() => {
     if (!manualMode || verso) return;
     const onKey = (e: KeyboardEvent) => {
@@ -454,13 +730,29 @@ export default function SheetCanvas(props: SheetCanvasProps) {
         doRedo();
         return;
       }
+      if ((e.ctrlKey || e.metaKey) && k.toLowerCase() === 'g') {
+        e.preventDefault();
+        if (e.shiftKey) ungroupSelection();
+        else createEditorGroup();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && k.toLowerCase() === 'd') {
+        e.preventDefault();
+        duplicateSelection();
+        return;
+      }
       if (k === 'Delete' || k === 'Backspace') {
         e.preventDefault();
         deleteSelection();
         return;
       }
+      if (k === 'Escape') {
+        setSelectedIds(new Set());
+        setKeyObjectId(null);
+        return;
+      }
       if (k === 'r' || k === 'R') {
-        rotateLocal();
+        rotateSelection(e.shiftKey ? -1 : 1);
         return;
       }
       if (k.startsWith('Arrow')) {
@@ -474,17 +766,25 @@ export default function SheetCanvas(props: SheetCanvasProps) {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [manualMode, verso, doUndo, doRedo, deleteSelection, rotateLocal, nudgeSelection]);
+  }, [
+    manualMode,
+    verso,
+    doUndo,
+    doRedo,
+    createEditorGroup,
+    ungroupSelection,
+    duplicateSelection,
+    deleteSelection,
+    rotateSelection,
+    nudgeSelection,
+  ]);
 
   // معلومات السحب الحي: الموضع الملتصق + خطوط الإرشاد والقياسات (Smart Guides)
   const dragInfo = useMemo(() => {
     if (!dragCtx) return null;
-    return resolveSnap(dragCtx.index, dragCtx.dxMm, dragCtx.dyMm, dragCtx.duplicate, dragCtx.piece);
+    return resolveSnap(dragCtx.sourceIds, dragCtx.dxMm, dragCtx.dyMm, dragCtx.duplicate);
   }, [dragCtx, resolveSnap]);
 
-  // ---------------- معالجات أحداث القطع (مستقرة من أجل memo) -----------------
-  // dragCtxRef يحمل آخر سياق سحب حتى تبقى المعالجات مستقرة أثناء السحب بينما
-  // تقرأ أحدث مرجع للقطعة (isolation عن دورة state).
   const dragCtxRef = useRef<DragCtx | null>(null);
   const updateDragCtx = useCallback((ctx: DragCtx | null) => {
     dragCtxRef.current = ctx;
@@ -493,34 +793,219 @@ export default function SheetCanvas(props: SheetCanvasProps) {
 
   const handleHover = useCallback((i: number) => setHovered(i), []);
   const handleHoverEnd = useCallback((i: number) => setHovered((h) => (h === i ? null : h)), []);
-  const handleClick = useCallback(
-    (i: number) => props.onSelectPiece(props.selectedPiece === i ? null : i),
-    [props],
-  );
-  const handleDragStart = useCallback(
-    (i: number, alt: boolean) => {
+
+  const handlePointerDown = useCallback(
+    (i: number, event: React.PointerEvent<SVGGElement>) => {
+      if (!manualMode || verso || event.button !== 0) return;
       const piece = placed[i];
       if (!piece) return;
-      updateDragCtx({ index: i, valid: true, dxMm: 0, dyMm: 0, duplicate: alt, piece });
+      event.preventDefault();
+      event.stopPropagation();
+      event.currentTarget.setPointerCapture(event.pointerId);
+
+      const clickedId = pieceEditorId(piece, i);
+      const groupMembers = piece.editorGroupId
+        ? placed
+            .map((candidate, index) => ({ candidate, id: pieceEditorId(candidate, index) }))
+            .filter(({ candidate }) => candidate.editorGroupId === piece.editorGroupId)
+            .map(({ id }) => id)
+        : [clickedId];
+
+      const nextSelection = new Set(selectedIds);
+      if (event.shiftKey) {
+        const allSelected = groupMembers.every((id) => nextSelection.has(id));
+        for (const id of groupMembers) {
+          if (allSelected) nextSelection.delete(id);
+          else nextSelection.add(id);
+        }
+      } else if (!nextSelection.has(clickedId)) {
+        nextSelection.clear();
+        groupMembers.forEach((id) => nextSelection.add(id));
+      }
+      if (nextSelection.size === 0) groupMembers.forEach((id) => nextSelection.add(id));
+      setSelectedIds(nextSelection);
+      setKeyObjectId(nextSelection.has(clickedId) ? clickedId : null);
+      updateDragCtx({
+        pointerId: event.pointerId,
+        anchorId: clickedId,
+        sourceIds: [...nextSelection],
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        valid: true,
+        dxMm: 0,
+        dyMm: 0,
+        duplicate: event.altKey,
+      });
     },
-    [placed, updateDragCtx],
+    [manualMode, verso, placed, selectedIds, updateDragCtx],
   );
-  const handleDragMove = useCallback(
-    (i: number, dxMm: number, dyMm: number, alt: boolean) => {
-      const ref = dragCtxRef.current?.piece ?? placed[i];
-      if (!ref) return;
-      updateDragCtx({ index: i, valid: liveCheck(i, dxMm, dyMm, alt, ref), dxMm, dyMm, duplicate: alt, piece: ref });
+
+  const handlePointerMove = useCallback(
+    (event: React.PointerEvent<SVGGElement>) => {
+      const current = dragCtxRef.current;
+      if (!current || current.pointerId !== event.pointerId) return;
+      const dxMm = (event.clientX - current.startClientX) / s;
+      const dyMm = (event.clientY - current.startClientY) / s;
+      const duplicate = current.duplicate || event.altKey;
+      updateDragCtx({
+        ...current,
+        valid: liveCheck(current.sourceIds, dxMm, dyMm, duplicate),
+        dxMm,
+        dyMm,
+        duplicate,
+      });
     },
-    [placed, liveCheck, updateDragCtx],
+    [s, liveCheck, updateDragCtx],
   );
-  const handleDragEnd = useCallback(
-    (i: number, dxMm: number, dyMm: number, alt: boolean) => {
-      const ref = dragCtxRef.current?.piece ?? placed[i];
+
+  const handlePointerUp = useCallback(
+    (event: React.PointerEvent<SVGGElement>) => {
+      const current = dragCtxRef.current;
+      if (!current || current.pointerId !== event.pointerId) return;
+      const dxMm = (event.clientX - current.startClientX) / s;
+      const dyMm = (event.clientY - current.startClientY) / s;
+      const duplicate = current.duplicate || event.altKey;
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
       updateDragCtx(null);
-      if (ref) commitDrag(i, dxMm, dyMm, alt, ref);
+      commitDrag(current.sourceIds, dxMm, dyMm, duplicate);
     },
-    [placed, commitDrag, updateDragCtx],
+    [s, commitDrag, updateDragCtx],
   );
+
+  const handlePointerCancel = useCallback(
+    (event: React.PointerEvent<SVGGElement>) => {
+      const current = dragCtxRef.current;
+      if (!current || current.pointerId !== event.pointerId) return;
+      updateDragCtx(null);
+    },
+    [updateDragCtx],
+  );
+
+  const canvasPoint = useCallback(
+    (element: SVGSVGElement, clientX: number, clientY: number) => {
+      const rect = element.getBoundingClientRect();
+      return {
+        x: (clientX - rect.left - ox) / s,
+        y: (clientY - rect.top - oy) / s,
+      };
+    },
+    [ox, oy, s],
+  );
+
+  const selectionFromMarquee = useCallback(
+    (ctx: MarqueeCtx, endX = ctx.currentX, endY = ctx.currentY) => {
+      const x1 = Math.min(ctx.startX, endX);
+      const y1 = Math.min(ctx.startY, endY);
+      const x2 = Math.max(ctx.startX, endX);
+      const y2 = Math.max(ctx.startY, endY);
+      if (x2 - x1 < 0.5 && y2 - y1 < 0.5) return new Set(ctx.baseSelection);
+
+      const next = new Set(ctx.baseSelection);
+      const touchedGroups = new Set<string>();
+      placed.forEach((piece, index) => {
+        const inside = piece.x >= x1 && piece.x + piece.w <= x2 && piece.y >= y1 && piece.y + piece.h <= y2;
+        const intersects = piece.x < x2 && piece.x + piece.w > x1 && piece.y < y2 && piece.y + piece.h > y1;
+        if (ctx.containOnly ? !inside : !intersects) return;
+        next.add(pieceEditorId(piece, index));
+        if (piece.editorGroupId) touchedGroups.add(piece.editorGroupId);
+      });
+      if (touchedGroups.size > 0) {
+        placed.forEach((piece, index) => {
+          if (piece.editorGroupId && touchedGroups.has(piece.editorGroupId)) next.add(pieceEditorId(piece, index));
+        });
+      }
+      return next;
+    },
+    [placed],
+  );
+
+  const handleCanvasPointerDown = useCallback(
+    (event: React.PointerEvent<SVGSVGElement>) => {
+      if (!manualMode || verso || event.button !== 0 || dragCtxRef.current) return;
+      event.preventDefault();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      const point = canvasPoint(event.currentTarget, event.clientX, event.clientY);
+      const baseSelection = event.shiftKey ? new Set(selectedIds) : new Set<string>();
+      if (!event.shiftKey) setSelectedIds(new Set());
+      setKeyObjectId(null);
+      setMarquee({
+        pointerId: event.pointerId,
+        startX: point.x,
+        startY: point.y,
+        currentX: point.x,
+        currentY: point.y,
+        baseSelection,
+        containOnly: event.altKey,
+      });
+    },
+    [manualMode, verso, canvasPoint, selectedIds],
+  );
+
+  const handleCanvasPointerMove = useCallback(
+    (event: React.PointerEvent<SVGSVGElement>) => {
+      const current = marquee;
+      if (!current || current.pointerId !== event.pointerId) return;
+      const point = canvasPoint(event.currentTarget, event.clientX, event.clientY);
+      const next = { ...current, currentX: point.x, currentY: point.y, containOnly: event.altKey };
+      setMarquee(next);
+      setSelectedIds(selectionFromMarquee(next));
+    },
+    [marquee, canvasPoint, selectionFromMarquee],
+  );
+
+  const finishMarquee = useCallback(
+    (event: React.PointerEvent<SVGSVGElement>, cancelled = false) => {
+      const current = marquee;
+      if (!current || current.pointerId !== event.pointerId) return;
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+      setMarquee(null);
+      if (cancelled) return;
+      const point = canvasPoint(event.currentTarget, event.clientX, event.clientY);
+      const finalCtx = { ...current, currentX: point.x, currentY: point.y, containOnly: event.altKey };
+      if (Math.abs(point.x - current.startX) < 0.5 && Math.abs(point.y - current.startY) < 0.5) {
+        setSelectedIds(current.baseSelection);
+        setKeyObjectId(null);
+        return;
+      }
+      setSelectedIds(selectionFromMarquee(finalCtx));
+      setKeyObjectId(null);
+    },
+    [marquee, canvasPoint, selectionFromMarquee],
+  );
+
+  const selectDesignType = useCallback(
+    (designGroupId: string, additive: boolean) => {
+      if (!manualMode || verso) return;
+      const ids = placed
+        .map((piece, index) => ({ piece, id: pieceEditorId(piece, index) }))
+        .filter(({ piece }) => piece.groupId === designGroupId)
+        .map(({ id }) => id);
+      setSelectedIds((current) => {
+        const next = additive ? new Set(current) : new Set<string>();
+        const allSelected = ids.every((id) => current.has(id));
+        for (const id of ids) {
+          if (additive && allSelected) next.delete(id);
+          else next.add(id);
+        }
+        return next;
+      });
+      setKeyObjectId(null);
+    },
+    [manualMode, verso, placed],
+  );
+
+  const resetEditor = useCallback(() => {
+    undoStack.current = [];
+    redoStack.current = [];
+    setSelectedIds(new Set());
+    setKeyObjectId(null);
+    syncHistoryDepth();
+    onResetManual();
+  }, [onResetManual, syncHistoryDepth]);
 
   const duplex = (result?.facesPerSheet ?? (state.method === 'recto' ? 1 : 2)) === 2;
   const bleedOf = (groupId: string): BleedValue => bleedByGroup.get(groupId) ?? state.bleedShared;
@@ -605,9 +1090,7 @@ export default function SheetCanvas(props: SheetCanvasProps) {
   const renderedPieces = !manualMode && placed.length > MAX_RENDERED ? placed.slice(0, MAX_RENDERED) : placed;
   const hiddenCount = placed.length - renderedPieces.length;
 
-  // خرائط مستقرة الهوية من أجل memo: bleedForFace/كائن areaPx كانا يُبنيان من
-  // الصفر كل render فيكسران مقارنة الخصائص لكل القطع — هنا تُحسب مرة واحدة
-  // ولا تتغير مراجعها إلا بتغير مدخلاتها فعلاً.
+  // Stable per-design bleed map for memoized pieces.
   const bleedFaceMap = useMemo(() => {
     const m = new Map<string, BleedValue>();
     for (const p of placed) {
@@ -627,17 +1110,6 @@ export default function SheetCanvas(props: SheetCanvasProps) {
     }
     return m;
   }, [placed, bleedByGroup, state.bleedShared, verso, flipAxis]);
-
-  const areaPxList = useMemo(
-    () =>
-      renderedPieces.map((p) => ({
-        left: area.x * s,
-        top: area.y * s,
-        right: (area.x + area.w - p.w) * s,
-        bottom: (area.y + area.h - p.h) * s,
-      })),
-    [renderedPieces, area, s],
-  );
 
   // clear reason when the engine cannot place anything
   const infeasible = !result && inputsValid(state) ? infeasibilityReason(state) : null;
@@ -742,15 +1214,172 @@ export default function SheetCanvas(props: SheetCanvasProps) {
         >
           <Crosshair size={14} />
         </button>
-        {manualMode && props.selectedPiece !== null && !verso && (
+        {manualMode && !verso && (
           <button
             type="button"
-            onClick={rotateLocal}
-            title="تدوير 90° (R)"
-            className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)]"
+            onClick={() => setSnapEnabled((enabled) => !enabled)}
+            title={snapEnabled ? 'Smart Snap مفعّل — اضغط لتعطيله' : 'Smart Snap معطّل — اضغط لتفعيله'}
+            className={cn(
+              'flex h-8 items-center gap-1 rounded-[8px] border px-2 text-[10px] font-semibold transition-colors',
+              snapEnabled
+                ? 'border-[var(--cyan-600)] bg-[var(--cyan-50)] text-[var(--cyan-600)]'
+                : 'border-[var(--line-strong)] text-[var(--ink-400)]',
+            )}
           >
-            <RotateCw size={14} />
+            <Magnet size={13} />
+            SNAP
           </button>
+        )}
+        {manualMode && !verso && (
+          <>
+            <span className="h-5 w-px bg-[var(--line)]" />
+            <button
+              type="button"
+              onClick={doUndo}
+              disabled={historyDepth.undo === 0}
+              title="تراجع (Ctrl+Z)"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <Undo2 size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={doRedo}
+              disabled={historyDepth.redo === 0}
+              title="إعادة (Ctrl+Y)"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <Redo2 size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={duplicateSelection}
+              disabled={selectedIds.size === 0}
+              title="نسخ التحديد (Ctrl+D أو Alt+سحب)"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <CopyPlus size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={createEditorGroup}
+              disabled={selectedIds.size < 2}
+              title="تجميع (Ctrl+G)"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <Group size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={ungroupSelection}
+              disabled={!selectedEntries.some(({ piece }) => piece.editorGroupId)}
+              title="فك التجميع (Ctrl+Shift+G)"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <Ungroup size={14} />
+            </button>
+            <span className="h-5 w-px bg-[var(--line)]" />
+            <button
+              type="button"
+              onClick={() => alignSelection('left')}
+              disabled={selectedIds.size === 0}
+              title="محاذاة يسار — عنصر واحد مع الورقة، عدة عناصر مع مرجع التحديد"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <AlignStartVertical size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => alignSelection('centerX')}
+              disabled={selectedIds.size === 0}
+              title="محاذاة وسط أفقي"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <AlignCenterVertical size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => alignSelection('right')}
+              disabled={selectedIds.size === 0}
+              title="محاذاة يمين"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <AlignEndVertical size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => alignSelection('top')}
+              disabled={selectedIds.size === 0}
+              title="محاذاة أعلى"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <AlignStartHorizontal size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => alignSelection('centerY')}
+              disabled={selectedIds.size === 0}
+              title="محاذاة وسط عمودي"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <AlignCenterHorizontal size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => alignSelection('bottom')}
+              disabled={selectedIds.size === 0}
+              title="محاذاة أسفل"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <AlignEndHorizontal size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => distributeSelection('x')}
+              disabled={selectedIds.size < 3}
+              title="توزيع أفقي بمسافات متساوية"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <AlignHorizontalSpaceBetween size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => distributeSelection('y')}
+              disabled={selectedIds.size < 3}
+              title="توزيع عمودي بمسافات متساوية"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <AlignVerticalSpaceBetween size={14} />
+            </button>
+            <span className="h-5 w-px bg-[var(--line)]" />
+            <button
+              type="button"
+              onClick={() => rotateSelection(-1)}
+              disabled={selectedIds.size === 0}
+              title="تدوير 90° يسار (Shift+R)"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <RotateCcw size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => rotateSelection(1)}
+              disabled={selectedIds.size === 0}
+              title="تدوير 90° يمين (R)"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <RotateCw size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={deleteSelection}
+              disabled={selectedIds.size === 0}
+              title="حذف التحديد (Del)"
+              className="grid h-8 w-8 place-items-center rounded-[8px] border border-[var(--line-strong)] text-[var(--ink-500)] hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              <Trash2 size={14} />
+            </button>
+          </>
         )}
 
         {duplex && (
@@ -794,26 +1423,38 @@ export default function SheetCanvas(props: SheetCanvasProps) {
       {/* legend */}
       {result && (
         <div className="flex flex-wrap items-center gap-1.5 border-b border-[var(--line)] bg-[var(--paper-50)] px-3 py-1.5">
-          {legend.map((g) => (
-            <button
-              key={g.id}
-              type="button"
-              onClick={() => props.onSelectGroup(props.selectedGroupId === g.id ? null : g.id)}
-              className={cn(
-                'flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors',
-                props.selectedGroupId === g.id ? 'border-[var(--cyan-600)] bg-[var(--cyan-50)]' : 'border-[var(--line)] bg-white hover:bg-[var(--paper-100)]',
-              )}
-            >
-              <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: g.color }} />
-              <span dir="ltr" className="font-latin font-semibold text-[var(--ink-700)]">
-                {trimNumber(g.w)}×{trimNumber(g.h)}
-              </span>
-              <span dir="ltr" className="font-latin text-[var(--ink-400)]">
-                ×{g.count}
-              </span>
-            </button>
-          ))}
-          {props.selectedGroupId && manualMode && <span className="text-[11px] text-[var(--cyan-600)]">المجموعة محددة — اسحب أي قطعة لتحريك الكل</span>}
+          {legend.map((g) => {
+            const ids = placed
+              .map((piece, index) => ({ piece, id: pieceEditorId(piece, index) }))
+              .filter(({ piece }) => piece.groupId === g.id)
+              .map(({ id }) => id);
+            const active = ids.length > 0 && ids.every((id) => selectedIds.has(id));
+            return (
+              <button
+                key={g.id}
+                type="button"
+                disabled={!manualMode || verso}
+                onClick={(event) => selectDesignType(g.id, event.shiftKey)}
+                className={cn(
+                  'flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors disabled:cursor-default',
+                  active ? 'border-[var(--cyan-600)] bg-[var(--cyan-50)]' : 'border-[var(--line)] bg-white hover:bg-[var(--paper-100)]',
+                )}
+              >
+                <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: g.color }} />
+                <span dir="ltr" className="font-latin font-semibold text-[var(--ink-700)]">
+                  {trimNumber(g.w)}×{trimNumber(g.h)}
+                </span>
+                <span dir="ltr" className="font-latin text-[var(--ink-400)]">
+                  ×{g.count}
+                </span>
+              </button>
+            );
+          })}
+          {manualMode && selectedIds.size > 0 && (
+            <span className="text-[11px] text-[var(--cyan-600)]">
+              {selectedIds.size} محدد — Shift لإضافة تحديد، Ctrl+G للتجميع
+            </span>
+          )}
         </div>
       )}
 
@@ -829,15 +1470,17 @@ export default function SheetCanvas(props: SheetCanvasProps) {
           >
             <Crosshair size={13} />
             <span className="flex-1">
-              تحرير المخطط مفعّل — اسحب القطع (تلتصق بإرشادات ذكية)، <span dir="ltr" className="font-latin font-semibold">Alt</span>+سحب نسخ •{' '}
-              <span dir="ltr" className="font-latin font-semibold">R</span> تدوير • أسهم 1مم (<span dir="ltr" className="font-latin font-semibold">Shift</span>=10) •{' '}
-              <span dir="ltr" className="font-latin font-semibold">Del</span> حذف • <span dir="ltr" className="font-latin font-semibold">Ctrl+Z/Y</span> تراجع/إعادة
-              {histDepth > 0 && <span className="ms-1 text-[var(--cyan-600)]/70">({histDepth}/50)</span>}
+              اسحب للتحريك والالتصاق • <span dir="ltr" className="font-latin font-semibold">Alt</span>+سحب للنسخ •{' '}
+              اسحب في الفراغ لتحديد مساحة • <span dir="ltr" className="font-latin font-semibold">Shift</span> لإضافة تحديد •{' '}
+              <span dir="ltr" className="font-latin font-semibold">Ctrl+G</span> تجميع • أسهم 1مم •{' '}
+              <span dir="ltr" className="font-latin font-semibold">R/Shift+R</span> تدوير •{' '}
+              <span dir="ltr" className="font-latin font-semibold">Ctrl+Z/Y</span> تراجع/إعادة
+              {historyDepth.undo > 0 && <span className="ms-1 text-[var(--cyan-600)]/70">({historyDepth.undo}/50)</span>}
             </span>
             <button type="button" onClick={props.onSaveManual} className="rounded-full bg-white/70 px-2.5 py-0.5 text-[11px] font-semibold hover:bg-white">
               حفظ
             </button>
-            <button type="button" onClick={props.onResetManual} className="rounded-full bg-white/70 px-2.5 py-0.5 text-[11px] font-semibold hover:bg-white">
+            <button type="button" onClick={resetEditor} className="rounded-full bg-white/70 px-2.5 py-0.5 text-[11px] font-semibold hover:bg-white">
               استعادة اقتراح النظام
             </button>
           </motion.div>
@@ -867,7 +1510,15 @@ export default function SheetCanvas(props: SheetCanvasProps) {
             )}
           </div>
         ) : (
-          <svg width={size.w} height={size.h} className="block touch-none select-none">
+          <svg
+            width={size.w}
+            height={size.h}
+            className="block touch-none select-none"
+            onPointerDown={handleCanvasPointerDown}
+            onPointerMove={handleCanvasPointerMove}
+            onPointerUp={(event) => finishMarquee(event)}
+            onPointerCancel={(event) => finishMarquee(event, true)}
+          >
             <defs>
               <pattern id="mg-hatch" width="6" height="6" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
                 <rect width="6" height="6" fill="var(--paper-200)" />
@@ -1012,6 +1663,21 @@ export default function SheetCanvas(props: SheetCanvasProps) {
                 />
               )}
 
+              {marquee && (
+                <rect
+                  x={Math.min(marquee.startX, marquee.currentX)}
+                  y={Math.min(marquee.startY, marquee.currentY)}
+                  width={Math.abs(marquee.currentX - marquee.startX)}
+                  height={Math.abs(marquee.currentY - marquee.startY)}
+                  fill="rgba(2,132,199,0.10)"
+                  stroke="var(--cyan-600)"
+                  strokeWidth={1}
+                  strokeDasharray="5 3"
+                  vectorEffect="non-scaling-stroke"
+                  pointerEvents="none"
+                />
+              )}
+
               {/* invalid drop flash */}
               <AnimatePresence>
                 {invalidFlash && (
@@ -1069,6 +1735,81 @@ export default function SheetCanvas(props: SheetCanvasProps) {
                   </g>
                 ))}
 
+              {/* User-created editor groups — independent from design groupId. */}
+              {manualMode &&
+                [...editorGroups.entries()].map(([groupId, bounds]) => {
+                  const active = bounds.ids.every((id) => selectedIds.has(id));
+                  const moving =
+                    dragInfo &&
+                    dragCtx &&
+                    !dragCtx.duplicate &&
+                    bounds.ids.every((id) => dragCtx.sourceIds.includes(id));
+                  const groupDx = moving ? dragInfo.dx : 0;
+                  const groupDy = moving ? dragInfo.dy : 0;
+                  return (
+                    <g key={`editor-group-${groupId}`} pointerEvents="none">
+                      <rect
+                        x={bounds.x + groupDx - 2.5}
+                        y={bounds.y + groupDy - 2.5}
+                        width={bounds.w + 5}
+                        height={bounds.h + 5}
+                        rx={2}
+                        fill="none"
+                        stroke="var(--cyan-600)"
+                        strokeWidth={active ? 1.6 : 0.9}
+                        strokeDasharray={active ? '6 3' : '3 3'}
+                        vectorEffect="non-scaling-stroke"
+                        opacity={active ? 0.95 : 0.45}
+                      />
+                      {active && (
+                        <text
+                          x={bounds.x + groupDx}
+                          y={bounds.y + groupDy - 4}
+                          fontSize={3.2}
+                          fontWeight={700}
+                          fill="var(--cyan-600)"
+                          className="font-latin"
+                        >
+                          GROUP · {bounds.ids.length}
+                        </text>
+                      )}
+                    </g>
+                  );
+                })}
+
+              {manualMode && selectedEntries.length > 1 && selectionBounds && (
+                <g pointerEvents="none">
+                  <rect
+                    x={selectionBounds.x + (dragInfo && dragCtx ? dragInfo.dx : 0) - 1.5}
+                    y={selectionBounds.y + (dragInfo && dragCtx ? dragInfo.dy : 0) - 1.5}
+                    width={selectionBounds.w + 3}
+                    height={selectionBounds.h + 3}
+                    fill="none"
+                    stroke="var(--cyan-600)"
+                    strokeWidth={1.2}
+                    vectorEffect="non-scaling-stroke"
+                  />
+                  {[
+                    [selectionBounds.x, selectionBounds.y],
+                    [selectionBounds.x + selectionBounds.w, selectionBounds.y],
+                    [selectionBounds.x, selectionBounds.y + selectionBounds.h],
+                    [selectionBounds.x + selectionBounds.w, selectionBounds.y + selectionBounds.h],
+                  ].map(([x, y], index) => (
+                    <rect
+                      key={`selection-handle-${index}`}
+                      x={x + (dragInfo && dragCtx ? dragInfo.dx : 0) - 1.5}
+                      y={y + (dragInfo && dragCtx ? dragInfo.dy : 0) - 1.5}
+                      width={3}
+                      height={3}
+                      fill="#fff"
+                      stroke="var(--cyan-600)"
+                      strokeWidth={1}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  ))}
+                </g>
+              )}
+
               {/* علامات القص — طبقة واحدة على مستوى الورقة من cut-marks.ts:
                   outer = زاوية قطعة منفردة، shared = خط مشترك مُدمج بين قطع
                   ملتصقة (يُرسم مرة واحدة)، guillotine = علامة قصيرة عند طرف
@@ -1121,6 +1862,18 @@ export default function SheetCanvas(props: SheetCanvasProps) {
                       />
                     ),
                   )}
+                  {dragInfo.snap.guides.some((guide) => guide.axis === 'v') &&
+                    dragInfo.snap.guides.some((guide) => guide.axis === 'h') && (
+                      <circle
+                        cx={dragInfo.snap.guides.find((guide) => guide.axis === 'v')!.pos}
+                        cy={dragInfo.snap.guides.find((guide) => guide.axis === 'h')!.pos}
+                        r={2.2}
+                        fill="#fff"
+                        stroke="var(--cyan-600)"
+                        strokeWidth={1.2}
+                        vectorEffect="non-scaling-stroke"
+                      />
+                    )}
                   {dragInfo.snap.measures.map((m, mi) => (
                     <g key={`measure-${mi}`}>
                       <line
@@ -1159,28 +1912,15 @@ export default function SheetCanvas(props: SheetCanvasProps) {
               {renderedPieces.map((p, i) => {
                 const px = pieceX(p);
                 const py = pieceY(p);
-                const isDragged = dragCtx?.index === i;
-                const isGroupDragged =
-                  dragCtx !== null &&
-                  !isDragged &&
-                  props.selectedGroupId === p.groupId &&
-                  placed[dragCtx.index]?.groupId === p.groupId;
-                // المجموعة تبقى كتلة واحدة بصرياً بلا تمدد ولا قفزات: القطعة
-                // المسحوبة يحركها framer بالفعل مع المؤشر بالإزاحة الخام،
-                // فنضيف لها فقط الفرق حتى الإزاحة المشتركة النهائية (بعد
-                // التقييد + الالتصاق) — تصحيح snap ≤ العتبة فلا تقفز. بقية
-                // أعضاء المجموعة يأخذون الإزاحة المشتركة كاملة.
+                const id = pieceEditorId(p, i);
+                const isDragged = dragCtx?.sourceIds.includes(id) ?? false;
                 const dragOffset =
-                  dragInfo && dragCtx
-                    ? isDragged
-                      ? { dx: (dragInfo.dx - dragCtx.dxMm) * s, dy: (dragInfo.dy - dragCtx.dyMm) * s }
-                      : isGroupDragged
-                        ? { dx: dragInfo.dx * s, dy: dragInfo.dy * s }
-                        : null
+                  dragInfo && dragCtx && isDragged && !dragCtx.duplicate
+                    ? { dx: dragInfo.dx * s, dy: dragInfo.dy * s }
                     : null;
                 return (
                   <Piece
-                    key={`${p.groupId}-${i}`}
+                    key={id}
                     index={i}
                     piece={p}
                     x0={px * s}
@@ -1189,21 +1929,52 @@ export default function SheetCanvas(props: SheetCanvasProps) {
                     bleed={bleedFaceMap.get(p.groupId) ?? state.bleedShared}
                     showLabel={zoom >= 0.75 || hovered === i}
                     draggable={manualMode && !verso}
-                    selected={props.selectedPiece === i}
-                    groupSelected={props.selectedGroupId === p.groupId}
+                    selected={selectedIds.has(id)}
+                    keyObject={selectedIds.size > 1 && keyObjectId === id}
+                    preview={false}
                     dragOffset={dragOffset}
-                    invalid={isDragged && !dragCtx.valid}
+                    invalid={isDragged && dragCtx?.valid === false}
                     delay={Math.min(i, 23) * 0.025}
-                    areaPx={areaPxList[i]}
                     onHover={handleHover}
                     onHoverEnd={handleHoverEnd}
-                    onClick={handleClick}
-                    onDragStart={handleDragStart}
-                    onDragMove={handleDragMove}
-                    onDragEnd={handleDragEnd}
+                    onPointerDown={handlePointerDown}
+                    onPointerMove={handlePointerMove}
+                    onPointerUp={handlePointerUp}
+                    onPointerCancel={handlePointerCancel}
                   />
                 );
               })}
+              {dragCtx?.duplicate &&
+                dragInfo &&
+                renderedPieces.map((p, i) => {
+                  const id = pieceEditorId(p, i);
+                  if (!dragCtx?.sourceIds.includes(id)) return null;
+                  return (
+                    <Piece
+                      key={`duplicate-preview-${id}`}
+                      index={i}
+                      piece={p}
+                      x0={pieceX(p) * s}
+                      y0={pieceY(p) * s}
+                      s={s}
+                      bleed={bleedFaceMap.get(p.groupId) ?? state.bleedShared}
+                      showLabel={zoom >= 0.75}
+                      draggable={false}
+                      selected
+                      keyObject={selectedIds.size > 1 && keyObjectId === id}
+                      preview
+                      dragOffset={{ dx: dragInfo.dx * s, dy: dragInfo.dy * s }}
+                      invalid={!dragCtx.valid}
+                      delay={0}
+                      onHover={handleHover}
+                      onHoverEnd={handleHoverEnd}
+                      onPointerDown={handlePointerDown}
+                      onPointerMove={handlePointerMove}
+                      onPointerUp={handlePointerUp}
+                      onPointerCancel={handlePointerCancel}
+                    />
+                  );
+                })}
             </g>
           </svg>
         )}
@@ -1309,21 +2080,19 @@ interface PieceProps {
   showLabel: boolean;
   draggable: boolean;
   selected: boolean;
-  groupSelected: boolean;
+  keyObject: boolean;
+  preview: boolean;
   dragOffset: { dx: number; dy: number } | null;
   invalid: boolean;
   delay: number;
-  areaPx: { left: number; top: number; right: number; bottom: number };
   onHover: (index: number) => void;
   onHoverEnd: (index: number) => void;
-  onClick: (index: number) => void;
-  onDragStart: (index: number, altKey: boolean) => void;
-  onDragMove: (index: number, dxMm: number, dyMm: number, altKey: boolean) => void;
-  onDragEnd: (index: number, dxMm: number, dyMm: number, altKey: boolean) => void;
+  onPointerDown: (index: number, event: React.PointerEvent<SVGGElement>) => void;
+  onPointerMove: (event: React.PointerEvent<SVGGElement>) => void;
+  onPointerUp: (event: React.PointerEvent<SVGGElement>) => void;
+  onPointerCancel: (event: React.PointerEvent<SVGGElement>) => void;
 }
 
-// memo: أثناء السحب يتغير dragInfo كل حركة مؤشر فيعيد الأب الرسم — بفضل الخصائص
-// المستقرة (معالجات useCallback + خرائط memo) لا تُعاد ترجمة سوى القطع المتأثرة.
 const Piece = memo(function Piece(props: PieceProps) {
   const { piece: p, s, x0, y0, bleed } = props;
   const w = p.w * s;
@@ -1332,26 +2101,17 @@ const Piece = memo(function Piece(props: PieceProps) {
   return (
     <motion.g
       initial={{ scale: 0.6, opacity: 0, x: x0, y: y0 }}
-      animate={{ x: x0, y: y0, scale: 1, opacity: 1 }}
+      animate={{ x: x0, y: y0, scale: 1, opacity: props.preview ? 0.78 : 1 }}
       transition={{ ...SPRING_FLIP, delay: props.delay }}
-      style={{ originX: 0.5, originY: 0.5, cursor: props.draggable ? 'grab' : 'default' }}
-      drag={props.draggable}
-      dragMomentum={false}
-      dragElastic={0}
-      // object constraints are relative to the piece's current position
-      dragConstraints={{
-        left: props.areaPx.left - x0,
-        right: props.areaPx.right - x0,
-        top: props.areaPx.top - y0,
-        bottom: props.areaPx.bottom - y0,
-      }}
-      onDrag={(e, info) => props.onDragMove(props.index, info.offset.x / s, info.offset.y / s, (e as PointerEvent).altKey ?? false)}
-      onDragStart={(e) => props.onDragStart(props.index, (e as PointerEvent).altKey ?? false)}
-      onDragEnd={(e, info) => props.onDragEnd(props.index, info.offset.x / s, info.offset.y / s, (e as PointerEvent).altKey ?? false)}
+      pointerEvents={props.preview ? 'none' : undefined}
+      style={{ originX: 0.5, originY: 0.5, cursor: props.draggable ? 'grab' : 'default', touchAction: 'none' }}
+      onPointerDown={(event) => props.onPointerDown(props.index, event)}
+      onPointerMove={props.onPointerMove}
+      onPointerUp={props.onPointerUp}
+      onPointerCancel={props.onPointerCancel}
       whileHover={props.draggable ? undefined : { scale: 1.04 }}
       onHoverStart={() => props.onHover(props.index)}
       onHoverEnd={() => props.onHoverEnd(props.index)}
-      onClick={() => props.onClick(props.index)}
     >
       <g transform={props.dragOffset ? `translate(${props.dragOffset.dx} ${props.dragOffset.dy})` : undefined}>
         {/* bleed halo — خط متقطع بلون المجموعة */}
@@ -1374,10 +2134,22 @@ const Piece = memo(function Piece(props: PieceProps) {
           rx={2}
           fill={withAlpha(p.color, props.invalid ? 0.35 : 0.18)}
           stroke={props.invalid ? '#DC2626' : 'var(--ink-900)'}
-          strokeWidth={props.selected || props.groupSelected ? 2.2 : 1.5}
+          strokeWidth={props.selected ? 2.2 : 1.5}
         />
-        {(props.selected || props.groupSelected) && (
+        {props.selected && (
           <rect x={-2.5} y={-2.5} width={w + 5} height={h + 5} rx={3} fill="none" stroke="var(--cyan-600)" strokeWidth={1.4} strokeDasharray="4 3" />
+        )}
+        {props.keyObject && (
+          <rect
+            x={-4.5}
+            y={-4.5}
+            width={w + 9}
+            height={h + 9}
+            rx={4}
+            fill="none"
+            stroke="var(--cyan-600)"
+            strokeWidth={2.1}
+          />
         )}
         {/* size label */}
         {props.showLabel && w > 26 && h > 14 && (

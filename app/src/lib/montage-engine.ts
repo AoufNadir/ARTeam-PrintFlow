@@ -33,7 +33,7 @@
 // ---------------------------------------------------------------------------
 
 import { GROUP_COLORS, SEED_MACHINES } from './catalog';
-import { computeCutBlocks } from './cut-marks';
+import { computeCutBlocks, CUT_MARK_EPS_MM } from './cut-marks';
 import type {
   BleedBox,
   FlipAxisInfo,
@@ -761,8 +761,437 @@ function uniqueGroupOrders(orders: GroupInternal[][]): GroupInternal[][] {
   return out;
 }
 
-/** مصدر مرشح التعبئة: أرفف صارمة (أشرطة/أعمدة لكل مجموعة) / أرفف مختلطة / MaxRects حر */
-type PackSource = 'shelf' | 'mixed' | 'maxrects';
+// ---------------------------------------------------------------------------
+// عائلات أنماط القص المستقيم (guillotine) — قاعدة معتمدة حرفياً:
+//   1. قص أفقي  : صفوف كاملة متجانسة (مجموعة واحدة لكل صف) بخطوط قص أفقية مستمرة.
+//   2. قص عمودي : أعمدة كاملة متجانسة بخطوط قص عمودية مستمرة.
+//   3. قص بلوكات: كل مقاس في شبكة/شبكات n×m مكتملة تُفصل بتقسيم شريحي
+//      (slicing) — بضربات قص مستقيمة متتالية؛ يُسمح بتعدد بلوكات المقاس الواحد.
+// ممنوع: صف/عمود مختلط وتراكيب L/حرة تكسر خطوط القص. الترتيب الحجمي (فكرة 1):
+// الأكبر في الأسفل عند المسكة ثم الأصغر صعوداً — تُبنى كل العائلات تصاعدياً
+// من الأعلى (الأصغر أولاً) فتستقر بعد الجاذبية بالأكبر في القاع.
+// ---------------------------------------------------------------------------
+
+/** Ascending cell-area order (الأصغر أولاً في البناء = الأكبر في القاع بعد الجاذبية). */
+const ascByCellArea = (groups: GroupInternal[]): GroupInternal[] =>
+  [...groups].sort((a, b) => a.cellW * a.cellH - b.cellW * b.cellH || a.id.localeCompare(b.id));
+
+/**
+ * Proportional-share quantity search around ANY fixed-need packer: binary-
+ * searches the largest scale N whose proportional needs still pack, then
+ * returns the max pack plus a "balanced" pack (same sheet count, only the
+ * copies covering the quantities — less overproduction for the same paper).
+ * Shared by the three cut-pattern families (and the legacy mixed shelves).
+ */
+function quantitySearchPacks(
+  areaW: number,
+  areaH: number,
+  order: GroupInternal[],
+  pack: (need: Map<string, number>) => FixedPackPiece[] | null,
+): FixedPackPiece[][] {
+  const totalQty = order.reduce((s, g) => s + g.quantity, 0);
+  if (totalQty <= 0) return [];
+  const minCellArea = Math.min(...order.map((g) => g.cellW * g.cellH));
+  const nMax = Math.max(order.length, Math.ceil((areaW * areaH) / minCellArea) + order.length);
+  const needFor = (n: number) =>
+    new Map<string, number>(order.map((g) => [g.id, Math.max(1, Math.round((g.quantity / totalQty) * n))]));
+  let lo = 0;
+  let hi = nMax;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (pack(needFor(mid))) lo = mid;
+    else hi = mid - 1;
+  }
+  if (lo === 0) return [];
+  const out: FixedPackPiece[][] = [];
+  const maxNeed = needFor(lo);
+  const maxPack = pack(maxNeed);
+  if (!maxPack || maxPack.length === 0) return out;
+  out.push(maxPack);
+  const sheets = order.reduce((s, g) => Math.max(s, Math.ceil(g.quantity / (maxNeed.get(g.id) ?? 1))), 1);
+  const balNeed = new Map<string, number>(order.map((g) => [g.id, Math.max(1, Math.ceil(g.quantity / sheets))]));
+  const same = order.every((g) => balNeed.get(g.id) === maxNeed.get(g.id));
+  if (!same) {
+    const balPack = pack(balNeed);
+    if (balPack && balPack.length > 0) out.push(balPack);
+  }
+  return out;
+}
+
+/** عائلة القص الأفقي: أشرطة أفقية صارمة لكل مجموعة (أرفف متجانسة) بترتيب تصاعدي — الأكبر في القاع. */
+function rowsQuantityPacks(areaW: number, areaH: number, groups: GroupInternal[], gap: GapFn): FixedPackPiece[][] {
+  const asc = ascByCellArea(groups);
+  return quantitySearchPacks(areaW, areaH, asc, (need) => strictShelfFixedPack(areaW, areaH, asc, need, gap));
+}
+
+/** عائلة القص العمودي: نفس الأشرطة الصارمة على المساحة المنقولة (أعمدة متجانسة) — تنازلي: العمود الأكبر عند الجهة الأولى ثم التصاعد. */
+function columnsQuantityPacks(areaW: number, areaH: number, groups: GroupInternal[], gap: GapFn): FixedPackPiece[][] {
+  const desc = [...ascByCellArea(groups)].reverse();
+  return quantitySearchPacks(areaH, areaW, desc, (need) => strictShelfFixedPack(areaH, areaW, desc, need, gap)).map(
+    transposeFixedPieces,
+  );
+}
+
+/** النسخة الثابتة من عائلة الأعمدة (عدد محدد لكل مجموعة). */
+function columnsFixedPack(
+  areaW: number,
+  areaH: number,
+  order: GroupInternal[],
+  need: Map<string, number>,
+  gap: GapFn,
+): FixedPackPiece[] | null {
+  const p = strictShelfFixedPack(areaH, areaW, order, need, gap);
+  return p ? transposeFixedPieces(p) : null;
+}
+
+/**
+ * عائلة القص بالبلوكات: كل مقاس يُقسَّم إلى بلوك مستطيل ممتلئ واحد أو عدة
+ * بلوكات n×m مستقلة. لا يوجد صف أخير ناقص داخل البلوك؛ الباقي يصبح بلوكاً
+ * مستطيلاً مستقلاً. تُركّب البلوكات كرُصص شريحية: قص عمودي كامل بين الرصص،
+ * ثم قص أفقي كامل داخل كل رصة. الأكبر يسبق الأصغر عند خط المسكة، ولا يُكدّس
+ * بلوك فوق مضيف أضيق/أقصر منه. البحث محدود العقد ليبقى مناسباً للمعاينة.
+ */
+function blocksFixedPack(
+  areaW: number,
+  areaH: number,
+  order: GroupInternal[],
+  need: Map<string, number>,
+  gap: GapFn,
+): FixedPackPiece[] | null {
+  interface Plan {
+    g: GroupInternal;
+    rot: boolean;
+    cw: number;
+    ch: number;
+    cols: number;
+    rows: number;
+    w: number;
+    h: number;
+  }
+  const orientsOf = (g: GroupInternal) => [
+    { cw: g.cellW, ch: g.cellH, rot: false },
+    { cw: g.cellH, ch: g.cellW, rot: true },
+  ];
+  const gs = order.filter((g) => (need.get(g.id) ?? 0) > 0);
+  if (gs.length === 0) return null;
+
+  const makePlan = (
+    g: GroupInternal,
+    o: { cw: number; ch: number; rot: boolean },
+    cols: number,
+    rows: number,
+  ): Plan => {
+    const g0 = gap(g.id, g.id);
+    return {
+      g,
+      rot: o.rot,
+      cw: o.cw,
+      ch: o.ch,
+      cols,
+      rows,
+      w: cols * (o.cw + g0) - g0,
+      h: rows * (o.ch + g0) - g0,
+    };
+  };
+
+  /**
+   * بدائل تقسيم العدد إلى مستطيلات مكتملة. نجرب أولاً بلوكاً واحداً (عوامل
+   * العدد)، ثم تقسيمات صفّية محدودة: كتل cols×rows ممتلئة، والباقي الأصغر
+   * كتلة rem×1 مستقلة. هذا يسمح بالتعدد من دون إدخال شكل L داخل أي بلوك.
+   */
+  const decompositionsOf = (g: GroupInternal): Plan[][] => {
+    const total = need.get(g.id) ?? 0;
+    const g0 = gap(g.id, g.id);
+    const out: Plan[][] = [];
+    const seen = new Set<string>();
+    const push = (plans: Plan[]) => {
+      if (plans.length === 0) return;
+      const sig = plans.map((p) => `${p.rot ? 1 : 0}:${p.cols}x${p.rows}`).join('|');
+      if (seen.has(sig)) return;
+      seen.add(sig);
+      out.push(plans);
+    };
+    for (const o of orientsOf(g)) {
+      const maxCols = Math.floor((areaW + g0) / (o.cw + g0));
+      const maxRows = Math.floor((areaH + g0) / (o.ch + g0));
+      if (maxCols <= 0 || maxRows <= 0) continue;
+
+      // بلوك واحد مستطيل مكتمل.
+      for (let cols = 1; cols <= Math.min(total, maxCols); cols++) {
+        if (total % cols !== 0) continue;
+        const rows = total / cols;
+        if (rows <= maxRows) push([makePlan(g, o, cols, rows)]);
+      }
+
+      // عدة بلوكات مستطيلة عند عدم ملاءمة عامل واحد أو عندما يفيد الرص.
+      for (let cols = 1; cols <= Math.min(total, maxCols); cols++) {
+        const plans: Plan[] = [];
+        let remaining = total;
+        while (remaining > 0) {
+          if (remaining < cols) {
+            plans.push(makePlan(g, o, remaining, 1));
+            remaining = 0;
+            continue;
+          }
+          const rows = Math.min(maxRows, Math.floor(remaining / cols));
+          if (rows <= 0) break;
+          plans.push(makePlan(g, o, cols, rows));
+          remaining -= cols * rows;
+        }
+        if (remaining === 0) push(plans);
+      }
+    }
+    out.sort((a, b) => {
+      if (a.length !== b.length) return a.length - b.length;
+      const ah = Math.max(...a.map((p) => p.h));
+      const bh = Math.max(...b.map((p) => p.h));
+      const aw = a.reduce((s, p) => s + p.w, 0);
+      const bw = b.reduce((s, p) => s + p.w, 0);
+      return ah - bh || aw - bw;
+    });
+    return out.slice(0, 24);
+  };
+  const decompositions = gs.map(decompositionsOf);
+  if (decompositions.some((list) => list.length === 0)) return null;
+
+  const present = gs.map((g) => g.id);
+  let sepGap = 0;
+  for (const a of present) for (const b of present) sepGap = Math.max(sepGap, gap(a, b));
+  // بلوكان مختلفان يجب أن يبقيا مكوّنين مستقلين حتى عندما يكون gap المستخدم
+  // صفراً؛ قناة 0.1مم تتجاوز إبسيلون التجميع ولا تؤثر عملياً في المقاس.
+  const independentGap = CUT_MARK_EPS_MM * 2;
+  const blockGap = (a: string, b: string): number => Math.max(gap(a, b), independentGap);
+
+  interface Stack {
+    x: number;
+    w: number;
+    h: number;
+    plans: Plan[];
+  }
+  const stacks: Stack[] = [];
+  let usedW = 0;
+  let nodes = 0;
+  const NODE_CAP = 12_000;
+
+  const placeOne = (p: Plan, next: () => boolean): boolean => {
+    if (++nodes > NODE_CAP) return false;
+    const sep = stacks.length > 0 ? Math.max(sepGap, independentGap) : 0;
+    if (p.h <= areaH + FIXED_EPS && usedW + sep + p.w <= areaW + FIXED_EPS) {
+      stacks.push({ x: usedW + sep, w: p.w, h: p.h, plans: [p] });
+      usedW += sep + p.w;
+      if (next()) return true;
+      usedW -= sep + p.w;
+      stacks.pop();
+    }
+    const hosts = stacks
+      .filter((s) => {
+        const t = s.plans[s.plans.length - 1];
+        // عند gap=0 سيُسقط gravityCompact البلوك العلوي حتى يلامس السفلي؛
+        // لو كانا من المقاس نفسه اندمجا في مكوّن L. أبقهما رصتين أفقيتين
+        // مستقلتين، ولا نسمح بتكديسهما إلا إذا طلب المستخدم فجوة فعلية.
+        if (t.g.id === p.g.id && gap(t.g.id, p.g.id) <= CUT_MARK_EPS_MM) return false;
+        return (
+          t.w + FIXED_EPS >= p.w &&
+          t.h + FIXED_EPS >= p.h &&
+          s.h + blockGap(t.g.id, p.g.id) + p.h <= areaH + FIXED_EPS
+        );
+      })
+      .sort((a, b) => a.h - b.h);
+    for (const s of hosts) {
+      const sg = blockGap(s.plans[s.plans.length - 1].g.id, p.g.id);
+      s.plans.push(p);
+      s.h += sg + p.h;
+      if (next()) return true;
+      s.plans.pop();
+      s.h -= sg + p.h;
+    }
+    return false;
+  };
+
+  const placePlans = (plans: Plan[], idx: number, next: () => boolean): boolean => {
+    if (idx === plans.length) return next();
+    return placeOne(plans[idx], () => placePlans(plans, idx + 1, next));
+  };
+  const placeGroup = (idx: number): boolean => {
+    if (idx === gs.length) return true;
+    for (const plans of decompositions[idx]) {
+      if (placePlans(plans, 0, () => placeGroup(idx + 1))) return true;
+      if (nodes > NODE_CAP) return false;
+    }
+    return false;
+  };
+  if (!placeGroup(0)) return null;
+
+  // emit: الرصائص يساراً→يميناً؛ داخل الرصّ البلوك الأكبر أسفل (أكبر y في
+  // إحداثيات الحزم) والأصغر فوقه — بعد الجاذبية يلامس بلوكُ القاع خطَ الأساس
+  // ويستقر كل ضيف فوق مضيفه، فيبقى الترتيب الحجمي الصاعد محفوظاً
+  const pieces: FixedPackPiece[] = [];
+  for (const s of stacks) {
+    let y = s.h;
+    for (const [pi, p] of s.plans.entries()) {
+      if (pi > 0) y -= blockGap(s.plans[pi - 1].g.id, p.g.id);
+      y -= p.h;
+      const g0 = gap(p.g.id, p.g.id);
+      for (let r = 0; r < p.rows; r++) {
+        for (let cc = 0; cc < p.cols; cc++) {
+          pushFixedPiece(pieces, p.g, p.rot, p.cw, p.ch, s.x + cc * (p.cw + g0), y + r * (p.ch + g0));
+        }
+      }
+    }
+  }
+  return pieces;
+}
+
+/** عائلة البلوكات بنمط الكمية: بحث الحصص النسبية حول blocksFixedPack. */
+function blocksQuantityPacks(areaW: number, areaH: number, groups: GroupInternal[], gap: GapFn): FixedPackPiece[][] {
+  const desc = [...ascByCellArea(groups)].reverse();
+  return quantitySearchPacks(areaW, areaH, desc, (need) => blocksFixedPack(areaW, areaH, desc, need, gap));
+}
+
+// ---------------------------------------------------------------------------
+// assertCutPattern — شبكة الأمان الإلزامية لأنماط القص المستقيم
+// ---------------------------------------------------------------------------
+
+export type CutPattern = 'rows' | 'columns' | 'blocks' | 'invalid';
+
+/** تجميع القيم المتقاربة (ضمن eps) إلى خطوط ممثلة — نظير clusterLines في cut-marks */
+function clusterValues(values: number[], eps: number): number[] {
+  const sorted = [...values].sort((a, b) => a - b);
+  const lines: number[] = [];
+  for (const v of sorted) {
+    if (lines.length === 0 || v - lines[lines.length - 1] > eps) lines.push(v);
+  }
+  return lines;
+}
+
+function valueIndexOf(v: number, lines: number[], eps: number): number {
+  for (let i = 0; i < lines.length; i++) if (Math.abs(lines[i] - v) <= eps) return i;
+  return -1;
+}
+
+/** هل تشكّل الخلايا شبكة n×m منتظمة ممتلئة (نفس منطق isFilledGrid في cut-marks)؟ */
+function filledGridCells(cells: { x: number; y: number; w: number; h: number }[], eps: number): boolean {
+  const gx = clusterValues(cells.flatMap((c) => [c.x, c.x + c.w]), eps);
+  const gy = clusterValues(cells.flatMap((c) => [c.y, c.y + c.h]), eps);
+  if ((gx.length - 1) * (gy.length - 1) !== cells.length) return false;
+  const used = new Set<number>();
+  for (const c of cells) {
+    const c0 = valueIndexOf(c.x, gx, eps);
+    const c1 = valueIndexOf(c.x + c.w, gx, eps);
+    const r0 = valueIndexOf(c.y, gy, eps);
+    const r1 = valueIndexOf(c.y + c.h, gy, eps);
+    if (c0 < 0 || c1 !== c0 + 1 || r0 < 0 || r1 !== r0 + 1) return false;
+    const key = c0 * 4096 + r0;
+    if (used.has(key)) return false;
+    used.add(key);
+  }
+  return true;
+}
+
+/**
+ * فحص الشريحية (slicing) العودي حتى الشبكات: توجد دائماً ضربة قص مستقيمة
+ * كاملة (عمودية أو أفقية) تفصل نطاقاً عن الباقي، وتكرارها يقسّم المخطط إلى
+ * شبكات n×m ممتلئة (أوراق القسم = grids؛ القطعة المفردة شبكة 1×1). أي بنية
+ * متشابكة (pinwheel/L متعشّق) لا يوجد لها قص كامل في مرحلة ما ← غير شريحية.
+ * يجرب كل خطوط القص المرشحة مع مذكّرة فشل — لا يكتفي بأول قص يعثر عليه،
+ * فيقبل تعدد بلوكات المقاس الواحد المتلامسة (فاصل صفري) متى كانت قابلة
+ * للفصل بقص كامل، ويرفض التراكيب المتداخلة غير القابلة للقص المستقيم.
+ */
+function slicingGridDecomposable(
+  cells: { x: number; y: number; w: number; h: number }[],
+  eps: number,
+  failed: Set<string>,
+): boolean {
+  if (cells.length <= 1) return true;
+  if (filledGridCells(cells, eps)) return true;
+  const key = cells
+    .map((c) => `${Math.round(c.x * 20)},${Math.round(c.y * 20)},${Math.round(c.w * 20)},${Math.round(c.h * 20)}`)
+    .sort()
+    .join('|');
+  if (failed.has(key)) return false;
+  for (const axis of ['v', 'h'] as const) {
+    const startOf = (c: { x: number; y: number }): number => (axis === 'v' ? c.x : c.y);
+    const endOf = (c: { x: number; y: number; w: number; h: number }): number => (axis === 'v' ? c.x + c.w : c.y + c.h);
+    const coords = new Set<number>();
+    for (const c of cells) {
+      coords.add(startOf(c));
+      coords.add(endOf(c));
+    }
+    for (const cut of coords) {
+      const lo = cells.filter((c) => endOf(c) <= cut + eps);
+      const hi = cells.filter((c) => startOf(c) >= cut - eps);
+      if (lo.length === 0 || hi.length === 0 || lo.length + hi.length !== cells.length) continue;
+      if (slicingGridDecomposable(lo, eps, failed) && slicingGridDecomposable(hi, eps, failed)) return true;
+    }
+  }
+  failed.add(key);
+  return false;
+}
+
+/**
+ * مدقّق أنماط القص (معتمد — التعريفات الحرفية الثلاثة، لا شيء خارجها):
+ * يصنّف أي مخطط نهائي إلى 'rows' | 'columns' | 'blocks' | 'invalid'.
+ * في الطرق المشطورة يُدقَّق النصف الأول فقط (المرآة تُشتق بنفس النمط ويفصلها
+ * قص المحور). الخوارزمية على خلايا القطع (trim+bleed):
+ *  1. القص الفيزيائي: المخطط قابل للتقسيم العودي بضربات قص مستقيمة كاملة
+ *     حتى شبكات n×m ممتلئة (slicingGridDecomposable) — أي تركيب متشابك
+ *     (pinwheel/L متعشّق) ← invalid.
+ *  2. كل مكوّن متصل من المقاس نفسه = بلوك مستطيل ممتلئ. يمكن أن يكون للمقاس
+ *     الواحد أكثر من بلوك مستقل؛ لكن أي مكوّن L أو شبكة ناقصة ← invalid.
+ *  3. التصنيف:
+ *     - لا يتراكب مقاسان مختلفان على محور y ← rows.
+ *     - وإلا لا يتراكبان على محور x ← columns.
+ *     - وإلا، ما دام شريحياً وكل مكوّن مستطيل ← blocks.
+ */
+export function assertCutPattern(placed: PlacedPiece[], flip: FlipAxisInfo | null = null): CutPattern {
+  if (placed.length === 0) return 'invalid';
+  const eps = CUT_MARK_EPS_MM;
+  const cellsAll = placed.map((p) => ({
+    x: p.x - (p.bleed?.left ?? 0),
+    y: p.y - (p.bleed?.top ?? 0),
+    w: p.w + (p.bleed?.left ?? 0) + (p.bleed?.right ?? 0),
+    h: p.h + (p.bleed?.top ?? 0) + (p.bleed?.bottom ?? 0),
+  }));
+  let cells = cellsAll;
+  let ids = placed.map((p) => p.groupId);
+  if (flip) {
+    const keep = cellsAll.map((c) =>
+      flip.axis === 'vertical' ? c.x + c.w <= flip.position + eps : c.y + c.h <= flip.position + eps,
+    );
+    if (keep.some(Boolean)) {
+      cells = cellsAll.filter((_, i) => keep[i]);
+      ids = ids.filter((_, i) => keep[i]);
+    }
+  }
+  if (!slicingGridDecomposable(cells, eps, new Set())) return 'invalid';
+  // نفس نموذج البلوكات المستخدم لعلامات القص: كل مكوّن متصل للمقاس نفسه
+  // يجب أن يكون شبكة مستطيلة ممتلئة. المكونات المنفصلة تبقى بلوكات مستقلة.
+  const blocks = computeCutBlocks(
+    cells.map((c, i) => ({ ...c, groupId: ids[i] ?? `__single__${i}` })),
+    eps,
+  );
+  if (blocks.some((b) => !b.grid)) return 'invalid';
+
+  const groupsDisjointOn = (axis: 'x' | 'y'): boolean => {
+    for (let i = 0; i < cells.length; i++) {
+      for (let j = i + 1; j < cells.length; j++) {
+        if (ids[i] === ids[j]) continue;
+        const a0 = axis === 'x' ? cells[i].x : cells[i].y;
+        const a1 = a0 + (axis === 'x' ? cells[i].w : cells[i].h);
+        const b0 = axis === 'x' ? cells[j].x : cells[j].y;
+        const b1 = b0 + (axis === 'x' ? cells[j].w : cells[j].h);
+        if (Math.min(a1, b1) - Math.max(a0, b0) > eps) return false;
+      }
+    }
+    return true;
+  };
+  if (groupsDisjointOn('y')) return 'rows';
+  if (groupsDisjointOn('x')) return 'columns';
+  return 'blocks';
+}
+
+/** مصدر مرشح التعبئة: أرفف صارمة/مختلطة/MaxRects حر (die-cut) أو إحدى عائلات أنماط القص المستقيم الثلاث (guillotine) */
+type PackSource = 'shelf' | 'mixed' | 'maxrects' | 'rows' | 'columns' | 'blocks';
 
 interface EvalCandidate {
   result: Omit<MontageResult, 'alternatives'>;
@@ -796,6 +1225,44 @@ interface EvalCandidate {
  * المرآة بعده فيبقى التماثل تاماً؛ وقاع مساحة العمل في double-pince فوق شريط
  * القبضة السفلي أصلاً فلا خرق.
  */
+/**
+ * قاعدة الترسيخ والترتيب الحجمي الصاعد (معتمدة — guillotine): خط الأساس =
+ * الحافة السفلية لمنطقة العمل فوق المسكة.
+ *  1. أكبر مجموعة (بمساحة القطعة) تلامس خط الأساس بقطعة واحدة على الأقل.
+ *  2. أي قطعة مكدسة فوق قطعة من مجموعة أخرى (تقاطع إسقاط x وفصل عمودي)
+ *     تنتمي لمجموعة أصغر أو تساوي — ممنوع مجموعة أكبر فوق أصغر، وممنوع
+ *     مجموعة أصغر عند الأساس بينما الأكبر معلّق فوقها أو فوق فراغ.
+ * يُفحص النصف الأول في الطرق المشطورة (الترتيب يُفرض قبل اشتقاق المرآة)،
+ * وعلى خلايا القطع (trim+bleed) اتساقاً مع الجاذبية والفواصل.
+ */
+function anchoredOrderOk(placed: PlacedPiece[], workArea: Rect, flip: FlipAxisInfo | null = null): boolean {
+  const eps = CUT_MARK_EPS_MM;
+  const cells = placed.map((p) => ({
+    g: p.groupId,
+    area: p.w * p.h, // الدوران لا يغيّر مساحة القطعة
+    l: p.x - (p.bleed?.left ?? 0),
+    t: p.y - (p.bleed?.top ?? 0),
+    r: p.x + p.w + (p.bleed?.right ?? 0),
+    b: p.y + p.h + (p.bleed?.bottom ?? 0),
+  }));
+  let scope = cells;
+  if (flip) {
+    const prim = cells.filter((c) => (flip.axis === 'vertical' ? c.r <= flip.position + eps : c.b <= flip.position + eps));
+    if (prim.length > 0) scope = prim;
+  }
+  const baseline = workArea.y + workArea.h;
+  const maxArea = Math.max(...scope.map((c) => c.area));
+  if (!scope.some((c) => Math.abs(c.area - maxArea) <= eps && c.b >= baseline - eps)) return false;
+  for (const p of scope) {
+    for (const q of scope) {
+      if (p.g === q.g) continue;
+      const ox = Math.min(p.r, q.r) - Math.max(p.l, q.l);
+      if (ox <= eps) continue;
+      if (p.b <= q.t + eps && p.area > q.area + eps) return false; // مجموعة أكبر فوق أصغر
+    }
+  }
+  return true;
+}
 export function gravityCompact(pieces: PlacedPiece[], workArea: Rect, gap: GapFn = ZERO_GAP): PlacedPiece[] {
   const areaBottom = workArea.y + workArea.h;
   interface Cell {
@@ -846,6 +1313,7 @@ function evaluateCandidates(
   gutterMm: number,
   gripMm?: number,
   gap: GapFn = ZERO_GAP,
+  cutMethod?: MontageInput['cutMethod'],
 ): EvalCandidate[] {
   if (groups.length === 0) return [];
   const halved = method === 'bascule' || method === 'double-pince';
@@ -861,16 +1329,30 @@ function evaluateCandidates(
   if (workArea.w <= 0 || workArea.h <= 0) return [];
 
   // ---- packing candidates ---------------------------------------------------
-  // Candidate 1 (السلوك الحالي): أشرطة أفقية منفصلة لكل مجموعة بحصة نسبية من
-  // كميتها (shelfPack) + نسخة عمودية (أعمدة) منه. المرشحون الإضافيون: أرفف
-  // مختلطة (صفوف وأعمدة) تخلط التصاميم داخل نفس الرف بحصص نسبية، بعدة ترتيبات
-  // للمجموعات (بالحجم، بالارتفاع، بالعرض، بالمحيط). وأخيراً مرشحو MaxRects
-  // (ترتيب حر) بهيuristictين (BSSF وBAF) وتداخل/تجميع — يجدون تراكيب مدرّجة
-  // لا تصل إليها الأرفف إطلاقاً.
-  // كل مرشح موسوم بمصدره: في وضع القص guillotine يُقيَّد المرشح الافتراضي
-  // (balanced) بعائلة الأرفف ذات البلوكات المستطيلة القابلة للقص بضربات
-  // مستقيمة (وليس MaxRects الحر) — انظر computeMontageVariants.
+  // وضع guillotine: عائلات أنماط القص الثلاث فقط (انظر التفرع أدناه). غيره
+  // (die-cut/cutcontour/غير محدد — السلوك الحالي حرفياً): أشرطة أفقية منفصلة
+  // لكل مجموعة بحصة نسبية من كميتها (shelfPack) + نسخة عمودية (أعمدة) منه.
+  // المرشحون الإضافيون: أرفف مختلطة (صفوف وأعمدة) تخلط التصاميم داخل نفس الرف
+  // بحصص نسبية، بعدة ترتيبات للمجموعات (بالحجم، بالارتفاع، بالعرض، بالمحيط).
+  // وأخيراً مرشحو MaxRects (ترتيب حر) بهيuristictين (BSSF وBAF) وتداخل/تجميع —
+  // يجدون تراكيب مدرّجة لا تصل إليها الأرفف إطلاقاً.
   const packLists: { pieces: FixedPackPiece[]; source: PackSource }[] = [];
+  // وضع guillotine (قاعدة معتمدة): المرشحون حصرياً من عائلات أنماط القص
+  // المستقيم الثلاث (rows/columns/blocks) المرتّبة حجمياً من القاع — الأرفف
+  // المختلطة وMaxRects الحر لا تُولَّد أصلاً في هذا الوضع (لا تصل للنتيجة).
+  const guillotine = cutMethod === 'guillotine';
+  if (guillotine) {
+    for (const p of rowsQuantityPacks(workArea.w, workArea.h, groups, gap)) {
+      if (p.length > 0) packLists.push({ pieces: p, source: 'rows' });
+    }
+    for (const p of columnsQuantityPacks(workArea.w, workArea.h, groups, gap)) {
+      if (p.length > 0) packLists.push({ pieces: p, source: 'columns' });
+    }
+    for (const p of blocksQuantityPacks(workArea.w, workArea.h, groups, gap)) {
+      if (p.length > 0) packLists.push({ pieces: p, source: 'blocks' });
+    }
+  }
+  if (!guillotine) {
   const strict = shelfPack(workArea.w, workArea.h, groups, gap);
   if (strict.pieces.length > 0) packLists.push({ pieces: strict.pieces, source: 'shelf' });
   const strictCols = shelfPack(workArea.h, workArea.w, groups, gap);
@@ -921,6 +1403,7 @@ function evaluateCandidates(
       }
     }
   }
+  }
   if (packLists.length === 0) return [];
 
   const qtyTotal = groups.reduce((s, g) => s + g.quantity, 0);
@@ -965,6 +1448,11 @@ function evaluateCandidates(
       // is always ≥ the gutter (exactly the gutter when the block fills its half)
       placed = placed.concat(mirrorPieces(placed, flip.axis, flip.position));
     }
+
+    // شبكة الأمان الإلزامية (guillotine): أي مخطط لا يحقق أحد أنماط القص
+    // المستقيم الثلاث بعد الجاذبية والمرآة يُستبعد تلقائياً ولا يُعرض
+    const cutPattern = guillotine ? assertCutPattern(placed, flip) : undefined;
+    if (cutPattern === 'invalid') continue;
 
     const perGroup = new Map<string, number>();
     for (const p of placed) perGroup.set(p.groupId, (perGroup.get(p.groupId) ?? 0) + 1);
@@ -1015,6 +1503,7 @@ function evaluateCandidates(
         ...(flip ? { flipAxis: flip } : {}),
         ...(method === 'double-pince' ? { gripMm: Math.max(0, gripMm ?? DOUBLE_PINCE_GRIP_MM) } : {}),
         ...(method === 'bascule' ? { gutterMm: Math.max(0, gutterMm) } : {}),
+        ...(cutPattern ? { cutPattern } : {}),
       },
       runWaste,
       ratioDev,
@@ -1035,8 +1524,9 @@ function evaluate(
   gutterMm: number,
   gripMm?: number,
   gap: GapFn = ZERO_GAP,
+  cutMethod?: MontageInput['cutMethod'],
 ): Omit<MontageResult, 'alternatives'> | null {
-  const candidates = evaluateCandidates(sheetW, sheetH, machine, groups, method, gutterMm, gripMm, gap);
+  const candidates = evaluateCandidates(sheetW, sheetH, machine, groups, method, gutterMm, gripMm, gap, cutMethod);
   let best: EvalCandidate | null = null;
   for (const c of candidates) {
     if (
@@ -1136,6 +1626,7 @@ export function evaluateMontage(
     input.gutterMm ?? 10,
     input.gripMm,
     makeGapResolver(groups, input.defaultGapMm, input.pairGaps),
+    input.cutMethod,
   );
 }
 
@@ -1149,8 +1640,9 @@ function alternativeFor(
   gutterMm: number,
   gripMm?: number,
   gap: GapFn = ZERO_GAP,
+  cutMethod?: MontageInput['cutMethod'],
 ): SheetAlternative | null {
-  const r = evaluate(sheetW, sheetH, machine, groups, method, gutterMm, gripMm, gap);
+  const r = evaluate(sheetW, sheetH, machine, groups, method, gutterMm, gripMm, gap, cutMethod);
   if (!r) return null;
   return {
     sheetWidthMm: sheetW,
@@ -1175,7 +1667,17 @@ export function computeMontage(input: MontageInput, machines: Machine[] = SEED_M
   const gap = makeGapResolver(groups, input.defaultGapMm, input.pairGaps);
 
   const machine = machines.find((m) => m.id === input.machineId);
-  const primary = evaluate(input.sheetWidthMm, input.sheetHeightMm, machine, groups, input.method, gutter, grip, gap);
+  const primary = evaluate(
+    input.sheetWidthMm,
+    input.sheetHeightMm,
+    machine,
+    groups,
+    input.method,
+    gutter,
+    grip,
+    gap,
+    input.cutMethod,
+  );
 
   // gather alternatives across all enabled machine sheet sizes (plus the raw
   // input sheet without machine constraints as a fallback)
@@ -1183,7 +1685,7 @@ export function computeMontage(input: MontageInput, machines: Machine[] = SEED_M
   for (const m of machines.filter((x) => x.enabled)) {
     for (const s of m.sheetSizes) {
       if (m.id === input.machineId && s.widthMm === input.sheetWidthMm && s.heightMm === input.sheetHeightMm) continue;
-      const a = alternativeFor(s.widthMm, s.heightMm, m.id, m, groups, input.method, gutter, grip, gap);
+      const a = alternativeFor(s.widthMm, s.heightMm, m.id, m, groups, input.method, gutter, grip, gap, input.cutMethod);
       if (a) alts.push(a);
     }
   }
@@ -1194,7 +1696,7 @@ export function computeMontage(input: MontageInput, machines: Machine[] = SEED_M
     const best = alts[0];
     if (!best) return null;
     const m = machines.find((x) => x.id === best.machineId);
-    const r = evaluate(best.sheetWidthMm, best.sheetHeightMm, m, groups, input.method, gutter, grip, gap);
+    const r = evaluate(best.sheetWidthMm, best.sheetHeightMm, m, groups, input.method, gutter, grip, gap, input.cutMethod);
     if (!r) return null;
     return { ...r, alternatives: alts.slice(1, 6) };
   }
@@ -1549,16 +2051,33 @@ function maxFixedPerGroup(
  * per piece beats any single-orientation grid for non-square designs.
  * Only feasible, non-empty packs returned.
  */
+type FixedCandidateMode = 'free' | 'guillotine';
+
 function fixedPackCandidates(
   areaW: number,
   areaH: number,
   groups: GroupInternal[],
   need: Map<string, number>,
   gap: GapFn = ZERO_GAP,
+  mode: FixedCandidateMode = 'free',
 ): FixedPackPiece[][] {
   const byAreaDesc = [...groups].sort((a, b) => b.cellW * b.cellH - a.cellW * a.cellH);
   const byAreaAsc = [...groups].sort((a, b) => a.cellW * a.cellH - b.cellW * b.cellH);
   const byHeightDesc = [...groups].sort((a, b) => Math.max(b.cellW, b.cellH) - Math.max(a.cellW, a.cellH));
+
+  // بوابة التوليد الأولى في Guillotine: لا تُنشأ الأرفف المختلطة ولا
+  // MaxRects أصلاً. كل ما يخرج من هنا ينتمي إلى rows/columns/blocks.
+  if (mode === 'guillotine') {
+    const familyCandidates = [
+      strictShelfFixedPack(areaW, areaH, byAreaDesc, need, gap),
+      strictShelfFixedPack(areaW, areaH, byAreaAsc, need, gap),
+      columnsFixedPack(areaW, areaH, byAreaDesc, need, gap),
+      columnsFixedPack(areaW, areaH, byAreaAsc, need, gap),
+      blocksFixedPack(areaW, areaH, byAreaDesc, need, gap),
+    ];
+    return familyCandidates.filter((c): c is FixedPackPiece[] => !!c && c.length > 0);
+  }
+
   const cands: (FixedPackPiece[] | null)[] = [
     strictShelfFixedPack(areaW, areaH, byAreaDesc, need, gap),
     strictShelfFixedPack(areaW, areaH, byAreaAsc, need, gap),
@@ -1593,10 +2112,12 @@ function bestFixedPack(
   groups: GroupInternal[],
   need: Map<string, number>,
   gap: GapFn = ZERO_GAP,
+  opts?: { accept?: (pack: FixedPackPiece[]) => boolean; candidateMode?: FixedCandidateMode },
 ): FixedPackPiece[] | null {
   let best: FixedPackPiece[] | null = null;
   let bestScore = Infinity;
-  for (const cand of fixedPackCandidates(areaW, areaH, groups, need, gap)) {
+  for (const cand of fixedPackCandidates(areaW, areaH, groups, need, gap, opts?.candidateMode ?? 'free')) {
+    if (opts?.accept && !opts.accept(cand)) continue;
     const usedH = Math.max(...cand.map((p) => p.y + p.h));
     const usedW = Math.max(...cand.map((p) => p.x + p.w));
     const score = usedH * 100_000 + usedW;
@@ -1627,14 +2148,15 @@ function honestMaxPerGroupPrimary(
   groups: GroupInternal[],
   primaryNeed: Map<string, number>,
   gap: GapFn = ZERO_GAP,
+  opts?: { accept?: (pack: FixedPackPiece[]) => boolean; candidateMode?: FixedCandidateMode },
 ): Record<string, number> {
   const multiplier = 1; // all probes run in primary-half space
-  const shelf = maxFixedPerGroup(areaW, areaH, groups, multiplier, gap);
+  const shelf = opts?.candidateMode === 'guillotine' ? {} : maxFixedPerGroup(areaW, areaH, groups, multiplier, gap);
   const out: Record<string, number> = {};
   for (const g of groups) out[g.id] = shelf[g.id] ?? 0;
   const byAreaDesc = [...groups].sort((a, b) => b.cellW * b.cellH - a.cellW * a.cellH);
   const minCellArea = Math.min(...groups.map((g) => g.cellW * g.cellH));
-  if (Math.ceil((areaW * areaH) / minCellArea) <= MAXRECTS_MAX_PIECES * 2) {
+  if (opts?.candidateMode !== 'guillotine' && Math.ceil((areaW * areaH) / minCellArea) <= MAXRECTS_MAX_PIECES * 2) {
     for (const heuristic of ['bssf', 'baf'] as const) {
       const fill = maxRectsFill(areaW, areaH, byAreaDesc, heuristic, gap);
       for (const g of groups) out[g.id] = Math.max(out[g.id], fill.get(g.id) ?? 0);
@@ -1648,7 +2170,7 @@ function honestMaxPerGroupPrimary(
       const mid = (lo + hiB + 1) >> 1;
       const need = new Map(primaryNeed);
       need.set(g.id, mid);
-      if (bestFixedPack(areaW, areaH, groups, need, gap)) lo = mid;
+      if (bestFixedPack(areaW, areaH, groups, need, gap, opts)) lo = mid;
       else hiB = mid - 1;
     }
     out[g.id] = Math.max(out[g.id], lo);
@@ -1671,6 +2193,7 @@ function buildFixedSuggestion(
   halved: boolean,
   flip: FlipAxisInfo | null,
   gap: GapFn = ZERO_GAP,
+  opts?: { accept?: (pack: FixedPackPiece[]) => boolean; candidateMode?: FixedCandidateMode },
 ): FixedMontageSuggestion | undefined {
   const sugNeed = new Map<string, number>();
   for (const g of groups) {
@@ -1679,7 +2202,7 @@ function buildFixedSuggestion(
     if (n <= 0) return undefined; // a design would vanish — no honest suggestion
     sugNeed.set(g.id, n);
   }
-  let pack = bestFixedPack(workArea.w, workArea.h, groups, sugNeed, gap);
+  let pack = bestFixedPack(workArea.w, workArea.h, groups, sugNeed, gap, opts);
   let guard = 0;
   while (!pack && guard++ < 60) {
     let pick: GroupInternal | null = null;
@@ -1696,7 +2219,7 @@ function buildFixedSuggestion(
     }
     if (!pick) return undefined;
     sugNeed.set(pick.id, (sugNeed.get(pick.id) ?? 1) - 1);
-    pack = bestFixedPack(workArea.w, workArea.h, groups, sugNeed, gap);
+    pack = bestFixedPack(workArea.w, workArea.h, groups, sugNeed, gap, opts);
   }
   if (!pack) return undefined;
 
@@ -1789,22 +2312,46 @@ export function computeFixedMontage(input: FixedMontageInput, machine?: Machine)
   const primaryNeed = new Map<string, number>();
   for (const [id, n] of requested) primaryNeed.set(id, halved ? Math.ceil(n / 2) : n);
 
+  // شبكة أمان النمط الثابت في وضع guillotine: لا يُقبل إلا حزم تجتاز مدقّق
+  // القص الشريحي (assertCutPattern) وقاعدة الترسيخ والترتيب الحجمي الصاعد
+  // (anchoredOrderOk) بعد الترسيخ والمرآة، مع إتاحة مرشحي عائلتي الأعمدة
+  // والبلوكات — فمرشحو legacy قد يفوزون بالتسجيل رغم مخالفة الترتيب.
+  const guillotine = input.cutMethod === 'guillotine';
+  const accept = guillotine
+    ? (pack: FixedPackPiece[]) => {
+        const fin = finalizeFixedPlaced(pack, workArea, halved, flip, gap);
+        return assertCutPattern(fin, flip) !== 'invalid' && anchoredOrderOk(fin, workArea, flip);
+      }
+    : undefined;
+  const packOpts = { accept, candidateMode: guillotine ? ('guillotine' as const) : ('free' as const) };
+
   // generate packing candidates and keep the most compact feasible one
-  const best = bestFixedPack(workArea.w, workArea.h, groups, primaryNeed, gap);
+  const best = bestFixedPack(workArea.w, workArea.h, groups, primaryNeed, gap, packOpts);
 
   if (!best) {
-    const maxPrimary = honestMaxPerGroupPrimary(workArea.w, workArea.h, groups, primaryNeed, gap);
+    const maxPrimary = honestMaxPerGroupPrimary(workArea.w, workArea.h, groups, primaryNeed, gap, packOpts);
     const maxPerGroup: Record<string, number> = {};
     for (const g of groups) maxPerGroup[g.id] = (maxPrimary[g.id] ?? 0) * (halved ? 2 : 1);
     return {
       ok: false,
-      reason: 'الأعداد المطلوبة لا تسع معاً في الورقة الواحدة — قلّل الأعداد أو وسّع الورقة أو غيّر طريقة الطباعة.',
+      reason: guillotine
+        ? 'الأعداد المطلوبة لا تسع بأنماط القص المستقيم (صفوف/أعمدة/بلوكات متجانسة) — قلّل الأعداد أو وسّع الورقة أو بدّل إلى القص بالقالب (die-cut).'
+        : 'الأعداد المطلوبة لا تسع معاً في الورقة الواحدة — قلّل الأعداد أو وسّع الورقة أو غيّر طريقة الطباعة.',
       maxPerGroup,
-      suggestion: buildFixedSuggestion(workArea, full, groups, primaryNeed, maxPrimary, halved, flip, gap),
+      suggestion: buildFixedSuggestion(workArea, full, groups, primaryNeed, maxPrimary, halved, flip, gap, packOpts),
     };
   }
 
   const placed = finalizeFixedPlaced(best, workArea, halved, flip, gap);
+  const cutPattern = guillotine ? assertCutPattern(placed, flip) : undefined;
+  // دفاع أخير مستقل عن فلترة المرشحين: لا تُرجع نتيجة Guillotine غير مصنفة.
+  if (cutPattern === 'invalid') {
+    return {
+      ok: false,
+      reason: 'تعذّر اعتماد المخطط لأنه لا ينفصل بضربات قص مستقيمة ضمن أحد الأنماط الثلاثة.',
+      maxPerGroup: {},
+    };
+  }
 
   const perGroupCount = new Map<string, number>();
   for (const p of placed) perGroupCount.set(p.groupId, (perGroupCount.get(p.groupId) ?? 0) + 1);
@@ -1854,6 +2401,7 @@ export function computeFixedMontage(input: FixedMontageInput, machine?: Machine)
     ...(flip ? { flipAxis: flip } : {}),
     ...(method === 'double-pince' ? { gripMm: Math.max(0, grip ?? DOUBLE_PINCE_GRIP_MM) } : {}),
     ...(method === 'bascule' ? { gutterMm: Math.max(0, input.gutterMm ?? 10) } : {}),
+    ...(cutPattern ? { cutPattern } : {}),
     alternatives: [],
     perGroup,
   };
@@ -1984,6 +2532,7 @@ export function computeMontageVariants(input: MontageInput, machine?: Machine): 
     input.gutterMm ?? 10,
     input.gripMm,
     makeGapResolver(groups, input.defaultGapMm, input.pairGaps),
+    input.cutMethod,
   );
   if (candidates.length === 0) return [];
 
@@ -1992,28 +2541,31 @@ export function computeMontageVariants(input: MontageInput, machine?: Machine): 
   for (const c of candidates) if (!uniq.has(c.signature)) uniq.set(c.signature, c);
   const pool = [...uniq.values()];
 
-  // وضع guillotine (معتمد): المرشح الافتراضي balanced = مرشح من عائلة الأرفف
-  // ذي البلوكات المستطيلة القابلة للقص بضربات مستقيمة — وليس MaxRects الحر
-  // (تراكيب L لا تُقص بضربات مستقيمة). التقييد على مرحلتين: المصدر ≠ maxrects،
-  // ثم يُفضَّل منها من كل كتل اتصاله مستطيلة ممتلئة فعلاً (computeCutBlocks —
-  // نموذج البلوكات نفسه المستخدم لعلامات القص). باقي المرشحين بلا تقييد (تنوع).
+  // وضع guillotine: pool كلها مرشحون من العائلات الثلاث المدقَّقين (الفلترة
+  // والتدقيق يجريان داخل evaluateCandidates)، ويُختار الافتراضي balanced منها
+  // بأدنى هدر تشغيل ثم أدنى انحراف كميات ثم تفضيل عائلة الصفوف (ترتيب حجمي
+  // طبيعي: الأكبر في القاع) ثم أدنى ضربات قص.
   const guillotine = input.cutMethod === 'guillotine';
-  const blockFriendly = (c: EvalCandidate): boolean =>
-    computeCutBlocks(
-      c.result.placed.map((p) => ({ x: p.x, y: p.y, w: p.w, h: p.h, bleed: p.bleed, groupId: p.groupId })),
-    ).every((b) => b.grid);
-  const balancedPool = (() => {
-    if (!guillotine) return pool;
-    const shelfFamily = pool.filter((c) => c.source !== 'maxrects');
-    const friendly = shelfFamily.filter(blockFriendly);
-    if (friendly.length > 0) return friendly;
-    return shelfFamily.length > 0 ? shelfFamily : pool;
-  })();
+  const FAMILY_RANK: Record<string, number> = { rows: 0, blocks: 1, columns: 2 };
+  const FAMILY_LABEL: Record<string, string> = { rows: 'قص أفقي', columns: 'قص عمودي', blocks: 'قص بلوكات' };
+  const familyRank = (c: EvalCandidate): number => FAMILY_RANK[c.source] ?? 3;
+  // وسم العائلة يُشتق من المدقّق نفسه (تصنيف المخطط الفعلي) لا من اسم المولّد —
+  // مخطط مولّد أعمدة قد يُصنَّف بلوكات فعلياً والعكس (المرآة تُمرَّر للمشطورة)
+  const halved = input.method === 'bascule' || input.method === 'double-pince';
+  const flip = halved ? flipAxisOf(input.sheetWidthMm, input.sheetHeightMm, input.method) : null;
 
   const pickBalanced = () =>
-    balancedPool.reduce((a, b) =>
-      b.runWaste < a.runWaste - 1e-9 || (Math.abs(b.runWaste - a.runWaste) <= 1e-9 && b.ratioDev < a.ratioDev) ? b : a,
-    );
+    pool.reduce((a, b) => {
+      if (b.runWaste < a.runWaste - 1e-9) return b;
+      if (Math.abs(b.runWaste - a.runWaste) <= 1e-9) {
+        if (b.ratioDev < a.ratioDev - 1e-9) return b;
+        if (Math.abs(b.ratioDev - a.ratioDev) <= 1e-9) {
+          if (guillotine && familyRank(b) < familyRank(a)) return b;
+          if ((!guillotine || familyRank(b) === familyRank(a)) && b.cutScore < a.cutScore) return b;
+        }
+      }
+      return a;
+    });
   const pickMinWaste = () =>
     pool.reduce((a, b) =>
       b.result.wastePercent < a.result.wastePercent - 1e-9 ||
@@ -2031,7 +2583,11 @@ export function computeMontageVariants(input: MontageInput, machine?: Machine): 
   const push = (kind: MontageVariantKind, c: EvalCandidate) => {
     if (used.has(c.signature)) return;
     used.add(c.signature);
-    out.push({ kind, label: VARIANT_META[kind].label, description: VARIANT_META[kind].description, cutScore: c.cutScore, result: c.result });
+    const famLabel = guillotine ? FAMILY_LABEL[assertCutPattern(c.result.placed, flip)] : undefined;
+    const description = guillotine && famLabel
+      ? `${VARIANT_META[kind].description} — نمط القص: ${famLabel}.`
+      : VARIANT_META[kind].description;
+    out.push({ kind, label: VARIANT_META[kind].label, description, cutScore: c.cutScore, result: c.result });
   };
   push('balanced', pickBalanced());
   push('min-waste', pickMinWaste());

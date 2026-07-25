@@ -18,6 +18,7 @@ import {
   type FixedMontageOutcome,
 } from '@/lib/montage-engine';
 import { trimNumber } from '@/lib/units';
+import type { DesignFileAsset } from '@/lib/design-file-types';
 import type { BleedValue } from '@/components/ds/BleedGroup';
 import type {
   Machine,
@@ -145,6 +146,8 @@ export const MACHINE_MICRO: Record<string, string> = {
  */
 export interface Sticker {
   id: string;
+  /** User-facing name; populated from the uploaded file when available. */
+  name?: string;
   widthMm: number;
   heightMm: number;
   bleed: BleedValue;        // this design's own bleed
@@ -155,6 +158,10 @@ export interface Sticker {
   /** internal gap (mm) between copies of THIS design — extra air above bleed-box
    *  touching; overrides the global default gap. Undefined → default applies. */
   intraGapMm?: number;
+  /** Uploaded artwork metadata; the binary itself is persisted in IndexedDB. */
+  asset?: DesignFileAsset;
+  /** Optional separate die-line/cut-contour file linked to this design. */
+  cutContour?: DesignFileAsset;
 }
 
 /** How the sheet layout is driven: from quantities (automatic) or from fixed per-sheet counts. */
@@ -170,7 +177,7 @@ export interface MontageUIState {
   customSheet: boolean;
   autoSuggest: boolean;
   calcMode: CalcMode;
-  stickers: Sticker[]; // at least one — stickers[0] is the primary design
+  stickers: Sticker[]; // may be empty (blank sheet); stickers[0] is primary when present
   bleedShared: BleedValue; // the shared bleed that linked designs follow
   method: PrintMethod;
   gutterMm: number;
@@ -291,7 +298,7 @@ export function stickerBleed(state: MontageUIState, s: Sticker): BleedValue {
 export function allGroups(state: MontageUIState): StickerGroup[] {
   return state.stickers.map((s, i) => ({
     id: s.id,
-    name: `تصميم ${i + 1}`,
+    name: s.name || `تصميم ${i + 1}`,
     widthMm: s.widthMm,
     heightMm: s.heightMm,
     quantity: s.quantity,
@@ -625,6 +632,7 @@ export function computeFixedWithFallback(state: MontageUIState): FixedMontageOut
       machineId: state.machineId,
       defaultGapMm: state.defaultGapMm,
       pairGaps: state.pairGaps,
+      cutMethod: state.cutMethod,
     },
     machine,
   );
@@ -667,7 +675,7 @@ export function transparencyRows(
     const produced = sheetsNeeded * perSheet;
     return {
       id: s.id,
-      name: state.stickers.length === 1 ? 'التصميم' : `تصميم ${i + 1}`,
+      name: s.name || (state.stickers.length === 1 ? 'التصميم' : `تصميم ${i + 1}`),
       requested: s.quantity,
       perSheet,
       produced,

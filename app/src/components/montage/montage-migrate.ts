@@ -9,6 +9,7 @@
 // ---------------------------------------------------------------------------
 
 import type { BleedValue } from '@/components/ds/BleedGroup';
+import type { DesignFileAsset } from '@/lib/design-file-types';
 import { INITIAL_STATE, normalizeSheetForKind, type MontageUIState, type Sticker } from './montage-data';
 
 function asBleed(v: unknown, fallback: BleedValue): BleedValue {
@@ -22,11 +23,31 @@ function asBleed(v: unknown, fallback: BleedValue): BleedValue {
   };
 }
 
+function asAsset(v: unknown): DesignFileAsset | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const o = v as Record<string, unknown>;
+  const format = o.format;
+  const confidence = o.confidence;
+  if (
+    typeof o.id !== 'string' ||
+    typeof o.storageKey !== 'string' ||
+    typeof o.fileName !== 'string' ||
+    !['pdf', 'svg', 'ai', 'jpg'].includes(String(format)) ||
+    !['high', 'medium', 'low'].includes(String(confidence)) ||
+    typeof o.widthMm !== 'number' ||
+    typeof o.heightMm !== 'number'
+  ) {
+    return undefined;
+  }
+  return v as DesignFileAsset;
+}
+
 function asSticker(v: unknown, index: number, shared: BleedValue): Sticker | null {
   if (!v || typeof v !== 'object') return null;
   const o = v as Record<string, unknown>;
   return {
     id: typeof o.id === 'string' && o.id ? o.id : `st-${index + 1}`,
+    name: typeof o.name === 'string' && o.name.trim() ? o.name : undefined,
     widthMm: typeof o.widthMm === 'number' ? o.widthMm : 0,
     heightMm: typeof o.heightMm === 'number' ? o.heightMm : 0,
     bleed: asBleed(o.bleed, shared),
@@ -40,6 +61,8 @@ function asSticker(v: unknown, index: number, shared: BleedValue): Sticker | nul
       typeof o.intraGapMm === 'number' && Number.isFinite(o.intraGapMm) && o.intraGapMm > 0
         ? o.intraGapMm
         : undefined,
+    asset: asAsset(o.asset),
+    cutContour: asAsset(o.cutContour),
   };
 }
 
@@ -65,10 +88,10 @@ export function migrateStateDraft(raw: unknown): MontageUIState | null {
   if (!raw || typeof raw !== 'object') return null;
   const o = raw as Record<string, unknown>;
 
-  if (Array.isArray(o.stickers) && o.stickers.length > 0) {
+  if (Array.isArray(o.stickers)) {
     const shared = asBleed(o.bleedShared, INITIAL_STATE.bleedShared);
+    // empty stickers is valid (blank sheet); drop only unparsable entries
     const stickers = o.stickers.map((s, i) => asSticker(s, i, shared)).filter((s): s is Sticker => s !== null);
-    if (stickers.length === 0) return null;
     const rest = { ...o };
     delete rest.stickers;
     delete rest.bleedShared;

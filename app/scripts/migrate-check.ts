@@ -81,7 +81,8 @@ check('round-trip: stable', m3 !== null && JSON.stringify(m3) === JSON.stringify
 // ---- 4) garbage / unusable drafts ------------------------------------------
 check('garbage: null on non-object', migrateStateDraft('nope') === null);
 check('garbage: null on empty object', migrateStateDraft({}) === null);
-check('garbage: null on empty stickers', migrateStateDraft({ stickers: [] }) === null);
+  const empty = migrateStateDraft({ stickers: [] });
+  check('empty stickers: valid blank sheet', empty !== null && empty.stickers.length === 0);
 
 // ---- 5) legacy without extras ----------------------------------------------
 const m5 = migrateStateDraft({ pieceW: 89, pieceH: 89, bleed: { top: 3, bottom: 3, left: 3, right: 3 }, quantity: 1000 });
