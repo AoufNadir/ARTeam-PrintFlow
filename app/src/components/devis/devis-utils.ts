@@ -3,10 +3,11 @@
 // formatting, TVA math, and human/Latin item-spec strings.
 // ---------------------------------------------------------------------------
 
-import type { Client, Devis, DevisItem, DimensionValue, Service, Unit } from '@/lib/types';
+import type { Client, Devis, DevisDiscount, DevisItem, DevisTotals, DimensionValue, Service, Unit } from '@/lib/types';
 import { formatDimension } from '@/lib/units';
 
-export const TVA_RATE = 0.19;
+export const DEFAULT_TVA_RATE = 0.19;
+export const TVA_RATE = DEFAULT_TVA_RATE;
 
 /** Algerian month names (as used in the design docs: "14 جانفي 2025"). */
 export const AR_MONTHS = [
@@ -41,11 +42,44 @@ export function fromInputDate(value: string): string {
 
 // ------------------------------- totals -------------------------------------
 
-/** Devis totals: items carry HT; TTC = HT + TVA 19%. */
-export function devisTotals(items: Pick<DevisItem, 'total'>[]) {
-  const ht = items.reduce((s, it) => s + it.total, 0);
-  const tva = ht * TVA_RATE;
-  return { ht, tva, ttc: ht + tva };
+function money(value: number): number {
+  return Math.round((Number.isFinite(value) ? value : 0) * 100) / 100;
+}
+
+function discountAmount(discount: DevisDiscount | undefined, base: number): number {
+  if (!discount || discount.value <= 0 || base <= 0) return 0;
+  if (discount.mode === 'percent') return money((base * Math.min(100, discount.value)) / 100);
+  return money(Math.min(base, discount.value));
+}
+
+export interface DevisTotalsInput {
+  discount?: DevisDiscount;
+  extraFees?: { amount: number }[];
+  taxRate?: number;
+  advance?: Devis['advance'];
+}
+
+/**
+ * Fixed commercial calculation order:
+ * items HT -> discounts -> fees -> TVA -> TTC -> advance -> balance.
+ */
+export function devisTotals(items: Pick<DevisItem, 'total' | 'discount'>[], input: DevisTotalsInput = {}): DevisTotals {
+  const itemsGross = money(items.reduce((s, it) => s + it.total, 0));
+  const itemDiscounts = money(items.reduce((s, it) => s + discountAmount(it.discount, it.total), 0));
+  const itemsHt = money(Math.max(0, itemsGross - itemDiscounts));
+  const quoteDiscount = discountAmount(input.discount, itemsHt);
+  const extraFees = money((input.extraFees ?? []).reduce((s, fee) => s + Math.max(0, fee.amount || 0), 0));
+  const ht = money(Math.max(0, itemsHt - quoteDiscount) + extraFees);
+  const taxRate = Number.isFinite(input.taxRate) ? Math.max(0, input.taxRate ?? DEFAULT_TVA_RATE) : DEFAULT_TVA_RATE;
+  const tva = money(ht * taxRate);
+  const ttc = money(ht + tva);
+  const advance = input.advance
+    ? input.advance.mode === 'percent'
+      ? money((ttc * Math.min(100, Math.max(0, input.advance.value))) / 100)
+      : money(Math.min(ttc, Math.max(0, input.advance.value)))
+    : 0;
+  const balanceDue = money(Math.max(0, ttc - advance));
+  return { itemsHt, itemDiscounts, quoteDiscount, extraFees, ht, taxRate, tva, ttc, advance, balanceDue };
 }
 
 // ------------------------------- item specs ---------------------------------

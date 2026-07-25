@@ -3,6 +3,8 @@
 // All dimensions are stored internally in millimeters (mm). See units.ts.
 // ---------------------------------------------------------------------------
 
+import type { DesignFileAsset } from './design-file-types';
+
 export type Unit = 'mm' | 'cm';
 
 export type FieldType = 'number' | 'select' | 'yesno' | 'text' | 'dimensions';
@@ -100,14 +102,99 @@ export interface Project {
   createdAt: string;
 }
 
-export type DevisStatus = 'draft' | 'sent' | 'accepted' | 'rejected' | 'done';
+export type DevisStatus =
+  | 'draft'
+  | 'ready'
+  | 'sent'
+  | 'accepted'
+  | 'rejected'
+  | 'expired'
+  | 'production'
+  | 'done';
+
+export type DiscountMode = 'amount' | 'percent';
+
+export interface DevisDiscount {
+  mode: DiscountMode;
+  value: number;
+  reason?: string;
+}
+
+export interface DevisExtraFee {
+  id: string;
+  label: string;
+  amount: number;
+}
+
+export interface DevisAdvance {
+  mode: DiscountMode;
+  value: number;
+}
+
+export interface DevisTotals {
+  itemsHt: number;
+  itemDiscounts: number;
+  quoteDiscount: number;
+  extraFees: number;
+  ht: number;
+  taxRate: number;
+  tva: number;
+  ttc: number;
+  advance: number;
+  balanceDue: number;
+}
+
+export interface CommercialTerms {
+  paymentTerms?: string;
+  deliveryMethod?: string;
+  deliveryDelay?: string;
+  validityTerms?: string;
+  language?: 'ar' | 'fr' | 'bilingual';
+}
+
+export type DevisAttachmentKind = 'artwork' | 'cut-contour';
+
+export interface DevisAttachment {
+  id: string;
+  kind: DevisAttachmentKind;
+  asset: DesignFileAsset;
+  linkedDesignId?: string;
+  uploadedAt: string;
+}
+
+export type MontageState = 'confirmed' | 'estimated' | 'stale' | 'invalid';
+
+export type PreflightSeverity = 'ok' | 'warning' | 'error';
+
+export interface PreflightCheck {
+  key: string;
+  label: string;
+  status: PreflightSeverity;
+  message?: string;
+}
+
+export interface QuantityOption {
+  quantity: number;
+  pricing: PriceBreakdown;
+  unitPrice: number;
+  total: number;
+  margin: number;
+  marginPercent: number;
+}
 
 export interface DevisItem {
   id: string;
+  order?: number;
   serviceId: string;
   serviceName: string;
   quantity: number;
   fieldValues: Record<string, string | number | boolean | DimensionValue>;
+  attachments?: DevisAttachment[];
+  montageState?: MontageState;
+  preflight?: PreflightCheck[];
+  quantityOptions?: QuantityOption[];
+  discount?: DevisDiscount;
+  manualPriceReason?: string;
   montageResult?: MontageResult;
   pricing: PriceBreakdown;
   unitPrice: number; // DA
@@ -116,22 +203,44 @@ export interface DevisItem {
 
 export interface Devis {
   id: string;
+  dataVersion?: number;
   number: string; // e.g. "D-2025-0147"
+  revision?: number; // R1 = original, R2+ are locked quote revisions
+  revisionOfId?: string;
+  rootDevisId?: string;
   clientId: string;
   projectId?: string;
   status: DevisStatus;
   items: DevisItem[];
   total: number;
+  totals?: DevisTotals;
+  discount?: DevisDiscount;
+  extraFees?: DevisExtraFee[];
+  taxRate?: number;
+  advance?: DevisAdvance;
   /** Optional free-form title shown next to the number (e.g. "حملة رمضان") */
   title?: string;
   /** ISO date — promised delivery date */
   deliveryDate?: string;
   /** ISO date — offer validity deadline ("صالح حتى") */
   validUntil?: string;
-  /** Internal / client-facing notes */
+  /** Legacy notes. Migrated to internalNotes when possible. */
   notes?: string;
+  /** Notes that never appear on the client PDF. */
+  internalNotes?: string;
+  /** Notes and terms that appear on the client PDF. */
+  clientNotes?: string;
+  commercialTerms?: CommercialTerms;
   /** Reason recorded when the computed price was manually overridden */
   overrideReason?: string;
+  sentAt?: string;
+  sentVia?: 'download' | 'email' | 'whatsapp' | 'manual';
+  acceptedAt?: string;
+  rejectedAt?: string;
+  expiredAt?: string;
+  lockedAt?: string;
+  productionStatus?: 'not-started' | 'ready' | 'work-order-created';
+  productionWorkOrderId?: string;
   rulesVersion: number; // frozen pricing-rules version, badge "قواعد v{n}"
   rulesSnapshot: PricingRule[]; // deep copy of the rules at creation time
   /** deep copy of paper prices at creation time ("ثبات الماضي") */

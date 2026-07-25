@@ -17,6 +17,8 @@ import {
 import type {
   Client,
   Devis,
+  DevisItem,
+  DevisStatus,
   Machine,
   PaperType,
   PricingRule,
@@ -25,9 +27,12 @@ import type {
   Section,
   Service,
 } from './types';
+import { DEFAULT_TVA_RATE, devisTotals } from '@/components/devis/devis-utils';
 
 const PREFIX = 'arteam-printflow:';
 const SEEDED_KEY = `${PREFIX}seeded-v1`;
+const DATA_VERSION = 2;
+const SCHEMA_VERSION_KEY = `${PREFIX}schema-version`;
 
 type EntityMap = {
   sections: Section;
@@ -117,6 +122,7 @@ export function ensureSeeded(): void {
     seed();
     localStorage.setItem(SEEDED_KEY, '1');
   }
+  migrateStorage();
   reconcileSections();
 }
 
@@ -154,6 +160,84 @@ export function resetAndReseed(): void {
   }
   seed();
   localStorage.setItem(SEEDED_KEY, '1');
+  localStorage.setItem(SCHEMA_VERSION_KEY, String(DATA_VERSION));
+}
+
+// ------------------------------- migrations ----------------------------------
+
+function migrateItem(item: DevisItem, index: number): DevisItem {
+  const montageState = item.montageState ?? (item.montageResult ? 'confirmed' : 'estimated');
+  const preflight = item.preflight ?? [
+    {
+      key: 'montage',
+      label: 'المونتاج',
+      status: montageState === 'invalid' || montageState === 'stale' ? 'error' : montageState === 'estimated' ? 'warning' : 'ok',
+      message:
+        montageState === 'confirmed'
+          ? undefined
+          : montageState === 'estimated'
+            ? 'السعر تقديري لأن المونتاج غير مؤكد.'
+            : 'يحتاج المونتاج إلى مراجعة قبل الإرسال.',
+    },
+  ];
+  return {
+    ...item,
+    order: item.order ?? index,
+    attachments: item.attachments ?? [],
+    montageState,
+    preflight,
+    quantityOptions: item.quantityOptions ?? [],
+  };
+}
+
+function normalizeDevis(devis: Devis): Devis {
+  const items = devis.items.map(migrateItem).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  const taxRate = Number.isFinite(devis.taxRate) ? devis.taxRate : DEFAULT_TVA_RATE;
+  const totals = devisTotals(items, {
+    discount: devis.discount,
+    extraFees: devis.extraFees ?? [],
+    taxRate,
+    advance: devis.advance,
+  });
+  return {
+    ...devis,
+    dataVersion: DATA_VERSION,
+    revision: devis.revision ?? 1,
+    rootDevisId: devis.rootDevisId ?? devis.revisionOfId ?? devis.id,
+    status: devis.status ?? 'draft',
+    items,
+    taxRate,
+    extraFees: devis.extraFees ?? [],
+    internalNotes: devis.internalNotes ?? devis.notes,
+    commercialTerms: {
+      language: 'ar',
+      ...(devis.commercialTerms ?? {}),
+    },
+    productionStatus: devis.productionStatus ?? 'not-started',
+    totals,
+    total: totals.ttc,
+  };
+}
+
+function migrateStorage(): void {
+  const current = Number(localStorage.getItem(SCHEMA_VERSION_KEY));
+  const rows = readAll<Devis>('devis');
+  const migrated = rows.map(normalizeDevis);
+  const changed =
+    current !== DATA_VERSION ||
+    rows.length !== migrated.length ||
+    rows.some((row, index) => JSON.stringify(row) !== JSON.stringify(migrated[index]));
+  if (changed) writeAll('devis', migrated);
+  localStorage.setItem(SCHEMA_VERSION_KEY, String(DATA_VERSION));
+}
+
+function devisHasSendBlocker(devis: Devis): boolean {
+  return devis.items.some(
+    (item) =>
+      item.montageState === 'invalid' ||
+      item.montageState === 'stale' ||
+      item.preflight?.some((check) => check.status === 'error'),
+  );
 }
 
 // ------------------------------- pricing snapshots ---------------------------
@@ -193,13 +277,13 @@ export function publishRules(rules: PricingRule[], note?: string): number {
  */
 export function pricingSnapshot(devis: Omit<Devis, 'rulesVersion' | 'rulesSnapshot'>): Devis {
   const v = currentRulesVersion();
-  return {
+  return normalizeDevis({
     ...devis,
     rulesVersion: v.version,
     rulesSnapshot: structuredClone(v.rules),
     papersSnapshot: structuredClone(list('papers')),
     machinesSnapshot: structuredClone(list('machines')),
-  };
+  });
 }
 
 // ------------------------------- public repo ---------------------------------
@@ -243,11 +327,87 @@ export const db = {
     remove: (id: string) => remove('projects', id),
   },
   devis: {
-    list: () => list('devis'),
-    get: (id: string) => get('devis', id),
-    create: (e: Devis) => create('devis', e),
-    update: (id: string, p: Partial<Devis>) => update('devis', id, p),
+    list: () => list('devis').map(normalizeDevis),
+    get: (id: string) => {
+      const found = get('devis', id);
+      return found ? normalizeDevis(found) : undefined;
+    },
+    create: (e: Devis) => create('devis', normalizeDevis(e)),
+    update: (id: string, p: Partial<Devis>) => {
+      const updated = update('devis', id, p);
+      if (!updated) return undefined;
+      const normalized = normalizeDevis(updated);
+      update('devis', id, normalized);
+      return normalized;
+    },
     remove: (id: string) => remove('devis', id),
+    saveDraft: (draft: Devis): Devis => {
+      const now = new Date().toISOString();
+      const normalized = normalizeDevis({ ...draft, status: 'draft', updatedAt: now });
+      const existing = get('devis', normalized.id);
+      if (!existing) return create('devis', normalized);
+      update('devis', normalized.id, normalized);
+      return normalizeDevis(get('devis', normalized.id)!);
+    },
+    transitionStatus: (
+      id: string,
+      status: DevisStatus,
+      meta: { sentVia?: Devis['sentVia'] } = {},
+    ): Devis | undefined => {
+      const src = get('devis', id);
+      if (!src) return undefined;
+      const devis = normalizeDevis(src);
+      if (status === 'sent' && devisHasSendBlocker(devis)) return undefined;
+      const now = new Date().toISOString();
+      const patch: Partial<Devis> = { status, updatedAt: now };
+      if (status === 'sent') {
+        patch.sentAt = devis.sentAt ?? now;
+        patch.sentVia = meta.sentVia ?? devis.sentVia ?? 'manual';
+        patch.lockedAt = devis.lockedAt ?? now;
+      }
+      if (status === 'accepted') patch.acceptedAt = devis.acceptedAt ?? now;
+      if (status === 'rejected') patch.rejectedAt = devis.rejectedAt ?? now;
+      if (status === 'expired') patch.expiredAt = devis.expiredAt ?? now;
+      if (status === 'production') {
+        patch.productionStatus = 'work-order-created';
+        patch.productionWorkOrderId = devis.productionWorkOrderId ?? uid('wo');
+      }
+      return db.devis.update(id, patch);
+    },
+    createRevision: (id: string): Devis | undefined => {
+      const src = db.devis.get(id);
+      if (!src) return undefined;
+      const now = new Date().toISOString();
+      const rootId = src.rootDevisId ?? src.id;
+      const baseNumber = src.number.replace(/-R\d+$/i, '');
+      const nextRevision =
+        db.devis
+          .list()
+          .filter((candidate) => (candidate.rootDevisId ?? candidate.id) === rootId)
+          .reduce((max, candidate) => Math.max(max, candidate.revision ?? 1), 1) + 1;
+      const revision = normalizeDevis({
+        ...structuredClone(src),
+        id: uid('devis'),
+        number: `${baseNumber}-R${nextRevision}`,
+        revision: nextRevision,
+        revisionOfId: src.id,
+        rootDevisId: rootId,
+        status: 'draft',
+        sentAt: undefined,
+        sentVia: undefined,
+        acceptedAt: undefined,
+        rejectedAt: undefined,
+        expiredAt: undefined,
+        lockedAt: undefined,
+        productionStatus: 'not-started',
+        productionWorkOrderId: undefined,
+        items: src.items.map((item, index) => ({ ...structuredClone(item), id: uid('item'), order: index })),
+        createdAt: now,
+        updatedAt: now,
+      });
+      return create('devis', revision);
+    },
+    convertToProduction: (id: string): Devis | undefined => db.devis.transitionStatus(id, 'production'),
     /**
      * Duplicate a quote (deep copy) with a fresh id, a NEW persistent number
      * and fresh timestamps; resets the copy to 'draft'. Optional fields
@@ -262,11 +422,23 @@ export const db = {
         ...structuredClone(src),
         id: uid('devis'),
         number: db.devis.nextNumber(),
+        revision: 1,
+        revisionOfId: undefined,
+        rootDevisId: undefined,
         status: 'draft',
+        sentAt: undefined,
+        sentVia: undefined,
+        acceptedAt: undefined,
+        rejectedAt: undefined,
+        expiredAt: undefined,
+        lockedAt: undefined,
+        productionStatus: 'not-started',
+        productionWorkOrderId: undefined,
+        items: src.items.map((item, index) => ({ ...structuredClone(item), id: uid('item'), order: index })),
         createdAt: now,
         updatedAt: now,
       };
-      return create('devis', copy);
+      return create('devis', normalizeDevis(copy));
     },
     /**
      * Next quote number from a PERSISTENT per-year counter

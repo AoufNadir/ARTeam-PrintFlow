@@ -2,20 +2,26 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
+  ArrowDown,
+  ArrowUp,
   Check,
   ChevronLeft,
   ChevronRight,
+  Copy,
   FileDown,
   Flag,
   Info,
   Layers,
   Lock,
   Package,
+  Pencil,
   PanelTop,
   Plus,
   Printer,
   Puzzle,
+  Save,
   Search,
+  Send,
   Sparkles,
   X,
 } from 'lucide-react';
@@ -47,18 +53,27 @@ import {
 } from '@/components/devis/devis-utils';
 import { isSectionDisabled, isServiceDisabled } from '@/components/builder/meta';
 import { useUnit } from '@/components/layout-context';
+import DesignFileUploader from '@/components/montage/DesignFileUploader';
+import type { Sticker } from '@/components/montage/montage-data';
+import { logAudit } from '@/components/settings/audit';
+import { designNameFromAsset, type DesignFileAsset } from '@/lib/design-file-types';
 import { computeMontage } from '@/lib/montage-engine';
 import { percentRule, priceItem, type FieldValues } from '@/lib/pricing-engine';
 import { db, uid } from '@/lib/storage';
 import type {
   Client,
+  DevisAttachment,
+  DevisDiscount,
   Devis,
   DevisItem,
   DevisStatus,
   DimensionValue,
   MontageResult,
+  MontageState,
+  PreflightCheck,
   PrintMethod,
   Project,
+  QuantityOption,
   Section,
   Service,
   SheetAlternative,
@@ -67,11 +82,108 @@ import { formatDA, formatPercent, round2 } from '@/lib/units';
 import { cn } from '@/lib/utils';
 
 const EASE = [0.22, 0.68, 0.26, 1] as [number, number, number, number];
-const STEPS = ['القسم', 'الخدمة', 'المعلومات', 'الحقول', 'المونتاج', 'المراجعة', 'تم'];
-const QTY_PRESETS = [100, 250, 500, 1000];
+const PHASES = ['العميل والعرض', 'الخدمات والتصاميم', 'التسعير والشروط', 'المراجعة'];
+const QTY_PRESETS = [100, 250, 500, 1000, 2000];
+const QUANTITY_COMPARE = [500, 1000, 2000];
+const DRAFT_RESTORE_KEY = 'arteam-printflow:devis-active-draft';
+
+type SaveState = 'idle' | 'saving' | 'saved' | 'failed';
 
 function isDim(v: unknown): v is DimensionValue {
   return typeof v === 'object' && v !== null && 'widthMm' in v && 'heightMm' in v;
+}
+
+function firstDimensionFieldId(service: Service | undefined): string | undefined {
+  return service?.fields.find((field) => field.type === 'dimensions')?.id;
+}
+
+function discountOrUndefined(mode: 'amount' | 'percent', value: number, reason?: string): DevisDiscount | undefined {
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  return { mode, value, reason: reason?.trim() || undefined };
+}
+
+function compareAssetToDims(asset: DesignFileAsset, dims: DimensionValue | undefined): PreflightCheck {
+  if (!dims) {
+    return { key: 'size', label: 'المقاس', status: 'warning', message: 'لا يوجد مقاس طلب للمقارنة.' };
+  }
+  const direct = Math.max(Math.abs(asset.widthMm - dims.widthMm), Math.abs(asset.heightMm - dims.heightMm));
+  const rotated = Math.max(Math.abs(asset.widthMm - dims.heightMm), Math.abs(asset.heightMm - dims.widthMm));
+  const best = Math.min(direct, rotated);
+  if (best <= 0.5) return { key: 'size', label: 'المقاس', status: 'ok' };
+  if (best <= 2) return { key: 'size', label: 'المقاس', status: 'warning', message: `فرق قياس صغير ${round2(best)} مم.` };
+  return { key: 'size', label: 'المقاس', status: 'error', message: `مقاس الملف مختلف عن الطلب بـ ${round2(best)} مم.` };
+}
+
+function montageStateFrom(montage: MontageResult | null, montageStale: boolean, manualPrice: number | null): MontageState {
+  if (montageStale) return 'stale';
+  if (montage) return 'confirmed';
+  return manualPrice !== null ? 'estimated' : 'estimated';
+}
+
+function attachmentOf(kind: DevisAttachment['kind'], asset: DesignFileAsset, linkedDesignId?: string): DevisAttachment {
+  return {
+    id: uid('att'),
+    kind,
+    asset,
+    linkedDesignId,
+    uploadedAt: new Date().toISOString(),
+  };
+}
+
+function buildPreflight({
+  dims,
+  designAssets,
+  cutContours,
+  montageState,
+}: {
+  dims?: DimensionValue;
+  designAssets: DesignFileAsset[];
+  cutContours: DesignFileAsset[];
+  montageState: MontageState;
+}): PreflightCheck[] {
+  const checks: PreflightCheck[] = [
+    {
+      key: 'file',
+      label: 'الملف',
+      status: designAssets.length > 0 ? 'ok' : 'warning',
+      message: designAssets.length > 0 ? undefined : 'لم يُربط ملف تصميم بعد.',
+    },
+    {
+      key: 'montage',
+      label: 'المونتاج',
+      status: montageState === 'confirmed' ? 'ok' : montageState === 'estimated' ? 'warning' : 'error',
+      message:
+        montageState === 'confirmed'
+          ? undefined
+          : montageState === 'estimated'
+            ? 'السعر تقديري ويمكن حفظه كمسودة.'
+            : 'يجب إعادة حساب المونتاج قبل الإرسال.',
+    },
+  ];
+  if (designAssets[0]) checks.push(compareAssetToDims(designAssets[0], dims));
+  const hasCutNeed = designAssets.some((asset) => asset.hasEmbeddedCutContour) || cutContours.length > 0;
+  checks.push({
+    key: 'cut-contour',
+    label: 'tracé découpe',
+    status: !hasCutNeed || cutContours.length > 0 ? 'ok' : 'warning',
+    message: hasCutNeed && cutContours.length === 0 ? 'تم رصد مسار قص محتمل داخل التصميم؛ اربط ملف tracé عند الحاجة.' : undefined,
+  });
+  return checks;
+}
+
+function phaseForStep(step: number): number {
+  if (step <= 2) return 0;
+  if (step <= 4) return 1;
+  if (step === 5) return 2;
+  return 3;
+}
+
+function loadRestorableDraft(): Devis | null {
+  if (typeof localStorage === 'undefined') return null;
+  const id = localStorage.getItem(DRAFT_RESTORE_KEY);
+  if (!id) return null;
+  const draft = db.devis.get(id);
+  return draft?.status === 'draft' ? draft : null;
 }
 
 /** Section icon per design.md step-1 catalog (fallbacks by latin name). */
@@ -421,16 +533,23 @@ export default function DevisCreate() {
   const { unit, setUnit } = useUnit();
   const { id: editId } = useParams();
 
-  // edit mode: load the existing draft ONCE (guarded below)
-  const [editDevis] = useState<Devis | null>(() => (editId ? db.devis.get(editId) ?? null : null));
+  // edit mode: load the existing draft ONCE. New quotes restore the last local draft if present.
+  const [editDevis] = useState<Devis | null>(() => (editId ? db.devis.get(editId) ?? null : loadRestorableDraft()));
 
   useEffect(() => {
     if (editId && !editDevis) {
       toast.error('العرض المطلوب تعديله غير موجود');
       navigate('/devis', { replace: true });
-    } else if (editDevis && editDevis.status !== 'draft') {
-      toast.error('يمكن تعديل المسودات فقط — أنشئ نسخة من العرض بدلًا من ذلك');
-      navigate('/devis', { replace: true });
+    } else if (editId && editDevis && editDevis.status !== 'draft') {
+      const revision = db.devis.createRevision(editDevis.id);
+      if (revision) {
+        logAudit('devis', `أنشأ مراجعة ${revision.number} من ${editDevis.number}`, revision.number);
+        toast.success(`العرض مقفل — تم إنشاء مراجعة ${revision.number}`);
+        navigate(`/devis/${revision.id}/edit`, { replace: true });
+      } else {
+        toast.error('تعذر إنشاء مراجعة لهذا العرض');
+        navigate('/devis', { replace: true });
+      }
     }
   }, [editId, editDevis, navigate]);
 
@@ -481,12 +600,27 @@ export default function DevisCreate() {
       ? toInputDate(editDevis.validUntil)
       : toInputDate(addDays(new Date().toISOString(), 15)),
   );
-  const [notes, setNotes] = useState(() => editDevis?.notes ?? '');
+  const [notes, setNotes] = useState(() => editDevis?.internalNotes ?? editDevis?.notes ?? '');
+  const [clientNotes, setClientNotes] = useState(() => editDevis?.clientNotes ?? '');
+  const [paymentTerms, setPaymentTerms] = useState(() => editDevis?.commercialTerms?.paymentTerms ?? '50% تسبيق، والباقي عند التسليم');
+  const [deliveryMethod, setDeliveryMethod] = useState(() => editDevis?.commercialTerms?.deliveryMethod ?? '');
+  const [deliveryDelay, setDeliveryDelay] = useState(() => editDevis?.commercialTerms?.deliveryDelay ?? '');
+  const [documentLanguage, setDocumentLanguage] = useState<'ar' | 'fr' | 'bilingual'>(() => editDevis?.commercialTerms?.language ?? 'ar');
+  const [taxRatePct, setTaxRatePct] = useState(() => round2((editDevis?.taxRate ?? 0.19) * 100));
+  const [quoteDiscountMode, setQuoteDiscountMode] = useState<'amount' | 'percent'>(() => editDevis?.discount?.mode ?? 'amount');
+  const [quoteDiscountValue, setQuoteDiscountValue] = useState(() => editDevis?.discount?.value ?? 0);
+  const [quoteDiscountReason, setQuoteDiscountReason] = useState(() => editDevis?.discount?.reason ?? '');
+  const [extraFeeLabel, setExtraFeeLabel] = useState(() => editDevis?.extraFees?.[0]?.label ?? 'مصاريف إضافية');
+  const [extraFeeAmount, setExtraFeeAmount] = useState(() => editDevis?.extraFees?.[0]?.amount ?? 0);
+  const [advanceMode, setAdvanceMode] = useState<'amount' | 'percent'>(() => editDevis?.advance?.mode ?? 'percent');
+  const [advanceValue, setAdvanceValue] = useState(() => editDevis?.advance?.value ?? 0);
   const [clientError, setClientError] = useState(false);
   const [clientModal, setClientModal] = useState(false);
 
   // step 4 — service fields
   const [fieldValues, setFieldValues] = useState<FieldValues>({});
+  const [designAssets, setDesignAssets] = useState<DesignFileAsset[]>([]);
+  const [cutContourAssets, setCutContourAssets] = useState<DesignFileAsset[]>([]);
 
   // step 5 — montage
   const [montage, setMontage] = useState<MontageResult | null>(null);
@@ -503,10 +637,12 @@ export default function DevisCreate() {
   const [items, setItems] = useState<DevisItem[]>(() => editDevis?.items ?? []);
   const [devisId, setDevisId] = useState<string | null>(() => editDevis?.id ?? null);
   const [savedFlash, setSavedFlash] = useState(false);
+  const [saveState, setSaveState] = useState<SaveState>('idle');
   const [previewOpen, setPreviewOpen] = useState(false);
   const [rulesOpen, setRulesOpen] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
   const [removeItemId, setRemoveItemId] = useState<string | null>(null);
+  const [editingItemId, setEditingItemId] = useState<string | null>(null);
   const [negativeMarginConfirm, setNegativeMarginConfirm] = useState(false);
 
   const section = sectionId ? sections.find((s) => s.id === sectionId) : undefined;
@@ -562,7 +698,29 @@ export default function DevisCreate() {
   // manual price below production cost → negative margin (warn, never save silently)
   const negativeMargin = final !== null && final.margin < -0.005;
 
-  const totals = useMemo(() => devisTotals(items), [items]);
+  const taxRate = useMemo(() => Math.max(0, taxRatePct || 0) / 100, [taxRatePct]);
+  const quoteDiscount = useMemo(
+    () => discountOrUndefined(quoteDiscountMode, quoteDiscountValue, quoteDiscountReason),
+    [quoteDiscountMode, quoteDiscountValue, quoteDiscountReason],
+  );
+  const extraFees = useMemo(
+    () => (extraFeeAmount > 0 ? [{ id: 'fee-main', label: extraFeeLabel.trim() || 'مصاريف إضافية', amount: extraFeeAmount }] : []),
+    [extraFeeAmount, extraFeeLabel],
+  );
+  const advance = useMemo(
+    () => (advanceValue > 0 ? { mode: advanceMode, value: advanceValue } : undefined),
+    [advanceMode, advanceValue],
+  );
+  const totals = useMemo(
+    () => devisTotals(items, { discount: quoteDiscount, extraFees, taxRate, advance }),
+    [items, quoteDiscount, extraFees, taxRate, advance],
+  );
+  const editingItem = useMemo(() => items.find((item) => item.id === editingItemId), [items, editingItemId]);
+  const editingService = useMemo(() => (editingItem ? db.services.get(editingItem.serviceId) : undefined), [editingItem]);
+  const editingDimFieldId = firstDimensionFieldId(editingService);
+  const editingDims = editingDimFieldId && editingItem && isDim(editingItem.fieldValues[editingDimFieldId])
+    ? editingItem.fieldValues[editingDimFieldId]
+    : editingService?.defaultPieceSize;
 
   // auto-suggested title: «عرض — Carte Visite — مطعم الزيتونة» (until the user edits it)
   const suggestedTitle = ['عرض', service?.latinName ?? service?.name, client?.company ?? client?.name]
@@ -577,26 +735,39 @@ export default function DevisCreate() {
     window.setTimeout(() => setSavedFlash(false), 2400);
   };
 
-  const persistDevis = (nextItems: DevisItem[], status: DevisStatus = 'draft'): Devis | null => {
+  const persistDevis = (nextItems: DevisItem[], status: DevisStatus = 'draft', opts: { silent?: boolean } = {}): Devis | null => {
     if (!clientId) {
-      toast.error('اختر عميلًا قبل حفظ العرض');
+      if (!opts.silent) toast.error('اختر عميلًا قبل حفظ العرض');
       return null;
     }
     const now = new Date().toISOString();
-    const t = devisTotals(nextItems);
+    const t = devisTotals(nextItems, { discount: quoteDiscount, extraFees, taxRate, advance });
     // quote-level fields collected in step 3 + manual-override audit reason
     const meta = {
       title: titleValue.trim() || undefined,
       deliveryDate: deliveryDate ? fromInputDate(deliveryDate) : undefined,
       validUntil: validUntil ? fromInputDate(validUntil) : undefined,
       notes: notes.trim() || undefined,
+      internalNotes: notes.trim() || undefined,
+      clientNotes: clientNotes.trim() || undefined,
+      commercialTerms: {
+        paymentTerms: paymentTerms.trim() || undefined,
+        deliveryMethod: deliveryMethod.trim() || undefined,
+        deliveryDelay: deliveryDelay.trim() || undefined,
+        language: documentLanguage,
+      },
+      discount: quoteDiscount,
+      extraFees,
+      taxRate,
+      advance,
+      totals: t,
       overrideReason: overrideReason.trim() || undefined,
     };
     if (!devisId) {
-      const created = db.devis.create(
-        db.pricingSnapshot({
+      const fresh = db.pricingSnapshot({
           id: uid('devis'),
           number: db.devis.nextNumber(),
+          revision: 1,
           clientId,
           projectId: projectId || undefined,
           status,
@@ -605,12 +776,14 @@ export default function DevisCreate() {
           ...meta,
           createdAt: now,
           updatedAt: now,
-        }),
-      );
+      });
+      const created = status === 'draft' ? db.devis.saveDraft(fresh) : db.devis.create(fresh);
       setDevisId(created.id);
+      localStorage.setItem(DRAFT_RESTORE_KEY, created.id);
+      logAudit('devis', `أنشأ مسودة العرض ${created.number}`, created.number);
       return created;
     }
-    db.devis.update(devisId, {
+    const updated = db.devis.update(devisId, {
       items: nextItems,
       total: t.ttc,
       status,
@@ -619,7 +792,8 @@ export default function DevisCreate() {
       ...meta,
       updatedAt: now,
     });
-    return db.devis.get(devisId) ?? null;
+    if (updated) localStorage.setItem(DRAFT_RESTORE_KEY, updated.id);
+    return updated ?? db.devis.get(devisId) ?? null;
   };
 
   const initFieldValues = (svc: Service): FieldValues => {
@@ -651,14 +825,17 @@ export default function DevisCreate() {
     setManualPrice(null);
     setMarginPct(null);
     setOverrideReason('');
+    setDesignAssets([]);
+    setCutContourAssets([]);
     window.setTimeout(() => {
       setStep(2);
       setMaxStep((m) => Math.max(m, 2));
     }, 350);
   };
 
-  const goTo = (i: number) => {
-    if (i <= maxStep) setStep(i);
+  const goToPhase = (phase: number) => {
+    const target = [0, 3, 5, 6][phase] ?? 0;
+    if (phase <= phaseForStep(maxStep)) setStep(Math.min(target, maxStep));
   };
 
   const tryNext = () => {
@@ -718,6 +895,20 @@ export default function DevisCreate() {
     tryNext();
   };
 
+  const quantityOptions = useMemo<QuantityOption[]>(() => {
+    if (!service) return [];
+    return QUANTITY_COMPARE.map((q) => {
+      const values = { ...fieldValues, quantity: q };
+      const priced = priceItem(service, values, rules, montage, papers);
+      const rawTotal = priced.subtotal * (1 + effectiveMargin / 100);
+      const unitPrice = round2(rawTotal / q);
+      const total = round2(unitPrice * q);
+      const margin = round2(total - priced.subtotal);
+      const marginPercent = priced.subtotal > 0 ? round2((margin / priced.subtotal) * 100) : 0;
+      return { quantity: q, pricing: { ...priced, unitPrice, total, margin }, unitPrice, total, margin, marginPercent };
+    });
+  }, [service, fieldValues, rules, montage, papers, effectiveMargin]);
+
   const addItem = () => {
     if (!service || !final) return;
     // never persist a stale montage: the sheet count no longer matches the
@@ -736,12 +927,29 @@ export default function DevisCreate() {
 
   const doAddItem = () => {
     if (!service || !final) return;
+    const itemMontageState = montageStateFrom(montage, montageStale, manualPrice);
+    const attachments = [
+      ...designAssets.map((asset) => attachmentOf('artwork', asset)),
+      ...cutContourAssets.map((asset) => attachmentOf('cut-contour', asset, asset.match ? asset.id : undefined)),
+    ];
+    const preflight = buildPreflight({
+      dims: currentDims,
+      designAssets,
+      cutContours: cutContourAssets,
+      montageState: itemMontageState,
+    });
     const item: DevisItem = {
       id: uid('item'),
+      order: items.length,
       serviceId: service.id,
       serviceName: service.latinName ?? service.name,
       quantity,
       fieldValues: { ...fieldValues },
+      attachments,
+      montageState: itemMontageState,
+      preflight,
+      quantityOptions,
+      manualPriceReason: overrideReason.trim() || undefined,
       montageResult: montage ?? undefined,
       pricing: final,
       unitPrice: final.unitPrice,
@@ -751,18 +959,79 @@ export default function DevisCreate() {
     setItems(nextItems);
     const saved = persistDevis(nextItems);
     if (!saved) return;
+    if (negativeMargin || marginPct !== null) {
+      logAudit('margin', `تعديل سعر/هامش في ${saved.number}: ${overrideReason || 'بدون سبب مفصل'}`, saved.number);
+    }
     flashSaved();
     setStep(6);
     setMaxStep(6);
   };
 
   const removeItem = (id: string) => {
-    const nextItems = items.filter((it) => it.id !== id);
+    const nextItems = normalizeItemOrder(items.filter((it) => it.id !== id));
     setItems(nextItems);
     if (devisId) {
       persistDevis(nextItems);
       flashSaved();
     }
+  };
+
+  const normalizeItemOrder = (rows: DevisItem[]) => rows.map((item, index) => ({ ...item, order: index }));
+
+  const duplicateItem = (id: string) => {
+    const index = items.findIndex((item) => item.id === id);
+    if (index === -1) return;
+    const copy: DevisItem = {
+      ...structuredClone(items[index]),
+      id: uid('item'),
+      order: index + 1,
+      serviceName: `${items[index].serviceName} copy`,
+    };
+    const nextItems = normalizeItemOrder([...items.slice(0, index + 1), copy, ...items.slice(index + 1)]);
+    setItems(nextItems);
+    persistDevis(nextItems, 'draft', { silent: true });
+    flashSaved();
+    toast.success('تم نسخ البند');
+  };
+
+  const moveItem = (id: string, direction: -1 | 1) => {
+    const index = items.findIndex((item) => item.id === id);
+    const target = index + direction;
+    if (index < 0 || target < 0 || target >= items.length) return;
+    const next = [...items];
+    [next[index], next[target]] = [next[target], next[index]];
+    const nextItems = normalizeItemOrder(next);
+    setItems(nextItems);
+    persistDevis(nextItems, 'draft', { silent: true });
+  };
+
+  const updateExistingItem = (id: string, updater: (item: DevisItem) => DevisItem) => {
+    const nextItems = normalizeItemOrder(items.map((item) => (item.id === id ? updater(item) : item)));
+    setItems(nextItems);
+    persistDevis(nextItems, 'draft', { silent: true });
+  };
+
+  const recalcItem = (item: DevisItem, fields: FieldValues, qty: number): DevisItem => {
+    const itemService = db.services.get(item.serviceId);
+    if (!itemService) return { ...item, fieldValues: fields, quantity: qty };
+    const montageIsConfirmed = item.montageState === 'confirmed';
+    const pricing = priceItem(itemService, fields, rules, montageIsConfirmed ? item.montageResult : null, papers);
+    const unitPrice = round2(pricing.unitPrice);
+    const total = round2(unitPrice * qty);
+    return {
+      ...item,
+      quantity: qty,
+      fieldValues: fields,
+      montageState: item.montageResult ? 'stale' : item.montageState ?? 'estimated',
+      preflight: (item.preflight ?? []).map((check) =>
+        check.key === 'montage'
+          ? { ...check, status: item.montageResult ? 'error' : check.status, message: item.montageResult ? 'تغير البند ويحتاج إعادة حساب المونتاج.' : check.message }
+          : check,
+      ),
+      pricing: { ...pricing, unitPrice, total, margin: round2(total - pricing.subtotal) },
+      unitPrice,
+      total,
+    };
   };
 
   const addAnother = () => {
@@ -775,6 +1044,8 @@ export default function DevisCreate() {
     setManualPrice(null);
     setMarginPct(null);
     setOverrideReason('');
+    setDesignAssets([]);
+    setCutContourAssets([]);
     setStep(0);
     setMaxStep(2); // client info stays valid
   };
@@ -790,6 +1061,7 @@ export default function DevisCreate() {
   const finish = () => {
     const saved = persistDevis(items, 'draft');
     if (saved) {
+      localStorage.removeItem(DRAFT_RESTORE_KEY);
       toast.success(`تم حفظ العرض ${saved.number}`);
       navigate('/devis');
     }
@@ -801,12 +1073,57 @@ export default function DevisCreate() {
     setPdfBusy(true);
     try {
       await exportDevisPdf(saved, client, project);
+      logAudit('pdf', `صدّر PDF العميل ${saved.number}`, saved.number);
       toast.success(`تم تنزيل ${saved.number}.pdf`);
     } catch {
       toast.error('تعذّر توليد ملف PDF — حاول مجددًا');
     } finally {
       setPdfBusy(false);
     }
+  };
+
+  const hasSendBlocker = useMemo(
+    () =>
+      items.some(
+        (item) =>
+          item.montageState === 'invalid' ||
+          item.montageState === 'stale' ||
+          item.preflight?.some((check) => check.status === 'error'),
+      ),
+    [items],
+  );
+
+  const markReady = () => {
+    if (items.length === 0) {
+      toast.error('أضف بندًا واحدًا على الأقل');
+      return;
+    }
+    const saved = persistDevis(items, 'ready');
+    if (!saved) return;
+    logAudit('status', `غيّر حالة العرض إلى جاهز`, saved.number);
+    toast.success(`العرض ${saved.number} جاهز للمراجعة`);
+  };
+
+  const sendCurrent = () => {
+    if (items.length === 0) {
+      toast.error('أضف بندًا واحدًا على الأقل قبل الإرسال');
+      return;
+    }
+    if (hasSendBlocker) {
+      toast.error('لا يمكن إرسال العرض: يوجد بند يحتاج إعادة حساب أو فحص قبل الإنتاج');
+      return;
+    }
+    const saved = persistDevis(items, 'ready');
+    if (!saved) return;
+    const sent = db.devis.transitionStatus(saved.id, 'sent', { sentVia: 'manual' });
+    if (!sent) {
+      toast.error('لا يمكن إرسال العرض قبل تصحيح تحذيرات الإنتاج');
+      return;
+    }
+    localStorage.removeItem(DRAFT_RESTORE_KEY);
+    logAudit('status', `أرسل العرض للعميل`, sent.number);
+    toast.success(`تم إرسال العرض ${sent.number}`);
+    navigate('/devis');
   };
 
   const startingPrice = (svc: Service): number => {
@@ -823,24 +1140,93 @@ export default function DevisCreate() {
   const savedDevis = devisId ? db.devis.get(devisId) : undefined;
   const previewDevis: Devis | null =
     items.length > 0
-      ? savedDevis ?? {
-          id: 'preview',
-          number: 'D-····-····',
+      ? {
+          ...(savedDevis ?? {}),
+          id: savedDevis?.id ?? 'preview',
+          number: savedDevis?.number ?? 'D-····-····',
+          revision: savedDevis?.revision ?? 1,
           clientId,
           projectId: projectId || undefined,
-          status: 'draft',
+          status: savedDevis?.status ?? 'draft',
           items,
           total: totals.ttc,
+          totals,
+          discount: quoteDiscount,
+          extraFees,
+          taxRate,
+          advance,
           title: titleValue.trim() || undefined,
           deliveryDate: deliveryDate ? fromInputDate(deliveryDate) : undefined,
           validUntil: validUntil ? fromInputDate(validUntil) : undefined,
           notes: notes.trim() || undefined,
-          rulesVersion: rulesVersion.version,
-          rulesSnapshot: rulesVersion.rules,
-          createdAt: new Date().toISOString(),
+          internalNotes: notes.trim() || undefined,
+          clientNotes: clientNotes.trim() || undefined,
+          commercialTerms: {
+            paymentTerms: paymentTerms.trim() || undefined,
+            deliveryMethod: deliveryMethod.trim() || undefined,
+            deliveryDelay: deliveryDelay.trim() || undefined,
+            language: documentLanguage,
+          },
+          rulesVersion: savedDevis?.rulesVersion ?? rulesVersion.version,
+          rulesSnapshot: savedDevis?.rulesSnapshot ?? rulesVersion.rules,
+          createdAt: savedDevis?.createdAt ?? new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         }
       : null;
+
+  useEffect(() => {
+    if (!clientId) {
+      setSaveState('idle');
+      return;
+    }
+    setSaveState('saving');
+    const timer = window.setTimeout(() => {
+      try {
+        const saved = persistDevis(items, 'draft', { silent: true });
+        setSaveState(saved ? 'saved' : 'failed');
+      } catch {
+        setSaveState('failed');
+      }
+    }, 800);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally tracks form state, persistDevis is recreated per render
+  }, [
+    clientId,
+    projectId,
+    titleValue,
+    deliveryDate,
+    validUntil,
+    notes,
+    clientNotes,
+    paymentTerms,
+    deliveryMethod,
+    deliveryDelay,
+    documentLanguage,
+    taxRate,
+    quoteDiscount,
+    extraFees,
+    advance,
+    items,
+  ]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!event.ctrlKey && !event.metaKey) return;
+      const key = event.key.toLowerCase();
+      if (key === 's') {
+        event.preventDefault();
+        saveDraft();
+      }
+      if (key === 'd') {
+        event.preventDefault();
+        const target = editingItemId ?? items[items.length - 1]?.id;
+        if (target) duplicateItem(target);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingItemId, items]);
 
   // ------------------------------- step 0: section ---------------------------
 
@@ -1104,6 +1490,54 @@ export default function DevisCreate() {
           />
           <p className="mt-1 text-[11px] text-[var(--ink-400)]">لا تظهر في PDF.</p>
         </motion.div>
+        <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.385, duration: 0.35, ease: EASE }} className="md:col-span-2">
+          {fieldLabel('ملاحظات وشروط تظهر للعميل')}
+          <textarea
+            value={clientNotes}
+            onChange={(e) => setClientNotes(e.target.value)}
+            rows={3}
+            placeholder="ملاحظات تجارية تظهر في PDF العميل…"
+            className="w-full rounded-[8px] border border-[var(--line-strong)] px-3 py-2 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
+          />
+        </motion.div>
+        <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.44, duration: 0.35, ease: EASE }}>
+          {fieldLabel('شروط الدفع')}
+          <input
+            value={paymentTerms}
+            onChange={(e) => setPaymentTerms(e.target.value)}
+            className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
+          />
+        </motion.div>
+        <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.495, duration: 0.35, ease: EASE }}>
+          {fieldLabel('مدة الإنجاز')}
+          <input
+            value={deliveryDelay}
+            onChange={(e) => setDeliveryDelay(e.target.value)}
+            placeholder="مثلاً: 3 أيام عمل بعد اعتماد BAT"
+            className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
+          />
+        </motion.div>
+        <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.55, duration: 0.35, ease: EASE }}>
+          {fieldLabel('طريقة التسليم')}
+          <input
+            value={deliveryMethod}
+            onChange={(e) => setDeliveryMethod(e.target.value)}
+            placeholder="استلام من المطبعة / توصيل"
+            className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
+          />
+        </motion.div>
+        <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.605, duration: 0.35, ease: EASE }}>
+          {fieldLabel('قالب المستند')}
+          <select
+            value={documentLanguage}
+            onChange={(e) => setDocumentLanguage(e.target.value as 'ar' | 'fr' | 'bilingual')}
+            className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] bg-white px-3 text-[14px] outline-none focus:border-[var(--cyan-600)]"
+          >
+            <option value="ar">عربي</option>
+            <option value="fr">Français</option>
+            <option value="bilingual">ثنائي اللغة</option>
+          </select>
+        </motion.div>
       </div>
     </SectionCard>
   );
@@ -1111,6 +1545,52 @@ export default function DevisCreate() {
   // ------------------------------- step 3: service fields --------------------
 
   const setField = (id: string, v: FieldValues[string]) => setFieldValues((fv) => ({ ...fv, [id]: v }));
+  const dimensionFieldId = firstDimensionFieldId(service);
+  const uploadStickers = useMemo<Sticker[]>(() => {
+    const bleed = service?.defaultBleedMm ?? 2;
+    if (designAssets.length > 0) {
+      return designAssets.map((asset) => ({
+        id: asset.id,
+        name: designNameFromAsset(asset),
+        widthMm: asset.widthMm,
+        heightMm: asset.heightMm,
+        bleed: asset.detectedBleedMm ?? { top: bleed, bottom: bleed, left: bleed, right: bleed },
+        bleedLinked: !asset.detectedBleedMm,
+        quantity,
+        asset,
+        cutContour: cutContourAssets.find((contour) => contour.match?.status || contour.fileName),
+      }));
+    }
+    if (currentDims) {
+      return [
+        {
+          id: 'request-size',
+          name: 'مقاس الطلب',
+          widthMm: currentDims.widthMm,
+          heightMm: currentDims.heightMm,
+          bleed: { top: bleed, bottom: bleed, left: bleed, right: bleed },
+          bleedLinked: true,
+          quantity,
+        },
+      ];
+    }
+    return [];
+  }, [service, designAssets, cutContourAssets, currentDims, quantity]);
+
+  const addDesignFiles = (assets: DesignFileAsset[]) => {
+    if (assets.length === 0) return;
+    setDesignAssets((prev) => [...prev, ...assets]);
+    const first = assets[0];
+    if (dimensionFieldId) {
+      setField(dimensionFieldId, { widthMm: first.widthMm, heightMm: first.heightMm });
+      setMontage(null);
+      setMontageSig('');
+    }
+  };
+
+  const attachCutContour = (_stickerId: string, asset: DesignFileAsset) => {
+    setCutContourAssets((prev) => [...prev, asset]);
+  };
 
   const stepFields = service && (
     <SectionCard title={`حقول الخدمة — ${service.name}`}>
@@ -1232,6 +1712,31 @@ export default function DevisCreate() {
               </motion.div>
             );
           })}
+          <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: service.fields.length * 0.05, duration: 0.3, ease: EASE }}>
+            {fieldLabel('ملفات التصميم و tracé découpe')}
+            <DesignFileUploader
+              stickers={uploadStickers}
+              maxDesigns={12}
+              onAddDesigns={addDesignFiles}
+              onAttachCutContour={attachCutContour}
+            />
+            {(designAssets.length > 0 || cutContourAssets.length > 0) && (
+              <div className="mt-2 space-y-1 rounded-[10px] border border-[var(--line)] bg-[var(--paper-50)] p-2 text-[11px] text-[var(--ink-500)]">
+                {designAssets.map((asset) => (
+                  <div key={asset.id} className="flex items-center justify-between gap-2">
+                    <span className="truncate" dir="ltr">{asset.fileName}</span>
+                    <span dir="ltr" className="font-latin shrink-0">{round2(asset.widthMm)}×{round2(asset.heightMm)} mm</span>
+                  </div>
+                ))}
+                {cutContourAssets.map((asset) => (
+                  <div key={asset.id} className="flex items-center justify-between gap-2 text-[var(--cyan-600)]">
+                    <span className="truncate" dir="ltr">tracé: {asset.fileName}</span>
+                    <span>{asset.match?.status === 'matched' ? 'مطابق' : asset.match?.status === 'review' ? 'مراجعة' : 'تحذير'}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </motion.div>
         </div>
 
         {/* live price ticker */}
@@ -1524,11 +2029,11 @@ export default function DevisCreate() {
               </span>
             </div>
             <div className="flex items-baseline justify-between text-[13px]">
-              <span className="text-[var(--ink-500)]">TVA <span dir="ltr" className="font-latin">19%</span></span>
-              <span dir="ltr" className="font-latin tabular-nums text-[var(--ink-700)]">{formatDA(final.total * 0.19)}</span>
+              <span className="text-[var(--ink-500)]">TVA <span dir="ltr" className="font-latin">{taxRatePct}%</span></span>
+              <span dir="ltr" className="font-latin tabular-nums text-[var(--ink-700)]">{formatDA(final.total * taxRate)}</span>
             </div>
             <motion.div
-              key={Math.round(final.total * 119)}
+              key={Math.round(final.total * (1 + taxRate) * 100)}
               initial={{ backgroundColor: '#E0F2FE' }}
               animate={{ backgroundColor: 'rgba(224,242,254,0)' }}
               transition={{ duration: 0.6 }}
@@ -1536,7 +2041,7 @@ export default function DevisCreate() {
             >
               <span className="text-[15px] font-bold text-[var(--ink-900)]">الإجمالي TTC</span>
               <span className="font-latin text-[30px] leading-9 font-semibold text-[var(--cyan-600)]">
-                <FlipNumber value={final.total * 1.19} /> <span className="text-[15px] font-normal text-[var(--ink-500)]">دج</span>
+                <FlipNumber value={final.total * (1 + taxRate)} /> <span className="text-[15px] font-normal text-[var(--ink-500)]">دج</span>
               </span>
             </motion.div>
           </div>
@@ -1579,6 +2084,33 @@ export default function DevisCreate() {
               </motion.div>
             )}
           </div>
+
+          <div className="mt-4 rounded-[12px] border border-[var(--line)] bg-white p-4">
+            <div className="mb-2 text-[13px] font-semibold text-[var(--ink-800)]">مقارنة كميات سريعة</div>
+            <div className="grid gap-2 sm:grid-cols-3">
+              {quantityOptions.map((option) => (
+                <button
+                  key={option.quantity}
+                  type="button"
+                  onClick={() => setField('quantity', option.quantity)}
+                  className={cn(
+                    'rounded-[10px] border px-3 py-2 text-start transition-colors',
+                    quantity === option.quantity
+                      ? 'border-[var(--cyan-600)] bg-[var(--cyan-50)]'
+                      : 'border-[var(--line)] bg-[var(--paper-50)] hover:border-[var(--cyan-500)]',
+                  )}
+                >
+                  <div className="font-latin text-[15px] font-semibold text-[var(--ink-900)]">{option.quantity}</div>
+                  <div className="mt-1 text-[11px] text-[var(--ink-500)]">
+                    وحدة <span dir="ltr" className="font-latin">{formatDA(option.unitPrice)}</span>
+                  </div>
+                  <div className="text-[11px] text-[var(--ink-500)]">
+                    هامش <span dir="ltr" className="font-latin">{formatPercent(option.marginPercent)}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       </div>
     </SectionCard>
@@ -1611,7 +2143,7 @@ export default function DevisCreate() {
             </div>
           </div>
           <div dir="ltr" className="font-latin text-[17px] font-semibold tabular-nums text-[var(--cyan-600)]">
-            {formatDA(lastItem.total * 1.19)}
+            {formatDA(lastItem.total * (1 + taxRate))}
           </div>
         </motion.div>
       )}
@@ -1685,16 +2217,24 @@ export default function DevisCreate() {
           </p>
         </div>
         <AnimatePresence>
-          {savedFlash && (
+          {(savedFlash || saveState !== 'idle') && (
             <motion.span
+              key={`${saveState}-${savedFlash}`}
               initial={{ opacity: 0, y: 6 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.25 }}
-              className="inline-flex items-center gap-1.5 rounded-full bg-[#DCFCE7] px-3 py-1 text-[12px] font-medium text-[#15803D]"
+              className={cn(
+                'inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[12px] font-medium',
+                saveState === 'failed'
+                  ? 'bg-[#FEE2E2] text-[var(--danger-600)]'
+                  : saveState === 'saving'
+                    ? 'bg-[#FEF3C7] text-[#B45309]'
+                    : 'bg-[#DCFCE7] text-[#15803D]',
+              )}
             >
-              <Check size={13} />
-              محفوظ قبل ثوانٍ
+              {saveState === 'saving' ? <Save size={13} /> : <Check size={13} />}
+              {saveState === 'saving' ? 'جارٍ الحفظ…' : saveState === 'failed' ? 'فشل الحفظ' : 'محفوظ'}
             </motion.span>
           )}
         </AnimatePresence>
@@ -1702,18 +2242,18 @@ export default function DevisCreate() {
 
       {/* stepper (fixed at content top) */}
       <div className="sticky top-[80px] z-30 hidden rounded-[14px] border border-[var(--line)] bg-white/95 px-5 py-4 shadow-[var(--shadow-card)] backdrop-blur md:block">
-        <StageStepper steps={STEPS} current={step} onStepClick={goTo} />
+        <StageStepper steps={PHASES} current={phaseForStep(step)} onStepClick={goToPhase} />
       </div>
       {/* mobile stepper */}
       <div className="rounded-[12px] border border-[var(--line)] bg-white px-4 py-3 md:hidden">
         <div className="flex items-center justify-between text-[13px]">
-          <span className="font-semibold text-[var(--ink-900)]">{STEPS[step]}</span>
+          <span className="font-semibold text-[var(--ink-900)]">{PHASES[phaseForStep(step)]}</span>
           <span className="text-[var(--ink-500)]">
-            الخطوة <span dir="ltr" className="font-latin">{step + 1}</span> من <span dir="ltr" className="font-latin">7</span>
+            المرحلة <span dir="ltr" className="font-latin">{phaseForStep(step) + 1}</span> من <span dir="ltr" className="font-latin">4</span>
           </span>
         </div>
         <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[var(--paper-100)]">
-          <motion.div className="h-full rounded-full bg-[var(--cyan-500)]" animate={{ width: `${((step + 1) / 7) * 100}%` }} transition={{ duration: 0.3 }} />
+          <motion.div className="h-full rounded-full bg-[var(--cyan-500)]" animate={{ width: `${((phaseForStep(step) + 1) / 4) * 100}%` }} transition={{ duration: 0.3 }} />
         </div>
       </div>
 
@@ -1808,7 +2348,7 @@ export default function DevisCreate() {
             {/* items */}
             <ul className="mt-3 space-y-2">
               <AnimatePresence initial={false}>
-                {items.map((it) => (
+                {items.map((it, index) => (
                   <motion.li
                     key={it.id}
                     initial={{ opacity: 0, y: 16 }}
@@ -1830,6 +2370,40 @@ export default function DevisCreate() {
                     </span>
                     <button
                       type="button"
+                      aria-label="تعديل"
+                      onClick={() => setEditingItemId(it.id)}
+                      className="grid h-6 w-6 shrink-0 place-items-center rounded-[6px] text-[var(--ink-400)] transition-colors hover:bg-[var(--cyan-50)] hover:text-[var(--cyan-600)]"
+                    >
+                      <Pencil size={13} />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="نسخ"
+                      onClick={() => duplicateItem(it.id)}
+                      className="grid h-6 w-6 shrink-0 place-items-center rounded-[6px] text-[var(--ink-400)] transition-colors hover:bg-[var(--paper-200)] hover:text-[var(--ink-700)]"
+                    >
+                      <Copy size={13} />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="رفع"
+                      disabled={index === 0}
+                      onClick={() => moveItem(it.id, -1)}
+                      className="grid h-6 w-6 shrink-0 place-items-center rounded-[6px] text-[var(--ink-400)] transition-colors hover:bg-[var(--paper-200)] hover:text-[var(--ink-700)] disabled:opacity-30"
+                    >
+                      <ArrowUp size={13} />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="خفض"
+                      disabled={index === items.length - 1}
+                      onClick={() => moveItem(it.id, 1)}
+                      className="grid h-6 w-6 shrink-0 place-items-center rounded-[6px] text-[var(--ink-400)] transition-colors hover:bg-[var(--paper-200)] hover:text-[var(--ink-700)] disabled:opacity-30"
+                    >
+                      <ArrowDown size={13} />
+                    </button>
+                    <button
+                      type="button"
                       aria-label="إزالة"
                       onClick={() => setRemoveItemId(it.id)}
                       className="grid h-6 w-6 shrink-0 place-items-center rounded-[6px] text-[var(--ink-400)] transition-colors hover:bg-[#FEE2E2] hover:text-[var(--danger-600)]"
@@ -1842,6 +2416,89 @@ export default function DevisCreate() {
               {items.length === 0 && <li className="py-2 text-center text-[12px] text-[var(--ink-400)]">لا خدمات مضافة بعد</li>}
             </ul>
 
+            <div className="mt-3 rounded-[10px] border border-[var(--line)] bg-[var(--paper-50)] p-3">
+              <div className="mb-2 text-[12px] font-semibold text-[var(--ink-800)]">التسعير التجاري</div>
+              <div className="grid grid-cols-2 gap-2">
+                <label className="text-[11px] text-[var(--ink-500)]">
+                  الخصم
+                  <div className="mt-1 flex overflow-hidden rounded-[8px] border border-[var(--line-strong)] bg-white">
+                    <input
+                      dir="ltr"
+                      type="number"
+                      min={0}
+                      value={quoteDiscountValue}
+                      onChange={(e) => setQuoteDiscountValue(Number(e.target.value) || 0)}
+                      className="font-latin h-9 min-w-0 flex-1 px-2 text-[12px] outline-none"
+                    />
+                    <select
+                      value={quoteDiscountMode}
+                      onChange={(e) => setQuoteDiscountMode(e.target.value as 'amount' | 'percent')}
+                      className="h-9 border-s border-[var(--line)] bg-[var(--paper-100)] px-1 text-[11px] outline-none"
+                    >
+                      <option value="amount">دج</option>
+                      <option value="percent">%</option>
+                    </select>
+                  </div>
+                </label>
+                <label className="text-[11px] text-[var(--ink-500)]">
+                  TVA %
+                  <input
+                    dir="ltr"
+                    type="number"
+                    min={0}
+                    step={0.5}
+                    value={taxRatePct}
+                    onChange={(e) => setTaxRatePct(Number(e.target.value) || 0)}
+                    className="font-latin mt-1 h-9 w-full rounded-[8px] border border-[var(--line-strong)] bg-white px-2 text-[12px] outline-none"
+                  />
+                </label>
+                <label className="text-[11px] text-[var(--ink-500)]">
+                  مصاريف
+                  <input
+                    dir="ltr"
+                    type="number"
+                    min={0}
+                    value={extraFeeAmount}
+                    onChange={(e) => setExtraFeeAmount(Number(e.target.value) || 0)}
+                    className="font-latin mt-1 h-9 w-full rounded-[8px] border border-[var(--line-strong)] bg-white px-2 text-[12px] outline-none"
+                  />
+                </label>
+                <label className="text-[11px] text-[var(--ink-500)]">
+                  التسبيق
+                  <div className="mt-1 flex overflow-hidden rounded-[8px] border border-[var(--line-strong)] bg-white">
+                    <input
+                      dir="ltr"
+                      type="number"
+                      min={0}
+                      value={advanceValue}
+                      onChange={(e) => setAdvanceValue(Number(e.target.value) || 0)}
+                      className="font-latin h-9 min-w-0 flex-1 px-2 text-[12px] outline-none"
+                    />
+                    <select
+                      value={advanceMode}
+                      onChange={(e) => setAdvanceMode(e.target.value as 'amount' | 'percent')}
+                      className="h-9 border-s border-[var(--line)] bg-[var(--paper-100)] px-1 text-[11px] outline-none"
+                    >
+                      <option value="amount">دج</option>
+                      <option value="percent">%</option>
+                    </select>
+                  </div>
+                </label>
+              </div>
+              <input
+                value={quoteDiscountReason}
+                onChange={(e) => setQuoteDiscountReason(e.target.value)}
+                placeholder="سبب الخصم أو تعديل السعر"
+                className="mt-2 h-8 w-full rounded-[8px] border border-[var(--line)] bg-white px-2 text-[11px] outline-none focus:border-[var(--cyan-600)]"
+              />
+              <input
+                value={extraFeeLabel}
+                onChange={(e) => setExtraFeeLabel(e.target.value)}
+                placeholder="تسمية المصاريف"
+                className="mt-2 h-8 w-full rounded-[8px] border border-[var(--line)] bg-white px-2 text-[11px] outline-none focus:border-[var(--cyan-600)]"
+              />
+            </div>
+
             {/* totals */}
             <motion.div
               key={Math.round(totals.ttc * 100)}
@@ -1852,10 +2509,22 @@ export default function DevisCreate() {
             >
               <div className="flex justify-between text-[var(--ink-700)]">
                 <span>الإجمالي HT</span>
-                <span className="font-latin text-[15px] font-semibold"><FlipNumber value={totals.ht} /></span>
+                <span className="font-latin text-[15px] font-semibold"><FlipNumber value={totals.itemsHt} /></span>
               </div>
+              {totals.quoteDiscount > 0 && (
+                <div className="flex justify-between text-[var(--ink-500)]">
+                  <span>الخصم</span>
+                  <span className="font-latin">-<FlipNumber value={totals.quoteDiscount} /></span>
+                </div>
+              )}
+              {totals.extraFees > 0 && (
+                <div className="flex justify-between text-[var(--ink-500)]">
+                  <span>المصاريف</span>
+                  <span className="font-latin"><FlipNumber value={totals.extraFees} /></span>
+                </div>
+              )}
               <div className="flex justify-between text-[var(--ink-500)]">
-                <span>TVA <span dir="ltr" className="font-latin">19%</span></span>
+                <span>TVA <span dir="ltr" className="font-latin">{taxRatePct}%</span></span>
                 <span className="font-latin"><FlipNumber value={totals.tva} /></span>
               </div>
               <div className="flex items-baseline justify-between pt-1">
@@ -1864,6 +2533,12 @@ export default function DevisCreate() {
                   <FlipNumber value={totals.ttc} />
                 </span>
               </div>
+              {totals.advance > 0 && (
+                <div className="flex justify-between text-[var(--ink-700)]">
+                  <span>الباقي للدفع</span>
+                  <span className="font-latin text-[15px] font-semibold"><FlipNumber value={totals.balanceDue} /></span>
+                </div>
+              )}
             </motion.div>
 
             {/* frozen rules badge */}
@@ -1892,6 +2567,25 @@ export default function DevisCreate() {
                 className="h-10 w-full rounded-[10px] text-[14px] font-medium text-[var(--ink-500)] transition-colors hover:bg-[var(--paper-200)] hover:text-[var(--ink-700)] disabled:cursor-not-allowed disabled:opacity-40"
               >
                 حفظ كمسودة
+              </button>
+              <button
+                type="button"
+                onClick={markReady}
+                disabled={!clientId || items.length === 0}
+                className="flex h-10 w-full items-center justify-center gap-1.5 rounded-[10px] border border-[var(--line-strong)] bg-white text-[14px] font-semibold text-[var(--ink-700)] transition-colors hover:bg-[var(--paper-100)] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Check size={15} />
+                تعليم كجاهز
+              </button>
+              <button
+                type="button"
+                onClick={sendCurrent}
+                disabled={!clientId || items.length === 0 || hasSendBlocker}
+                title={hasSendBlocker ? 'صحّح المونتاج أو فحص الإنتاج قبل الإرسال' : undefined}
+                className="flex h-10 w-full items-center justify-center gap-1.5 rounded-[10px] bg-[var(--cyan-600)] text-[14px] font-semibold text-white transition-all hover:bg-[var(--cyan-500)] active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Send size={15} />
+                إرسال للعميل
               </button>
             </div>
           </SectionCard>
@@ -1951,6 +2645,173 @@ export default function DevisCreate() {
               <DevisDocument devis={previewDevis} client={client} project={project} unit={unit} onShowRules={() => setRulesOpen(true)} />
             </motion.div>
           </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* item side editor */}
+      <AnimatePresence>
+        {editingItem && (
+          <>
+            <motion.div
+              className="fixed inset-0 z-[88] bg-[rgba(21,23,30,0.28)]"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setEditingItemId(null)}
+            />
+            <motion.aside
+              initial={{ x: '-100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '-100%' }}
+              transition={{ duration: 0.25, ease: EASE }}
+              className="fixed inset-y-0 left-0 z-[89] flex w-[440px] max-w-[96vw] flex-col bg-white shadow-[var(--shadow-pop)]"
+              role="dialog"
+              aria-label="تحرير بند العرض"
+            >
+              <div className="flex items-center justify-between border-b border-[var(--line)] px-5 py-3">
+                <div>
+                  <div className="text-[15px] font-bold text-[var(--ink-900)]">تحرير البند</div>
+                  <div dir="ltr" className="font-latin text-[12px] text-[var(--ink-500)]">{editingItem.serviceName}</div>
+                </div>
+                <button
+                  type="button"
+                  aria-label="إغلاق"
+                  onClick={() => setEditingItemId(null)}
+                  className="grid h-9 w-9 place-items-center rounded-[8px] text-[var(--ink-400)] hover:bg-[var(--paper-100)] hover:text-[var(--ink-700)]"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="flex-1 space-y-4 overflow-y-auto p-5">
+                <NumberField
+                  label="الكمية"
+                  value={editingItem.quantity}
+                  min={1}
+                  presets={QTY_PRESETS}
+                  onChange={(q) =>
+                    updateExistingItem(editingItem.id, (item) => {
+                      const fields = { ...item.fieldValues, quantity: Math.max(1, Math.floor(q)) };
+                      return recalcItem(item, fields, Math.max(1, Math.floor(q)));
+                    })
+                  }
+                />
+                {editingDimFieldId && editingDims && (
+                  <DimensionGroup
+                    label="المقاس النهائي"
+                    value={editingDims}
+                    unit={unit}
+                    onUnitChange={setUnit}
+                    onChange={(dims) =>
+                      updateExistingItem(editingItem.id, (item) => {
+                        const fields = { ...item.fieldValues, [editingDimFieldId]: dims };
+                        return recalcItem(item, fields, item.quantity);
+                      })
+                    }
+                  />
+                )}
+                <div className="grid grid-cols-2 gap-2">
+                  <label className="text-[12px] text-[var(--ink-500)]">
+                    خصم البند
+                    <input
+                      dir="ltr"
+                      type="number"
+                      min={0}
+                      value={editingItem.discount?.value ?? 0}
+                      onChange={(e) =>
+                        updateExistingItem(editingItem.id, (item) => ({
+                          ...item,
+                          discount: discountOrUndefined(item.discount?.mode ?? 'amount', Number(e.target.value) || 0, item.discount?.reason),
+                        }))
+                      }
+                      className="font-latin mt-1 h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-2 outline-none"
+                    />
+                  </label>
+                  <label className="text-[12px] text-[var(--ink-500)]">
+                    نوع الخصم
+                    <select
+                      value={editingItem.discount?.mode ?? 'amount'}
+                      onChange={(e) =>
+                        updateExistingItem(editingItem.id, (item) => ({
+                          ...item,
+                          discount: discountOrUndefined(e.target.value as 'amount' | 'percent', item.discount?.value ?? 0, item.discount?.reason),
+                        }))
+                      }
+                      className="mt-1 h-10 w-full rounded-[8px] border border-[var(--line-strong)] bg-white px-2 outline-none"
+                    >
+                      <option value="amount">دج</option>
+                      <option value="percent">%</option>
+                    </select>
+                  </label>
+                </div>
+                <NumberField
+                  label="سعر الوحدة اليدوي"
+                  value={editingItem.unitPrice}
+                  min={0}
+                  step={0.5}
+                  unitSuffix="دج/نسخة"
+                  onChange={(price) =>
+                    updateExistingItem(editingItem.id, (item) => {
+                      const total = round2(price * item.quantity);
+                      return {
+                        ...item,
+                        unitPrice: round2(price),
+                        total,
+                        pricing: { ...item.pricing, unitPrice: round2(price), total, margin: round2(total - item.pricing.subtotal) },
+                      };
+                    })
+                  }
+                />
+                <textarea
+                  value={editingItem.manualPriceReason ?? ''}
+                  onChange={(e) =>
+                    updateExistingItem(editingItem.id, (item) => ({ ...item, manualPriceReason: e.target.value }))
+                  }
+                  placeholder="سبب السعر اليدوي أو الخصم"
+                  rows={2}
+                  className="w-full rounded-[8px] border border-[var(--line-strong)] px-3 py-2 text-[13px] outline-none focus:border-[var(--cyan-600)]"
+                />
+                <div className="rounded-[10px] border border-[var(--line)] bg-[var(--paper-50)] p-3">
+                  <div className="mb-2 text-[12px] font-semibold text-[var(--ink-800)]">جاهزية البند</div>
+                  <div className="space-y-1.5">
+                    {(editingItem.preflight ?? []).map((check) => (
+                      <div key={check.key} className="flex items-start justify-between gap-2 text-[11px]">
+                        <span>{check.label}</span>
+                        <span
+                          className={cn(
+                            'rounded-full px-2 py-0.5 font-semibold',
+                            check.status === 'ok' && 'bg-emerald-50 text-emerald-700',
+                            check.status === 'warning' && 'bg-amber-50 text-amber-700',
+                            check.status === 'error' && 'bg-red-50 text-red-700',
+                          )}
+                        >
+                          {check.status === 'ok' ? 'صالح' : check.status === 'warning' ? 'مراجعة' : 'خطأ'}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  {editingItem.attachments && editingItem.attachments.length > 0 && (
+                    <div className="mt-3 space-y-1 border-t border-[var(--line)] pt-2">
+                      {editingItem.attachments.map((att) => (
+                        <div key={att.id} className="flex items-center justify-between gap-2 text-[11px] text-[var(--ink-500)]">
+                          <span className="truncate" dir="ltr">{att.asset.fileName}</span>
+                          <span>{att.kind === 'artwork' ? 'تصميم' : 'tracé'}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="border-t border-[var(--line)] p-4">
+                <button
+                  type="button"
+                  onClick={() => setEditingItemId(null)}
+                  className="h-10 w-full rounded-[10px] bg-[var(--cyan-600)] text-[14px] font-semibold text-white hover:bg-[var(--cyan-500)]"
+                >
+                  تم
+                </button>
+              </div>
+            </motion.aside>
+          </>
         )}
       </AnimatePresence>
 

@@ -49,13 +49,15 @@ export default function WasteMeter({ percent, size = 120, className, animated = 
   const cx = w / 2;
   const cy = size / 2;
   const R = size / 2 - 10;
-  const angle = Math.PI * (1 - frac); // PI..0 (left to right in screen space)
+  const angle = Math.PI * (1 - frac); // PI..0 (left → right on upper semicircle)
   const arc = (r: number) => `M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${cx + r} ${cy}`;
   const progressArc = (r: number) => {
     const endX = cx + r * Math.cos(angle);
     const endY = cy - r * Math.sin(angle);
-    const large = frac > 0.5 ? 1 : 0;
-    return `M ${cx - r} ${cy} A ${r} ${r} 0 ${large} 1 ${endX} ${endY}`;
+    // Semicircle span is always ≤ 180° — large-arc must stay 0. Using 1 when
+    // frac > 0.5 took the long way around (clipped by the half-height viewBox),
+    // leaving only green/red caps at the ends.
+    return `M ${cx - r} ${cy} A ${r} ${r} 0 0 1 ${endX} ${endY}`;
   };
 
   return (

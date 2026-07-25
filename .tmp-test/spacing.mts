@@ -8,6 +8,7 @@
 import {
   computeFixedMontage,
   computeMontage,
+  computeMontageVariants,
   pairGapKey,
 } from '../app/src/lib/montage-engine';
 import type { MontageInput, PlacedPiece } from '../app/src/lib/types';
@@ -164,6 +165,103 @@ check('pairGapKey مرتّب أبجدياً', pairGapKey('st-b', 'st-a') === 'st
   const ab = r ? minPairDistance(r.placed, 'A', 'B') : { count: 0, min: Infinity };
   check('أولوية: يوجد زوج A-B متداخل إسقاطياً', ab.count > 0, `count=${ab.count}`);
   check('أولوية: الزوجي 2 يتغلّب على العام 8 (min ≈ 2)', ab.min >= 2 - EPS && ab.min <= 2 + 0.5, `min=${ab.min.toFixed(2)}`);
+}
+
+// ---------------------------------------------------------------------------
+// 2ج) استقلال الأزواج: A|C=10 لا يفرض فراغاً على B|C أو A|B (كان sepGap العام)
+// ---------------------------------------------------------------------------
+{
+  const r = computeFixedMontage({
+    sheetWidthMm: 300,
+    sheetHeightMm: 100,
+    margins: { top: 0, bottom: 0, left: 0, right: 0 },
+    groups: [
+      { id: 'A', widthMm: 80, heightMm: 90, quantity: 1, bleedMm: NO_BLEED, copiesPerSheet: 1 },
+      { id: 'B', widthMm: 80, heightMm: 90, quantity: 1, bleedMm: NO_BLEED, copiesPerSheet: 1 },
+      { id: 'C', widthMm: 80, heightMm: 90, quantity: 1, bleedMm: NO_BLEED, copiesPerSheet: 1 },
+    ],
+    bleedMm: NO_BLEED,
+    quantity: 1,
+    method: 'recto',
+    cutMethod: 'guillotine',
+    defaultGapMm: 0,
+    pairGaps: {
+      [pairGapKey('A', 'C')]: 10,
+      [pairGapKey('A', 'B')]: 0,
+      [pairGapKey('B', 'C')]: 0,
+    },
+  });
+  check('استقلال: التركيب ينجح', r.ok, r.ok ? '' : 'fail');
+  if (r.ok) {
+    const ab = minPairDistance(r.placed, 'A', 'B');
+    const bc = minPairDistance(r.placed, 'B', 'C');
+    const ac = minPairDistance(r.placed, 'A', 'C');
+    check('استقلال: A-B متجاوران ≈ 0 (لا 10)', ab.count > 0 && ab.min <= 0.5, `min=${ab.min.toFixed(2)}`);
+    check('استقلال: B-C متجاوران ≈ 0 (لا 10)', bc.count > 0 && bc.min <= 0.5, `min=${bc.min.toFixed(2)}`);
+    check('استقلال: A-C يحترم ≥ 10 إن تجاورا', ac.count === 0 || ac.min >= 10 - EPS, `min=${ac.min.toFixed(2)} count=${ac.count}`);
+  }
+}
+{
+  const r = computeFixedMontage({
+    sheetWidthMm: 300,
+    sheetHeightMm: 100,
+    margins: { top: 0, bottom: 0, left: 0, right: 0 },
+    groups: [
+      { id: 'A', widthMm: 80, heightMm: 90, quantity: 1, bleedMm: NO_BLEED, copiesPerSheet: 1 },
+      { id: 'B', widthMm: 80, heightMm: 90, quantity: 1, bleedMm: NO_BLEED, copiesPerSheet: 1 },
+      { id: 'C', widthMm: 80, heightMm: 90, quantity: 1, bleedMm: NO_BLEED, copiesPerSheet: 1 },
+    ],
+    bleedMm: NO_BLEED,
+    quantity: 1,
+    method: 'recto',
+    cutMethod: 'guillotine',
+    defaultGapMm: 0,
+    pairGaps: {
+      [pairGapKey('A', 'C')]: 0,
+      [pairGapKey('A', 'B')]: 0,
+      [pairGapKey('B', 'C')]: 10,
+    },
+  });
+  check('استقلال-BC: التركيب ينجح', r.ok);
+  if (r.ok) {
+    const ab = minPairDistance(r.placed, 'A', 'B');
+    const bc = minPairDistance(r.placed, 'B', 'C');
+    check('استقلال-BC: A-B ≈ 0', ab.count > 0 && ab.min <= 0.5, `min=${ab.min.toFixed(2)}`);
+    check('استقلال-BC: B-C ≈ 10 فقط', bc.count > 0 && bc.min >= 10 - EPS && bc.min <= 10.5, `min=${bc.min.toFixed(2)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2د) die-cut: كل المرشحين يحترمون الزوجي (لا يمرّ مخطط يخرق B|C=10)
+// ---------------------------------------------------------------------------
+{
+  const vs = computeMontageVariants({
+    sheetWidthMm: 500,
+    sheetHeightMm: 350,
+    margins: { top: 0, bottom: 10, left: 0, right: 0 },
+    groups: [
+      { id: 'g1', widthMm: 140, heightMm: 100, quantity: 4, bleedMm: { top: 3, bottom: 3, left: 3, right: 3 } },
+      { id: 'g2', widthMm: 89, heightMm: 89, quantity: 4, bleedMm: { top: 3, bottom: 3, left: 3, right: 3 } },
+      { id: 'g3', widthMm: 78, heightMm: 78, quantity: 4, bleedMm: { top: 3, bottom: 3, left: 3, right: 3 } },
+    ],
+    bleedMm: { top: 3, bottom: 3, left: 3, right: 3 },
+    quantity: 4,
+    method: 'recto',
+    cutMethod: 'die-cut',
+    defaultGapMm: 0,
+    pairGaps: { [pairGapKey('g2', 'g3')]: 10 },
+  });
+  check('die-cut+زوجي: يوجد مرشحون', vs.length > 0, `${vs.length}`);
+  let allOk = true;
+  for (const v of vs) {
+    const d = minPairDistance(v.result.placed, 'g2', 'g3');
+    // bleed 3+3=6 between cells when gap=0; with pair gap 10 → cell air ≥ 10, trim≥16
+    if (d.count > 0 && d.min < 10 - EPS) {
+      allOk = false;
+      check(`die-cut+زوجي: ${v.kind} يحترم B-C≥10`, false, `min=${d.min.toFixed(2)}`);
+    }
+  }
+  if (allOk) check('die-cut+زوجي: كل المرشحين يحترمون B-C≥10', true, `${vs.length} variants`);
 }
 
 // ---------------------------------------------------------------------------

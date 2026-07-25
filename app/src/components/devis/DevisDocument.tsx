@@ -4,6 +4,7 @@ import { CropMarks } from '@/components/ds/SectionCard';
 import VersionBadge from '@/components/ds/VersionBadge';
 import StatusPill from '@/components/ds/StatusPill';
 import { db } from '@/lib/storage';
+import { loadCompanySettings } from '@/lib/company-settings';
 import type { Client, Devis, Project, Unit } from '@/lib/types';
 import { formatDA } from '@/lib/units';
 import {
@@ -23,6 +24,7 @@ export interface DevisDocumentProps {
   /** stagger content sections (drawer opening) */
   animated?: boolean;
   onShowRules?: () => void;
+  showInternalSnapshot?: boolean;
 }
 
 const EASE = [0.22, 0.68, 0.26, 1] as [number, number, number, number];
@@ -32,10 +34,17 @@ const EASE = [0.22, 0.68, 0.26, 1] as [number, number, number, number];
  * table, totals, frozen price-version snapshot banner, CMYK footer.
  * Rendered inside the detail drawer and the wizard preview modal.
  */
-export default function DevisDocument({ devis, client, project, unit, animated = true, onShowRules }: DevisDocumentProps) {
-  const totals = devisTotals(devis.items);
+export default function DevisDocument({ devis, client, project, unit, animated = true, onShowRules, showInternalSnapshot }: DevisDocumentProps) {
+  const totals = devis.totals ?? devisTotals(devis.items, {
+    discount: devis.discount,
+    extraFees: devis.extraFees,
+    taxRate: devis.taxRate,
+    advance: devis.advance,
+  });
+  const company = loadCompanySettings();
   // صالح حتى: التاريخ المختار في العرض، وإلا fallback معقول = إنشاء + 15 يومًا
   const validUntil = devis.validUntil ?? addDays(devis.createdAt, 15);
+  const shouldShowSnapshot = showInternalSnapshot || Boolean(onShowRules);
 
   const section = (i: number, children: React.ReactNode, className?: string) => (
     <motion.div
@@ -58,15 +67,16 @@ export default function DevisDocument({ devis, client, project, unit, animated =
       {section(0, (
         <div className="flex items-start justify-between gap-4 border-b border-[var(--line)] pb-4">
           <div className="flex items-center gap-3">
-            <img src="/logo.svg" alt="ARTeam PrintFlow" className="h-11 w-11" />
+            <img src={company.logo || '/logo.svg'} alt="ARTeam PrintFlow" className="h-11 w-11 rounded-[8px] object-contain" />
             <div>
-              <div className="text-[15px] font-bold text-[var(--ink-900)]">مطبعة الأمل للطباعة الرقمية</div>
-              <div dir="ltr" className="font-latin text-[11px] text-[var(--ink-400)]">Imprimerie Al-Amal — Alger</div>
-              <div className="mt-0.5 text-[11px] text-[var(--ink-500)]">الجزائر — <span dir="ltr" className="font-latin">0550 00 00 00</span></div>
+              <div className="text-[15px] font-bold text-[var(--ink-900)]">{company.name}</div>
+              <div dir="ltr" className="font-latin text-[11px] text-[var(--ink-400)]">{company.email}</div>
+              <div className="mt-0.5 text-[11px] text-[var(--ink-500)]">{company.address} — <span dir="ltr" className="font-latin">{company.phone}</span></div>
             </div>
           </div>
           <div className="text-end">
             <div dir="ltr" className="font-latin text-[17px] font-bold text-[var(--ink-900)]">Devis N° {devis.number}</div>
+            {(devis.revision ?? 1) > 1 && <div dir="ltr" className="font-latin mt-0.5 text-[11px] font-semibold text-[var(--cyan-600)]">Revision R{devis.revision}</div>}
             {devis.title && <div className="mt-0.5 text-[13px] font-medium text-[var(--ink-700)]">{devis.title}</div>}
             <div className="mt-1 text-[12px] text-[var(--ink-500)]">التاريخ: {formatDateAr(devis.createdAt)}</div>
             <div className="text-[12px] text-[var(--ink-500)]">صالح حتى {formatDateAr(validUntil)}</div>
@@ -144,10 +154,22 @@ export default function DevisDocument({ devis, client, project, unit, animated =
           <div className="w-64 space-y-1.5 text-[13px]">
             <div className="flex justify-between text-[var(--ink-700)]">
               <span>الإجمالي HT</span>
-              <span dir="ltr" className="font-latin tabular-nums">{formatDA(totals.ht)}</span>
+              <span dir="ltr" className="font-latin tabular-nums">{formatDA(totals.itemsHt)}</span>
             </div>
+            {totals.quoteDiscount > 0 && (
+              <div className="flex justify-between text-[var(--ink-500)]">
+                <span>خصم تجاري</span>
+                <span dir="ltr" className="font-latin tabular-nums">-{formatDA(totals.quoteDiscount)}</span>
+              </div>
+            )}
+            {totals.extraFees > 0 && (
+              <div className="flex justify-between text-[var(--ink-500)]">
+                <span>مصاريف إضافية</span>
+                <span dir="ltr" className="font-latin tabular-nums">{formatDA(totals.extraFees)}</span>
+              </div>
+            )}
             <div className="flex justify-between text-[var(--ink-500)]">
-              <span>TVA <span dir="ltr" className="font-latin">19%</span></span>
+              <span>TVA <span dir="ltr" className="font-latin">{Math.round(totals.taxRate * 10000) / 100}%</span></span>
               <span dir="ltr" className="font-latin tabular-nums">{formatDA(totals.tva)}</span>
             </div>
             <div className="flex items-baseline justify-between border-t border-[var(--line)] pt-2">
@@ -162,12 +184,34 @@ export default function DevisDocument({ devis, client, project, unit, animated =
                 {formatDA(totals.ttc)}
               </motion.span>
             </div>
+            {totals.advance > 0 && (
+              <>
+                <div className="flex justify-between text-[var(--ink-500)]">
+                  <span>التسبيق</span>
+                  <span dir="ltr" className="font-latin tabular-nums">-{formatDA(totals.advance)}</span>
+                </div>
+                <div className="flex justify-between text-[var(--ink-900)]">
+                  <span className="font-semibold">الباقي للدفع</span>
+                  <span dir="ltr" className="font-latin font-semibold tabular-nums">{formatDA(totals.balanceDue)}</span>
+                </div>
+              </>
+            )}
           </div>
         </div>
       ))}
 
+      {(devis.clientNotes || devis.commercialTerms?.paymentTerms || devis.commercialTerms?.deliveryMethod || devis.commercialTerms?.deliveryDelay) &&
+        section(4, (
+          <div className="mt-5 rounded-[10px] border border-[var(--line)] bg-[var(--paper-50)] px-4 py-3 text-[12px] leading-6 text-[var(--ink-700)]">
+            {devis.clientNotes && <p>{devis.clientNotes}</p>}
+            {devis.commercialTerms?.paymentTerms && <p>شروط الدفع: {devis.commercialTerms.paymentTerms}</p>}
+            {devis.commercialTerms?.deliveryDelay && <p>مدة الإنجاز: {devis.commercialTerms.deliveryDelay}</p>}
+            {devis.commercialTerms?.deliveryMethod && <p>طريقة التسليم: {devis.commercialTerms.deliveryMethod}</p>}
+          </div>
+        ))}
+
       {/* frozen snapshot banner */}
-      {section(4, (
+      {shouldShowSnapshot && section(5, (
         <div className={cn('mt-5 flex items-center gap-2.5 rounded-[10px] bg-[var(--cyan-50)] px-4 py-3 text-[12px] leading-5 text-[var(--ink-700)]')}>
           <Lock size={15} className="shrink-0 text-[var(--cyan-600)]" />
           <span className="flex-1">
@@ -187,7 +231,7 @@ export default function DevisDocument({ devis, client, project, unit, animated =
       ))}
 
       {/* footer: CMYK bar */}
-      {section(5, (
+      {section(6, (
         <div className="mt-6 flex items-center justify-between border-t border-[var(--line)] pt-3">
           <div className="flex gap-1" aria-hidden>
             <span className="h-1 w-5 rounded-full bg-[#0284C7]" />

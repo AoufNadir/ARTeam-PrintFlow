@@ -6,6 +6,7 @@ import SheetCanvas from '@/components/montage/SheetCanvas';
 import ResultsPanel from '@/components/montage/ResultsPanel';
 import PdfExportModal from '@/components/montage/PdfExportModal';
 import { migrateStateDraft } from '@/components/montage/montage-migrate';
+import { computeMontageAdvisor, type MontageAdvisorChoice } from '@/components/montage/montage-advisor';
 import {
   INITIAL_STATE,
   MONTAGE_MACHINES,
@@ -351,6 +352,32 @@ export default function Montage() {
     [],
   );
 
+  const onAdoptAdvisor = useCallback(
+    (choice: MontageAdvisorChoice) => {
+      setState((st) =>
+        normalizeState({
+          ...st,
+          kind: choice.machine.kind,
+          machineId: choice.machine.id,
+          margins: { ...choice.machine.margins },
+          pinceMm: choice.machine.priseDePince ?? st.pinceMm,
+          sheetW: choice.sheetWidthMm,
+          sheetH: choice.sheetHeightMm,
+          method: choice.method,
+          cutMethod: choice.cutMethod,
+          customSheet: !choice.machine.sheetSizes.some((sheet) =>
+            sheetSizeMatches(choice.machine.kind, sheet.widthMm, sheet.heightMm, choice.sheetWidthMm, choice.sheetHeightMm),
+          ),
+          autoSuggest: false,
+        }),
+      );
+      setResult({ ...choice.result, alternatives: [] });
+      setManualPlaced(null);
+      toast.success('تم اعتماد حل مستشار المونتاج');
+    },
+    [],
+  );
+
   const onAdopt = useCallback(() => {
     if (!result) return;
     try {
@@ -385,6 +412,7 @@ export default function Montage() {
   // --------------------------- render ------------------------------------------
 
   const cost = result ? estimateCost(result, effMachine, rules) : null;
+  const advisor = useMemo(() => computeMontageAdvisor(state, rules), [state, rules]);
 
   return (
     <div className="grid items-start gap-4 xl:grid-cols-[340px_minmax(0,1fr)_360px]">
@@ -456,8 +484,10 @@ export default function Montage() {
           fixedWarnings={fixedWarnings}
           unit={unit}
           variants={variants}
+          advisor={advisor}
           selectedVariant={selectedVariant}
           onSelectVariant={onSelectVariant}
+          onAdoptAdvisor={onAdoptAdvisor}
           onAdopt={onAdopt}
           onExportPdf={() => setPdfOpen(true)}
           onAdoptAlternative={onAdoptAlternative}

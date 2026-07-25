@@ -490,6 +490,23 @@ function gapViolation(
   return false;
 }
 
+/** Final hard check: every pair of placed cells respects the resolved gap. */
+function layoutGapsOk(placed: PlacedPiece[], gap: GapFn): boolean {
+  if (placed.length < 2) return true;
+  const cells = placed.map((p) => ({
+    x: p.x - (p.bleed?.left ?? 0),
+    y: p.y - (p.bleed?.top ?? 0),
+    cw: p.w + (p.bleed?.left ?? 0) + (p.bleed?.right ?? 0),
+    ch: p.h + (p.bleed?.top ?? 0) + (p.bleed?.bottom ?? 0),
+    groupId: p.groupId,
+  }));
+  for (let i = 1; i < cells.length; i++) {
+    const a = cells[i];
+    if (gapViolation(a.x, a.y, a.cw, a.ch, a.groupId, cells.slice(0, i), gap)) return false;
+  }
+  return true;
+}
+
 /** Split every free rect intersecting the placed cell, then prune contained ones. */
 function mrSplitAndPrune(free: FreeRect[], used: FreeRect): FreeRect[] {
   const next: FreeRect[] = [];
@@ -954,9 +971,6 @@ function blocksFixedPack(
   const decompositions = gs.map(decompositionsOf);
   if (decompositions.some((list) => list.length === 0)) return null;
 
-  const present = gs.map((g) => g.id);
-  let sepGap = 0;
-  for (const a of present) for (const b of present) sepGap = Math.max(sepGap, gap(a, b));
   // بلوكان مختلفان يجب أن يبقيا مكوّنين مستقلين حتى عندما يكون gap المستخدم
   // صفراً؛ قناة 0.1مم تتجاوز إبسيلون التجميع ولا تؤثر عملياً في المقاس.
   const independentGap = CUT_MARK_EPS_MM * 2;
@@ -973,9 +987,69 @@ function blocksFixedPack(
   let nodes = 0;
   const NODE_CAP = 12_000;
 
+  /** Y spans of plans in a stack — same top-down walk as emit. */
+  const planRanges = (plans: Plan[], totalH: number) => {
+    const ranges: { id: string; y0: number; y1: number; w: number }[] = [];
+    let y = totalH;
+    for (let pi = 0; pi < plans.length; pi++) {
+      const pl = plans[pi];
+      if (pi > 0) y -= blockGap(plans[pi - 1].g.id, pl.g.id);
+      y -= pl.h;
+      ranges.push({ id: pl.g.id, y0: y, y1: y + pl.h, w: pl.w });
+    }
+    return ranges;
+  };
+
+  /**
+   * Horizontal separation for a new baseline column: max pair-gap only against
+   * groups on the right frontier whose vertical span overlaps the new block.
+   * (Previously used max-of-ALL-pairs, so gap(1,3) incorrectly forced gap(2,3).)
+   */
+  const horizontalSepFor = (p: Plan): number => {
+    if (stacks.length === 0) return 0;
+    let sep = independentGap;
+    for (const s of stacks) {
+      if (Math.abs(s.x + s.w - usedW) > FIXED_EPS) continue;
+      for (const pl of planRanges(s.plans, s.h)) {
+        // new column sits on the baseline occupying [0, p.h]
+        if (pl.y0 < p.h - FIXED_EPS && pl.y1 > FIXED_EPS) {
+          sep = Math.max(sep, blockGap(pl.id, p.g.id));
+        }
+      }
+    }
+    return sep;
+  };
+
+  /**
+   * When stacking p on host s, the host's x was fixed by earlier neighbors.
+   * Reject if p would sit beside another stack closer than the pair gap requires.
+   */
+  const stackHorizOk = (s: Stack, p: Plan): boolean => {
+    const top = s.plans[s.plans.length - 1];
+    const sg = blockGap(top.g.id, p.g.id);
+    const newH = s.h + sg + p.h;
+    const added = planRanges([...s.plans, p], newH).at(-1);
+    if (!added) return true;
+    for (const n of stacks) {
+      if (n === s) continue;
+      for (const nr of planRanges(n.plans, n.h)) {
+        if (!(added.y0 < nr.y1 - FIXED_EPS && nr.y0 < added.y1 - FIXED_EPS)) continue;
+        const need = gap(added.id, nr.id);
+        if (need <= FIXED_EPS) continue;
+        const aLeft = s.x;
+        const aRight = s.x + added.w;
+        const bLeft = n.x;
+        const bRight = n.x + nr.w;
+        const dx = Math.max(bLeft - aRight, aLeft - bRight);
+        if (dx < need - FIXED_EPS) return false;
+      }
+    }
+    return true;
+  };
+
   const placeOne = (p: Plan, next: () => boolean): boolean => {
     if (++nodes > NODE_CAP) return false;
-    const sep = stacks.length > 0 ? Math.max(sepGap, independentGap) : 0;
+    const sep = horizontalSepFor(p);
     if (p.h <= areaH + FIXED_EPS && usedW + sep + p.w <= areaW + FIXED_EPS) {
       stacks.push({ x: usedW + sep, w: p.w, h: p.h, plans: [p] });
       usedW += sep + p.w;
@@ -993,7 +1067,8 @@ function blocksFixedPack(
         return (
           t.w + FIXED_EPS >= p.w &&
           t.h + FIXED_EPS >= p.h &&
-          s.h + blockGap(t.g.id, p.g.id) + p.h <= areaH + FIXED_EPS
+          s.h + blockGap(t.g.id, p.g.id) + p.h <= areaH + FIXED_EPS &&
+          stackHorizOk(s, p)
         );
       })
       .sort((a, b) => a.h - b.h);
@@ -1453,6 +1528,9 @@ function evaluateCandidates(
     // المستقيم الثلاث بعد الجاذبية والمرآة يُستبعد تلقائياً ولا يُعرض
     const cutPattern = guillotine ? assertCutPattern(placed, flip) : undefined;
     if (cutPattern === 'invalid') continue;
+    // فواصل الأزواج/الداخلي/العام: قيد صلب بعد الجاذبية والمرآة — يرفض أي
+    // مرشح (خصوصاً mixed/MaxRects) تجاوز الفاصل الزوجي المطلوب
+    if (!layoutGapsOk(placed, gap)) continue;
 
     const perGroup = new Map<string, number>();
     for (const p of placed) perGroup.set(p.groupId, (perGroup.get(p.groupId) ?? 0) + 1);
@@ -2312,17 +2390,15 @@ export function computeFixedMontage(input: FixedMontageInput, machine?: Machine)
   const primaryNeed = new Map<string, number>();
   for (const [id, n] of requested) primaryNeed.set(id, halved ? Math.ceil(n / 2) : n);
 
-  // شبكة أمان النمط الثابت في وضع guillotine: لا يُقبل إلا حزم تجتاز مدقّق
-  // القص الشريحي (assertCutPattern) وقاعدة الترسيخ والترتيب الحجمي الصاعد
-  // (anchoredOrderOk) بعد الترسيخ والمرآة، مع إتاحة مرشحي عائلتي الأعمدة
-  // والبلوكات — فمرشحو legacy قد يفوزون بالتسجيل رغم مخالفة الترتيب.
+  // شبكة أمان النمط الثابت: فواصل الأزواج دائماً؛ وفي guillotine أيضاً مدقّق
+  // القص الشريحي وقاعدة الترسيخ والترتيب الحجمي الصاعد بعد الترسيخ والمرآة.
   const guillotine = input.cutMethod === 'guillotine';
-  const accept = guillotine
-    ? (pack: FixedPackPiece[]) => {
-        const fin = finalizeFixedPlaced(pack, workArea, halved, flip, gap);
-        return assertCutPattern(fin, flip) !== 'invalid' && anchoredOrderOk(fin, workArea, flip);
-      }
-    : undefined;
+  const accept = (pack: FixedPackPiece[]) => {
+    const fin = finalizeFixedPlaced(pack, workArea, halved, flip, gap);
+    if (!layoutGapsOk(fin, gap)) return false;
+    if (!guillotine) return true;
+    return assertCutPattern(fin, flip) !== 'invalid' && anchoredOrderOk(fin, workArea, flip);
+  };
   const packOpts = { accept, candidateMode: guillotine ? ('guillotine' as const) : ('free' as const) };
 
   // generate packing candidates and keep the most compact feasible one

@@ -3,3 +3,5 @@ dist
 app-dist
 debug-*.pdf
 .tmp-test/webbridge-req-*.json
+test-results
+app/test-results

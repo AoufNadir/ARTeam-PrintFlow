@@ -30,6 +30,7 @@ import { exportDevisPdf, exportDevisPdfCombined } from '@/components/devis/devis
 import { ensureDemoDevis } from '@/components/devis/demo-data';
 import { clientLabel, formatDateAr, servicesSummary } from '@/components/devis/devis-utils';
 import { useUnit } from '@/components/layout-context';
+import { logAudit } from '@/components/settings/audit';
 import { db } from '@/lib/storage';
 import type { Client, Devis, DevisStatus, Project } from '@/lib/types';
 import { formatDA } from '@/lib/units';
@@ -40,19 +41,27 @@ const EASE = [0.22, 0.68, 0.26, 1] as [number, number, number, number];
 const STATUS_CHIPS: { id: DevisStatus | 'all'; label: string }[] = [
   { id: 'all', label: 'الكل' },
   { id: 'draft', label: 'مسودة' },
+  { id: 'ready', label: 'جاهز' },
   { id: 'sent', label: 'مرسل' },
   { id: 'accepted', label: 'مقبول' },
   { id: 'rejected', label: 'مرفوض' },
+  { id: 'expired', label: 'منتهي' },
+  { id: 'production', label: 'إنتاج' },
   { id: 'done', label: 'منفّذ' },
 ];
 
 const STATUS_TOAST: Record<DevisStatus, string> = {
   draft: 'أُعيد العرض إلى المسودات',
+  ready: 'العرض جاهز للإرسال',
   sent: 'تم إرسال العرض للعميل',
   accepted: 'تم تعليم العرض كمقبول',
   rejected: 'تم تعليم العرض كمرفوض',
+  expired: 'تم تعليم العرض كمنتهي الصلاحية',
+  production: 'تم تحويل العرض إلى الإنتاج',
   done: 'تم تعليم العرض كمنفّذ',
 };
+
+const ALL_STATUSES: DevisStatus[] = ['draft', 'ready', 'sent', 'accepted', 'rejected', 'expired', 'production', 'done'];
 
 type SortKey = 'date-desc' | 'date-asc' | 'total-desc';
 
@@ -123,7 +132,7 @@ export default function Quotes() {
   }, [overflowId]);
 
   const counts = useMemo(() => {
-    const c: Record<DevisStatus, number> = { draft: 0, sent: 0, accepted: 0, rejected: 0, done: 0 };
+    const c = Object.fromEntries(ALL_STATUSES.map((status) => [status, 0])) as Record<DevisStatus, number>;
     devisList.forEach((d) => {
       c[d.status] += 1;
     });
@@ -173,9 +182,25 @@ export default function Quotes() {
   // ------------------------------- actions -----------------------------------
 
   const setStatus = (d: Devis, status: DevisStatus) => {
-    db.devis.update(d.id, { status, updatedAt: new Date().toISOString() });
+    const updated = db.devis.transitionStatus(d.id, status, { sentVia: status === 'sent' ? 'manual' : undefined });
+    if (!updated) {
+      toast.error('لا يمكن تغيير الحالة: يوجد بند يحتاج مراجعة قبل الإرسال');
+      return;
+    }
     refresh();
+    logAudit('status', `${STATUS_TOAST[status]} — ${d.number}`, d.number);
     toast.success(STATUS_TOAST[status]);
+  };
+
+  const createRevision = (d: Devis) => {
+    const revision = db.devis.createRevision(d.id);
+    if (!revision) {
+      toast.error('تعذر إنشاء مراجعة');
+      return;
+    }
+    refresh();
+    logAudit('devis', `أنشأ مراجعة ${revision.number} من ${d.number}`, revision.number);
+    toast.success(`تم إنشاء مراجعة ${revision.number}`);
   };
 
   const duplicate = (d: Devis) => {
@@ -218,6 +243,7 @@ export default function Quotes() {
     setPdfBusy(true);
     try {
       await exportDevisPdf(d, clientOf(d), projectOf(d));
+      logAudit('pdf', `صدّر PDF العميل ${d.number}`, d.number);
       toast.success(`تم تنزيل ${d.number}.pdf`);
     } catch {
       toast.error('تعذّر توليد ملف PDF — حاول مجددًا');
@@ -234,6 +260,7 @@ export default function Quotes() {
     setPdfBusy(true);
     try {
       await exportDevisPdfCombined(entries);
+      logAudit('pdf', `صدّر ${entries.length} عروض في PDF مجمّع`);
       toast.success(`تم تصدير ${entries.length} عروض في ملف واحد`);
     } catch {
       toast.error('تعذّر توليد ملف PDF — حاول مجددًا');
@@ -401,6 +428,19 @@ export default function Quotes() {
                   تعديل المسودة
                 </Link>
               )}
+              {d.status !== 'draft' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOverflowId(null);
+                    createRevision(d);
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-2.5 text-[13px] text-[var(--ink-700)] transition-colors hover:bg-[var(--paper-100)]"
+                >
+                  <Pencil size={14} />
+                  إنشاء مراجعة R2
+                </button>
+              )}
               <button
                 type="button"
                 disabled={d.status !== 'draft'}
@@ -444,6 +484,16 @@ export default function Quotes() {
       {d.status === 'draft' && (
         <button
           type="button"
+          onClick={() => setStatus(d, 'ready')}
+          className="flex h-10 items-center gap-1.5 rounded-[10px] border border-[var(--line-strong)] bg-white px-4 text-[14px] font-medium text-[var(--ink-700)] transition-colors hover:bg-[var(--paper-100)]"
+        >
+          <Check size={15} />
+          جاهز
+        </button>
+      )}
+      {(d.status === 'draft' || d.status === 'ready') && (
+        <button
+          type="button"
           onClick={() => setStatus(d, 'sent')}
           className="flex h-10 items-center gap-1.5 rounded-[10px] border border-[var(--line-strong)] bg-white px-4 text-[14px] font-medium text-[var(--ink-700)] transition-colors hover:bg-[var(--paper-100)]"
         >
@@ -474,6 +524,16 @@ export default function Quotes() {
       {d.status === 'accepted' && (
         <button
           type="button"
+          onClick={() => setStatus(d, 'production')}
+          className="flex h-10 items-center gap-1.5 rounded-[10px] border border-[#7C3AED] bg-white px-4 text-[14px] font-semibold text-[#7C3AED] transition-colors hover:bg-[#EDE9FE]"
+        >
+          <Check size={15} />
+          تحويل للإنتاج
+        </button>
+      )}
+      {d.status === 'production' && (
+        <button
+          type="button"
           onClick={() => setStatus(d, 'done')}
           className="flex h-10 items-center gap-1.5 rounded-[10px] border border-[#7C3AED] bg-white px-4 text-[14px] font-semibold text-[#7C3AED] transition-colors hover:bg-[#EDE9FE]"
         >
@@ -499,6 +559,16 @@ export default function Quotes() {
         <Copy size={15} />
         نسخ
       </button>
+      {d.status !== 'draft' && (
+        <button
+          type="button"
+          onClick={() => createRevision(d)}
+          className="flex h-10 items-center gap-1.5 rounded-[10px] px-3 text-[14px] font-medium text-[var(--ink-500)] transition-colors hover:bg-[var(--paper-200)] hover:text-[var(--ink-700)]"
+        >
+          <Pencil size={15} />
+          مراجعة جديدة
+        </button>
+      )}
       <button
         type="button"
         onClick={() => {

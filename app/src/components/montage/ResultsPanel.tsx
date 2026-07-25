@@ -19,6 +19,7 @@ import {
   type MontageUIState,
 } from './montage-data';
 import type { PricingRule } from '@/lib/types';
+import type { MontageAdvisorChoice, MontageAdvisorReport } from './montage-advisor';
 
 const EASE = [0.22, 0.68, 0.26, 1] as [number, number, number, number];
 const CUT_PATTERN_LABEL: Record<NonNullable<MontageResult['cutPattern']>, string> = {
@@ -40,8 +41,10 @@ export interface ResultsPanelProps {
   unit: Unit;
   /** montage layout candidates (quantity mode) — the user picks the trade-off */
   variants: MontageVariant[];
+  advisor: MontageAdvisorReport;
   selectedVariant: number;
   onSelectVariant: (i: number) => void;
+  onAdoptAdvisor: (choice: MontageAdvisorChoice) => void;
   onAdopt: () => void;
   onExportPdf: () => void;
   onAdoptAlternative: (alt: SheetAlternative) => void;
@@ -72,6 +75,218 @@ function CountUp({ value, decimals = 0, className }: { value: number; decimals?:
   );
 }
 
+function AdvisorPanel({
+  advisor,
+  state,
+  onAdoptAdvisor,
+}: {
+  advisor: MontageAdvisorReport;
+  state: MontageUIState;
+  onAdoptAdvisor: (choice: MontageAdvisorChoice) => void;
+}) {
+  const [rejectedOpen, setRejectedOpen] = useState(false);
+  if (advisor.choices.length === 0) return null;
+  const currentKey = `${state.machineId}|${state.sheetW}|${state.sheetH}|${state.method}|${state.cutMethod}`;
+  return (
+    <motion.section
+      initial={{ opacity: 0, y: 16 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.35, ease: EASE }}
+      className="rounded-[14px] border border-[var(--line)] bg-white p-4 shadow-[var(--shadow-card)]"
+    >
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <h3 className="flex items-center gap-1.5 text-[15px] font-bold text-[var(--ink-900)]">
+            <Sparkles size={16} className="text-[var(--cyan-600)]" />
+            مستشار المونتاج
+          </h3>
+          <p className="mt-0.5 text-[11px] text-[var(--ink-400)]">
+            جرّب <span dir="ltr" className="font-latin">{advisor.evaluated}</span> تركيبة، ووجد{' '}
+            <span dir="ltr" className="font-latin">{advisor.feasible}</span> حلول صالحة.
+          </p>
+        </div>
+        <span className="rounded-full bg-[var(--cyan-50)] px-2.5 py-1 text-[11px] font-semibold text-[var(--cyan-600)]">
+          أفضل 3
+        </span>
+      </div>
+
+      <div className="space-y-2">
+        {advisor.choices.map((choice) => {
+          const active = currentKey === `${choice.machine.id}|${choice.sheetWidthMm}|${choice.sheetHeightMm}|${choice.method}|${choice.cutMethod}`;
+          const cutLabel = choice.result.cutPattern
+            ? choice.result.cutPattern === 'rows'
+              ? 'أفقي'
+              : choice.result.cutPattern === 'columns'
+                ? 'عمودي'
+                : 'بلوكات'
+            : choice.cutMethod;
+          return (
+            <div
+              key={choice.id}
+              className={cn(
+                'rounded-[12px] border p-3',
+                choice.rank === 1 ? 'border-[var(--cyan-600)] bg-[var(--cyan-50)]/45' : 'border-[var(--line)] bg-white',
+              )}
+            >
+              <div className="flex items-start gap-2">
+                <span
+                  dir="ltr"
+                  className={cn(
+                    'font-latin grid h-6 w-6 shrink-0 place-items-center rounded-full text-[11px] font-bold',
+                    choice.rank === 1 ? 'bg-[var(--cyan-600)] text-white' : 'bg-[var(--paper-100)] text-[var(--ink-500)]',
+                  )}
+                >
+                  {choice.rank}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span dir="ltr" className="font-latin text-[13px] font-bold text-[var(--ink-900)]">
+                      {formatMeasure(choice.sheetWidthMm, 'cm')}×{formatMeasure(choice.sheetHeightMm, 'cm')}
+                    </span>
+                    <span className="rounded-full bg-[var(--paper-100)] px-1.5 py-px text-[10px] font-semibold text-[var(--ink-500)]">
+                      {choice.machine.name}
+                    </span>
+                    <span className="rounded-full bg-white px-1.5 py-px text-[10px] font-semibold text-[var(--ink-500)]">
+                      {cutLabel}
+                    </span>
+                    {active && (
+                      <span className="rounded-full bg-emerald-50 px-1.5 py-px text-[10px] font-semibold text-emerald-700">
+                        معتمد حالياً
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-1 grid grid-cols-4 gap-1 text-[10px] text-[var(--ink-500)]">
+                    <span>
+                      أوراق <span dir="ltr" className="font-latin font-semibold text-[var(--ink-900)]">{choice.result.sheetsNeeded}</span>
+                    </span>
+                    <span>
+                      نسخ/ورقة <span dir="ltr" className="font-latin font-semibold text-[var(--ink-900)]">{choice.result.copiesPerSheet}</span>
+                    </span>
+                    <span>
+                      هدر <span dir="ltr" className="font-latin font-semibold text-[var(--ink-900)]">{formatPercent(choice.result.wastePercent)}</span>
+                    </span>
+                    <span>
+                      تكلفة <span dir="ltr" className="font-latin font-semibold text-[var(--ink-900)]">{formatDA(choice.cost.total)}</span>
+                    </span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onAdoptAdvisor(choice)}
+                  className="shrink-0 rounded-[8px] border border-[var(--line-strong)] bg-white px-2.5 py-1 text-[11px] font-semibold text-[var(--ink-700)] transition-colors hover:border-[var(--cyan-600)] hover:text-[var(--cyan-600)]"
+                >
+                  اعتماد
+                </button>
+              </div>
+              <ul className="mt-2 space-y-1 border-t border-dashed border-[var(--line)] pt-2 text-[11px] leading-5 text-[var(--ink-500)]">
+                {choice.reasons.map((reason) => (
+                  <li key={reason}>• {reason}</li>
+                ))}
+                {choice.warnings.map((warning) => (
+                  <li key={warning} className="text-[var(--warning-600)]">
+                    • {warning}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          );
+        })}
+      </div>
+
+      {advisor.rejected.length > 0 && (
+        <div className="mt-3 rounded-[10px] border border-[var(--line)] bg-[var(--paper-50)]">
+          <button
+            type="button"
+            onClick={() => setRejectedOpen((open) => !open)}
+            className="flex w-full items-center justify-between px-3 py-2 text-[12px] font-semibold text-[var(--ink-700)]"
+          >
+            لماذا رُفضت بعض المرشحات؟
+            <motion.span animate={{ rotate: rejectedOpen ? -180 : 0 }} transition={{ duration: 0.2 }}>
+              <ChevronDown size={14} />
+            </motion.span>
+          </button>
+          <AnimatePresence initial={false}>
+            {rejectedOpen && (
+              <motion.ul
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: 0.25 }}
+                className="space-y-1 overflow-hidden px-3 pb-3 text-[11px] leading-5 text-[var(--ink-500)]"
+              >
+                {advisor.rejected.map((item) => (
+                  <li key={item.id} className="border-t border-dashed border-[var(--line)] pt-1.5">
+                    <span dir="ltr" className="font-latin font-semibold">{item.sheetLabel}</span> · {item.methodLabel} · {item.cutLabel}: {item.reason}
+                  </li>
+                ))}
+              </motion.ul>
+            )}
+          </AnimatePresence>
+        </div>
+      )}
+    </motion.section>
+  );
+}
+
+function PreflightPanel({
+  state,
+  result,
+  shortfalls,
+  sheetFallback,
+}: {
+  state: MontageUIState;
+  result: MontageResult;
+  shortfalls: { id: string; name: string; requested: number; produced: number }[];
+  sheetFallback: boolean;
+}) {
+  const issues: { severity: 'ok' | 'warning' | 'error'; label: string; message: string }[] = [];
+  if (shortfalls.length > 0) {
+    issues.push({ severity: 'error', label: 'الكمية', message: 'الكمية لا تغطيها الأوراق المحسوبة لكل التصاميم.' });
+  } else {
+    issues.push({ severity: 'ok', label: 'الكمية', message: 'الإنتاج يغطي الكميات المطلوبة.' });
+  }
+  if (sheetFallback) issues.push({ severity: 'warning', label: 'الورقة', message: 'المقاس المختار استُبدل ببديل صالح.' });
+  else issues.push({ severity: 'ok', label: 'الورقة', message: 'المخطط يعمل على الورقة المختارة.' });
+  if (result.wastePercent >= 18) issues.push({ severity: 'warning', label: 'الهدر', message: `الهدر مرتفع (${formatPercent(result.wastePercent)}).` });
+  else issues.push({ severity: 'ok', label: 'الهدر', message: `الهدر ضمن المجال المقبول (${formatPercent(result.wastePercent)}).` });
+  for (const sticker of state.stickers) {
+    if (sticker.asset?.warnings[0]) issues.push({ severity: 'warning', label: sticker.name ?? 'ملف', message: sticker.asset.warnings[0] });
+    if (sticker.cutContour?.match?.status === 'mismatch') {
+      issues.push({ severity: 'error', label: 'tracé', message: `قياس مسار القص لا يطابق ${sticker.name ?? 'التصميم'}.` });
+    } else if (sticker.cutContour?.match?.status === 'review') {
+      issues.push({ severity: 'warning', label: 'tracé', message: `فرق صغير في مسار القص لـ ${sticker.name ?? 'التصميم'}.` });
+    }
+  }
+  if (state.cutMethod === 'cutcontour' && !state.stickers.some((sticker) => sticker.cutContour || sticker.asset?.hasEmbeddedCutContour)) {
+    issues.push({ severity: 'warning', label: 'tracé', message: 'CutContour مختار لكن لا يوجد ملف قص مرتبط بعد.' });
+  }
+
+  return (
+    <section className="rounded-[14px] border border-[var(--line)] bg-white p-4 shadow-[var(--shadow-card)]">
+      <h3 className="mb-2.5 flex items-center gap-1.5 text-[14px] font-semibold text-[var(--ink-900)]">
+        <TriangleAlert size={15} className="text-[var(--warning-600)]" />
+        تحذيرات ما قبل الطباعة
+      </h3>
+      <div className="space-y-1.5">
+        {issues.map((issue) => (
+          <div key={`${issue.label}-${issue.message}`} className="flex items-start gap-2 rounded-[8px] bg-[var(--paper-50)] px-2.5 py-2 text-[11px] leading-5">
+            <span
+              className={cn(
+                'mt-1 h-2 w-2 shrink-0 rounded-full',
+                issue.severity === 'ok' && 'bg-emerald-500',
+                issue.severity === 'warning' && 'bg-amber-500',
+                issue.severity === 'error' && 'bg-red-500',
+              )}
+            />
+            <span className="font-semibold text-[var(--ink-700)]">{issue.label}</span>
+            <span className="text-[var(--ink-500)]">{issue.message}</span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 export default function ResultsPanel(props: ResultsPanelProps) {
   const { state, machine, result, rules, placedCount, unit } = props;
   const [altsOpen, setAltsOpen] = useState(false);
@@ -83,35 +298,45 @@ export default function ResultsPanel(props: ResultsPanelProps) {
   );
 
   if (!result || !cost) {
+    const advisory = <AdvisorPanel advisor={props.advisor} state={state} onAdoptAdvisor={props.onAdoptAdvisor} />;
     // fixed mode: a failed fixed computation carries explicit per-design maximums
     if (state.calcMode === 'fixed' && props.fixedWarnings && props.fixedWarnings.length > 0) {
       return (
-        <EmptyState
-          image="/empty-montage.svg"
-          title="العدد المطلوب لا يسع الورقة"
-          helper={props.fixedWarnings.join(' — ')}
-          className="min-h-[320px]"
-        />
+        <div className="flex flex-col gap-3">
+          {advisory}
+          <EmptyState
+            image="/empty-montage.svg"
+            title="العدد المطلوب لا يسع الورقة"
+            helper={props.fixedWarnings.join(' — ')}
+            className="min-h-[320px]"
+          />
+        </div>
       );
     }
     const reason = !result ? infeasibilityReason(state) : null;
     if (reason) {
       return (
-        <EmptyState
-          image="/empty-montage.svg"
-          title="تعذّر تركيب المونتاج"
-          helper={reason}
-          className="min-h-[320px]"
-        />
+        <div className="flex flex-col gap-3">
+          {advisory}
+          <EmptyState
+            image="/empty-montage.svg"
+            title="تعذّر تركيب المونتاج"
+            helper={reason}
+            className="min-h-[320px]"
+          />
+        </div>
       );
     }
     return (
-      <EmptyState
-        image="/empty-montage.svg"
-        title="التوصية الذكية تظهر هنا"
-        helper="بعد إدخال المقاسات والضغط على «احسب المونتاج» يقترح النظام أفضل ورقة بأقل هدر."
-        className="min-h-[320px]"
-      />
+      <div className="flex flex-col gap-3">
+        {advisory}
+        <EmptyState
+          image="/empty-montage.svg"
+          title="التوصية الذكية تظهر هنا"
+          helper="بعد إدخال المقاسات والضغط على «احسب المونتاج» يقترح النظام أفضل ورقة بأقل هدر."
+          className="min-h-[320px]"
+        />
+      </div>
     );
   }
 
@@ -132,6 +357,8 @@ export default function ResultsPanel(props: ResultsPanelProps) {
 
   return (
     <div className="flex flex-col gap-3">
+      <AdvisorPanel advisor={props.advisor} state={state} onAdoptAdvisor={props.onAdoptAdvisor} />
+
       {/* ---------------- montage variants (quantity mode) ---------------- */}
       {state.calcMode === 'quantity' && props.variants.length > 1 && (
         <motion.section
@@ -232,6 +459,8 @@ export default function ResultsPanel(props: ResultsPanelProps) {
           </span>
         </motion.div>
       )}
+
+      <PreflightPanel state={state} result={result} shortfalls={shortfalls} sheetFallback={sheetFallback} />
 
       {/* ---------------- RecommendationCard ---------------- */}
       <motion.section
@@ -355,7 +584,7 @@ export default function ResultsPanel(props: ResultsPanelProps) {
         {/* waste meter */}
         <div className="mb-3 flex flex-col items-center rounded-[12px] bg-white/70 py-3">
           <WasteMeter percent={result.wastePercent} size={140} />
-          <p className="mt-1 text-[11px] text-[var(--ink-400)]">مساحة مهدورة من القابلة للطباعة</p>
+          <p className="mt-1 text-[11px] text-[var(--ink-400)]">مساحة مهدورة من مساحة الورقة</p>
         </div>
 
         {/* why note */}
