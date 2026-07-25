@@ -9,7 +9,8 @@ test('devis creation page exposes the upgraded commercial editor', async ({ page
 
   await expect(page.getByRole('heading', { name: /إنشاء Devis|تعديل العرض/ })).toBeVisible();
   await expect(page.getByRole('button', { name: 'العميل والعرض' })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'الخدمات والتصاميم' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'التصاميم' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'الإنتاج والمونتاج' })).toBeVisible();
   await expect(page.getByText('التسعير التجاري')).toBeVisible();
   await expect(page.getByRole('button', { name: 'إرسال للعميل' })).toBeDisabled();
 });
