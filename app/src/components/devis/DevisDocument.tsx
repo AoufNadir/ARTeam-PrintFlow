@@ -137,22 +137,6 @@ export default function DevisDocument({ devis, client, project, unit, animated =
                       {dims && ' — '}
                       <span dir="ltr" className="font-latin">{qty}</span> نسخة
                     </div>
-                    {item.designs && item.designs.length > 1 && (
-                      <div className="mt-1.5 space-y-0.5 text-[10.5px] text-[var(--ink-500)]">
-                        {item.designs.slice(0, 4).map((design) => {
-                          const allocation = item.designAllocations?.find((row) => row.designId === design.id);
-                          return (
-                            <div key={design.id} className="flex flex-wrap items-center gap-1.5">
-                              <span className="font-medium text-[var(--ink-700)]">{design.name}</span>
-                              <span dir="ltr" className="font-latin">{Math.round(design.widthMm)}×{Math.round(design.heightMm)} mm</span>
-                              <span dir="ltr" className="font-latin">{design.quantity} ex</span>
-                              {allocation && <span dir="ltr" className="font-latin text-[var(--cyan-600)]">{formatDA(allocation.unitPrice)}/ex</span>}
-                            </div>
-                          );
-                        })}
-                        {item.designs.length > 4 && <div>+ {item.designs.length - 4} تصاميم أخرى</div>}
-                      </div>
-                    )}
                   </td>
                   <td className="py-2.5 text-end"><span dir="ltr" className="font-latin tabular-nums">{qty}</span></td>
                   <td className="py-2.5 text-end"><span dir="ltr" className="font-latin tabular-nums">{formatDA(item.unitPrice)}</span></td>

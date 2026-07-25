@@ -182,40 +182,6 @@ export interface QuantityOption {
   marginPercent: number;
 }
 
-export interface DevisDesign {
-  id: string;
-  name: string;
-  widthMm: number;
-  heightMm: number;
-  quantity: number;
-  bleedMm?: BleedBox;
-  artwork?: DesignFileAsset;
-  cutContour?: DesignFileAsset;
-}
-
-export interface DevisProductionSetup {
-  serviceTemplateId?: string;
-  paperId?: string;
-  paperLabel?: string;
-  method?: PrintMethod;
-  machineId?: string;
-  sheetWidthMm?: number;
-  sheetHeightMm?: number;
-  cutMethod?: MontageInput['cutMethod'];
-  serviceFieldValues?: Record<string, string | number | boolean | DimensionValue>;
-}
-
-export interface DesignPriceAllocation {
-  designId: string;
-  name: string;
-  quantity: number;
-  copiesPerSheet: number;
-  produced: number;
-  areaShare: number;
-  allocatedTotal: number;
-  unitPrice: number;
-}
-
 export interface DevisItem {
   id: string;
   order?: number;
@@ -223,9 +189,6 @@ export interface DevisItem {
   serviceName: string;
   quantity: number;
   fieldValues: Record<string, string | number | boolean | DimensionValue>;
-  designs?: DevisDesign[];
-  productionSetup?: DevisProductionSetup;
-  designAllocations?: DesignPriceAllocation[];
   attachments?: DevisAttachment[];
   montageState?: MontageState;
   preflight?: PreflightCheck[];

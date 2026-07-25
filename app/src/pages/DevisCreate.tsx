@@ -65,11 +65,8 @@ import type {
   DevisAttachment,
   DevisDiscount,
   Devis,
-  DevisDesign,
   DevisItem,
-  DevisProductionSetup,
   DevisStatus,
-  DesignPriceAllocation,
   DimensionValue,
   MontageResult,
   MontageState,
@@ -85,13 +82,10 @@ import { formatDA, formatPercent, round2 } from '@/lib/units';
 import { cn } from '@/lib/utils';
 
 const EASE = [0.22, 0.68, 0.26, 1] as [number, number, number, number];
-const PHASES = ['العميل والعرض', 'التصاميم', 'الإنتاج والمونتاج', 'السعر والحفظ'];
+const PHASES = ['العميل والعرض', 'الخدمات والتصاميم', 'التسعير والشروط', 'المراجعة'];
 const QTY_PRESETS = [100, 250, 500, 1000, 2000];
 const QUANTITY_COMPARE = [500, 1000, 2000];
 const DRAFT_RESTORE_KEY = 'arteam-printflow:devis-active-draft';
-const DEFAULT_TEMPLATE_SERVICE_ID = 'svc-etiquettes';
-const STUDIO_STATE_KEY = 'arteam-printflow:montage-state-draft';
-const STUDIO_RESULT_KEY = 'arteam-printflow:montage-draft';
 
 type SaveState = 'idle' | 'saving' | 'saved' | 'failed';
 
@@ -178,55 +172,10 @@ function buildPreflight({
 }
 
 function phaseForStep(step: number): number {
-  return Math.min(step, 3);
-}
-
-function initFieldValuesFromService(svc: Service | undefined): FieldValues {
-  const v: FieldValues = {};
-  svc?.fields.forEach((f) => {
-    if (f.defaultValue !== undefined) v[f.id] = f.defaultValue as FieldValues[string];
-  });
-  return v;
-}
-
-function defaultBleedBox(mm: number) {
-  return { top: mm, bottom: mm, left: mm, right: mm };
-}
-
-function blankDesign(service: Service | undefined, index = 0): DevisDesign {
-  const size = service?.defaultPieceSize ?? { widthMm: 60, heightMm: 40 };
-  const qty = Number(service?.fields.find((f) => f.id === 'quantity')?.defaultValue) || 1000;
-  const bleed = service?.defaultBleedMm ?? 2;
-  return {
-    id: uid('design'),
-    name: `تصميم ${index + 1}`,
-    widthMm: size.widthMm,
-    heightMm: size.heightMm,
-    quantity: qty,
-    bleedMm: defaultBleedBox(bleed),
-  };
-}
-
-function designFromAsset(asset: DesignFileAsset, service: Service | undefined, quantity: number): DevisDesign {
-  const bleed = service?.defaultBleedMm ?? 2;
-  return {
-    id: asset.id,
-    name: designNameFromAsset(asset),
-    widthMm: asset.widthMm,
-    heightMm: asset.heightMm,
-    quantity,
-    bleedMm: asset.detectedBleedMm ?? defaultBleedBox(bleed),
-    artwork: asset,
-  };
-}
-
-function validDesigns(designs: DevisDesign[]): DevisDesign[] {
-  return designs.filter((design) => design.widthMm > 0 && design.heightMm > 0 && design.quantity > 0);
-}
-
-function designAreaMm2(design: DevisDesign): number {
-  const bleed = design.bleedMm ?? defaultBleedBox(0);
-  return Math.max(1, (design.widthMm + bleed.left + bleed.right) * (design.heightMm + bleed.top + bleed.bottom));
+  if (step <= 2) return 0;
+  if (step <= 4) return 1;
+  if (step === 5) return 2;
+  return 3;
 }
 
 function loadRestorableDraft(): Devis | null {
@@ -628,19 +577,12 @@ export default function DevisCreate() {
     ensureDemoClients();
     return db.clients.list();
   });
-  const initialServiceId =
-    editDevis?.items[0]?.productionSetup?.serviceTemplateId ??
-    editDevis?.items[0]?.serviceId ??
-    db.services.get(DEFAULT_TEMPLATE_SERVICE_ID)?.id ??
-    db.services.list()[0]?.id ??
-    null;
-  const initialService = initialServiceId ? db.services.get(initialServiceId) : undefined;
 
   // wizard state
   const [step, setStep] = useState(0);
   const [maxStep, setMaxStep] = useState(0);
-  const [sectionId, setSectionId] = useState<string | null>(() => initialService?.sectionId ?? null);
-  const [serviceId, setServiceId] = useState<string | null>(() => initialServiceId);
+  const [sectionId, setSectionId] = useState<string | null>(null);
+  const [serviceId, setServiceId] = useState<string | null>(null);
   const [serviceSearch, setServiceSearch] = useState('');
 
   // step 3 — general info (hydrated from the edited draft when present)
@@ -676,15 +618,7 @@ export default function DevisCreate() {
   const [clientModal, setClientModal] = useState(false);
 
   // step 4 — service fields
-  const [fieldValues, setFieldValues] = useState<FieldValues>(() => ({
-    ...initFieldValuesFromService(initialService),
-    ...(editDevis?.items[0]?.productionSetup?.serviceFieldValues ?? editDevis?.items[0]?.fieldValues ?? {}),
-  }));
-  const [designs, setDesigns] = useState<DevisDesign[]>(() => {
-    const saved = editDevis?.items[0]?.designs;
-    if (saved?.length) return saved;
-    return [blankDesign(initialService, 0)];
-  });
+  const [fieldValues, setFieldValues] = useState<FieldValues>({});
   const [designAssets, setDesignAssets] = useState<DesignFileAsset[]>([]);
   const [cutContourAssets, setCutContourAssets] = useState<DesignFileAsset[]>([]);
 
@@ -715,41 +649,31 @@ export default function DevisCreate() {
   const service: Service | undefined = serviceId ? db.services.get(serviceId) : undefined;
   const client = clientId ? clients.find((c) => c.id === clientId) : undefined;
   const project: Project | undefined = projectId ? db.projects.get(projectId) : undefined;
-  const dimensionFieldId = firstDimensionFieldId(service);
-  const activeDesigns = useMemo(() => validDesigns(designs), [designs]);
-  const primaryDesign = activeDesigns[0] ?? designs[0];
 
   const quantity = useMemo(() => {
-    const total = activeDesigns.reduce((sum, design) => sum + design.quantity, 0);
-    return total || 1;
-  }, [activeDesigns]);
+    const q = fieldValues['quantity'];
+    return (typeof q === 'number' ? q : Number(q)) || 1;
+  }, [fieldValues]);
 
   const currentDims = useMemo((): DimensionValue | undefined => {
-    if (primaryDesign) return { widthMm: primaryDesign.widthMm, heightMm: primaryDesign.heightMm };
-    return service?.defaultPieceSize;
-  }, [primaryDesign, service]);
+    if (!service) return undefined;
+    const df = service.fields.find((f) => f.type === 'dimensions');
+    const v = df ? fieldValues[df.id] : undefined;
+    return isDim(v) ? v : service.defaultPieceSize;
+  }, [service, fieldValues]);
 
   const currentMethod = useMemo((): PrintMethod => (fieldValues['faces'] === 'recto' ? 'recto' : 'recto-verso'), [fieldValues]);
 
   const currentSig = useMemo(
-    () => JSON.stringify({
-      designs: activeDesigns.map((d) => ({ id: d.id, q: d.quantity, w: d.widthMm, h: d.heightMm })),
-      m: currentMethod,
-      paper: fieldValues['paper'] ?? fieldValues['support'],
-    }),
-    [activeDesigns, currentMethod, fieldValues],
+    () => JSON.stringify({ q: quantity, w: currentDims?.widthMm, h: currentDims?.heightMm, m: currentMethod }),
+    [quantity, currentDims, currentMethod],
   );
   const montageStale = montage !== null && montageSig !== currentSig;
-  const pricingFieldValues = useMemo(() => {
-    const next: FieldValues = { ...fieldValues, quantity };
-    if (dimensionFieldId && currentDims) next[dimensionFieldId] = currentDims;
-    return next;
-  }, [fieldValues, quantity, dimensionFieldId, currentDims]);
 
   // pricing (re-totals on every change) — paper priced from the (possibly frozen) catalog
   const breakdown = useMemo(
-    () => (service ? priceItem(service, pricingFieldValues, rules, montage, papers) : null),
-    [service, pricingFieldValues, rules, montage, papers],
+    () => (service ? priceItem(service, fieldValues, rules, montage, papers) : null),
+    [service, fieldValues, rules, montage, papers],
   );
 
   const effectiveMargin = marginPct ?? defaultMargin;
@@ -770,40 +694,6 @@ export default function DevisCreate() {
     const margin = round2(total - breakdown.subtotal);
     return { ...breakdown, margin, total, unitPrice };
   }, [breakdown, effectiveMargin, manualPrice, quantity]);
-
-  const designAllocations = useMemo<DesignPriceAllocation[]>(() => {
-    if (!final || activeDesigns.length === 0) return [];
-    const counts = new Map<string, number>();
-    for (const piece of montage?.placed ?? []) counts.set(piece.groupId, (counts.get(piece.groupId) ?? 0) + 1);
-    const weights = activeDesigns.map((design) => {
-      const copiesPerSheet = counts.get(design.id) ?? (activeDesigns.length === 1 ? montage?.copiesPerSheet ?? 1 : 1);
-      return {
-        design,
-        copiesPerSheet,
-        weight: designAreaMm2(design) * Math.max(1, copiesPerSheet),
-      };
-    });
-    const totalWeight = weights.reduce((sum, row) => sum + row.weight, 0) || 1;
-    let allocatedSoFar = 0;
-    return weights.map((row, index) => {
-      const isLast = index === weights.length - 1;
-      const allocatedTotal = isLast
-        ? round2(final.total - allocatedSoFar)
-        : round2((final.total * row.weight) / totalWeight);
-      allocatedSoFar = round2(allocatedSoFar + allocatedTotal);
-      const produced = montage ? Math.max(row.design.quantity, row.copiesPerSheet * montage.sheetsNeeded) : row.design.quantity;
-      return {
-        designId: row.design.id,
-        name: row.design.name,
-        quantity: row.design.quantity,
-        copiesPerSheet: row.copiesPerSheet,
-        produced,
-        areaShare: round2((row.weight / totalWeight) * 100),
-        allocatedTotal,
-        unitPrice: round2(allocatedTotal / Math.max(1, row.design.quantity)),
-      };
-    });
-  }, [activeDesigns, final, montage]);
 
   // manual price below production cost → negative margin (warn, never save silently)
   const negativeMargin = final !== null && final.margin < -0.005;
@@ -907,7 +797,11 @@ export default function DevisCreate() {
   };
 
   const initFieldValues = (svc: Service): FieldValues => {
-    return initFieldValuesFromService(svc);
+    const v: FieldValues = {};
+    svc.fields.forEach((f) => {
+      if (f.defaultValue !== undefined) v[f.id] = f.defaultValue as FieldValues[string];
+    });
+    return v;
   };
 
   const selectSection = (id: string) => {
@@ -925,80 +819,59 @@ export default function DevisCreate() {
     const svc = db.services.get(id);
     if (!svc) return;
     setServiceId(id);
-    setSectionId(svc.sectionId);
     setFieldValues(initFieldValues(svc));
     setMontage(null);
     setMontageSig('');
     setManualPrice(null);
     setMarginPct(null);
     setOverrideReason('');
-    setDesigns((prev) => {
-      if (prev.length === 0) return [blankDesign(svc, 0)];
-      return prev.map((design, index) => {
-        if (design.artwork) return design;
-        const fallback = blankDesign(svc, index);
-        return {
-          ...design,
-          widthMm: fallback.widthMm,
-          heightMm: fallback.heightMm,
-          bleedMm: fallback.bleedMm,
-          quantity: design.quantity || fallback.quantity,
-        };
-      });
-    });
+    setDesignAssets([]);
+    setCutContourAssets([]);
+    window.setTimeout(() => {
+      setStep(2);
+      setMaxStep((m) => Math.max(m, 2));
+    }, 350);
   };
 
   const goToPhase = (phase: number) => {
-    const target = Math.min(phase, 3);
-    if (target <= maxStep) setStep(target);
+    const target = [0, 3, 5, 6][phase] ?? 0;
+    if (phase <= phaseForStep(maxStep)) setStep(Math.min(target, maxStep));
   };
 
   const tryNext = () => {
-    if (step === 0 && !clientId) {
+    if (step === 2 && !clientId) {
       setClientError(true);
       toast.error('العميل مطلوب');
       return;
     }
-    if (step === 1 && activeDesigns.length === 0) {
-      toast.error('أضف تصميمًا واحدًا على الأقل بمقاس وكمية صحيحين');
+    if (step === 3 && quantity <= 0) {
+      toast.error('أدخل كمية صحيحة');
       return;
     }
-    const n = Math.min(step + 1, 4);
+    const n = Math.min(step + 1, 6);
     setStep(n);
     setMaxStep((m) => Math.max(m, n));
   };
 
   const runMontage = (sheet?: { w: number; h: number; machineId?: string }) => {
-    if (!service || activeDesigns.length === 0) {
-      toast.error('أضف التصاميم والمقاسات أولًا');
+    if (!service || !currentDims) {
+      toast.error('حدّد مقاس المنتج أولًا');
       return;
     }
     const bleed = service.defaultBleedMm ?? 2;
     const method = currentMethod;
-    const primary = activeDesigns[0];
+    const dims = currentDims;
     setMontageLoading(true);
     window.setTimeout(() => {
       const result = computeMontage({
         sheetWidthMm: sheet?.w ?? 320,
         sheetHeightMm: sheet?.h ?? 450,
-        pieceWidthMm: primary.widthMm,
-        pieceHeightMm: primary.heightMm,
-        groups: activeDesigns.length > 1
-          ? activeDesigns.map((design, index) => ({
-              id: design.id,
-              name: design.name,
-              widthMm: design.widthMm,
-              heightMm: design.heightMm,
-              quantity: design.quantity,
-              bleedMm: design.bleedMm ?? defaultBleedBox(bleed),
-              color: ['#0D9488', '#DB2777', '#D97706', '#7C3AED', '#0284C7', '#65A30D'][index % 6],
-            }))
-          : undefined,
-        bleedMm: primary.bleedMm ?? { top: bleed, bottom: bleed, left: bleed, right: bleed },
-        quantity: primary.quantity,
+        pieceWidthMm: dims.widthMm,
+        pieceHeightMm: dims.heightMm,
+        bleedMm: { top: bleed, bottom: bleed, left: bleed, right: bleed },
+        quantity,
         method,
         machineId: sheet?.machineId ?? 'machine-digital-versant',
-        cutMethod: fieldValues['contour-cut'] === true ? 'cutcontour' : 'guillotine',
       });
       setMontageLoading(false);
       if (!result) {
@@ -1025,17 +898,16 @@ export default function DevisCreate() {
   const quantityOptions = useMemo<QuantityOption[]>(() => {
     if (!service) return [];
     return QUANTITY_COMPARE.map((q) => {
-      const factor = q / Math.max(1, quantity);
-      const values = { ...pricingFieldValues, quantity: q };
+      const values = { ...fieldValues, quantity: q };
       const priced = priceItem(service, values, rules, montage, papers);
       const rawTotal = priced.subtotal * (1 + effectiveMargin / 100);
       const unitPrice = round2(rawTotal / q);
       const total = round2(unitPrice * q);
       const margin = round2(total - priced.subtotal);
       const marginPercent = priced.subtotal > 0 ? round2((margin / priced.subtotal) * 100) : 0;
-      return { quantity: Math.round(quantity * factor), pricing: { ...priced, unitPrice, total, margin }, unitPrice, total, margin, marginPercent };
+      return { quantity: q, pricing: { ...priced, unitPrice, total, margin }, unitPrice, total, margin, marginPercent };
     });
-  }, [service, pricingFieldValues, rules, montage, papers, effectiveMargin, quantity]);
+  }, [service, fieldValues, rules, montage, papers, effectiveMargin]);
 
   const addItem = () => {
     if (!service || !final) return;
@@ -1056,39 +928,23 @@ export default function DevisCreate() {
   const doAddItem = () => {
     if (!service || !final) return;
     const itemMontageState = montageStateFrom(montage, montageStale, manualPrice);
-    const productionSetup: DevisProductionSetup = {
-      serviceTemplateId: service.id,
-      paperId: typeof fieldValues['paper'] === 'string' ? fieldValues['paper'] : typeof fieldValues['support'] === 'string' ? fieldValues['support'] : undefined,
-      paperLabel: service.fields
-        .flatMap((field) => field.options ?? [])
-        .find((option) => option.id === fieldValues['paper'] || option.id === fieldValues['support'])?.label,
-      method: currentMethod,
-      machineId: undefined,
-      sheetWidthMm: montage?.sheetWidthMm,
-      sheetHeightMm: montage?.sheetHeightMm,
-      cutMethod: fieldValues['contour-cut'] === true ? 'cutcontour' : 'guillotine',
-      serviceFieldValues: { ...pricingFieldValues },
-    };
     const attachments = [
-      ...activeDesigns.flatMap((design) => design.artwork ? [attachmentOf('artwork', design.artwork, design.id)] : []),
-      ...activeDesigns.flatMap((design) => design.cutContour ? [attachmentOf('cut-contour', design.cutContour, design.id)] : []),
+      ...designAssets.map((asset) => attachmentOf('artwork', asset)),
+      ...cutContourAssets.map((asset) => attachmentOf('cut-contour', asset, asset.match ? asset.id : undefined)),
     ];
     const preflight = buildPreflight({
       dims: currentDims,
-      designAssets: activeDesigns.flatMap((design) => design.artwork ? [design.artwork] : []),
-      cutContours: activeDesigns.flatMap((design) => design.cutContour ? [design.cutContour] : []),
+      designAssets,
+      cutContours: cutContourAssets,
       montageState: itemMontageState,
     });
     const item: DevisItem = {
       id: uid('item'),
       order: items.length,
       serviceId: service.id,
-      serviceName: activeDesigns.length > 1 ? `Montage ${activeDesigns.length} designs` : (service.latinName ?? service.name),
+      serviceName: service.latinName ?? service.name,
       quantity,
-      fieldValues: { ...pricingFieldValues },
-      designs: activeDesigns.map((design) => structuredClone(design)),
-      productionSetup,
-      designAllocations,
+      fieldValues: { ...fieldValues },
       attachments,
       montageState: itemMontageState,
       preflight,
@@ -1179,21 +1035,19 @@ export default function DevisCreate() {
   };
 
   const addAnother = () => {
-    const svc = service ?? initialService;
-    setSectionId(svc?.sectionId ?? null);
-    setServiceId(svc?.id ?? DEFAULT_TEMPLATE_SERVICE_ID);
+    setSectionId(null);
+    setServiceId(null);
     setServiceSearch('');
-    setFieldValues(initFieldValuesFromService(svc));
+    setFieldValues({});
     setMontage(null);
     setMontageSig('');
     setManualPrice(null);
     setMarginPct(null);
     setOverrideReason('');
-    setDesigns([blankDesign(svc, 0)]);
     setDesignAssets([]);
     setCutContourAssets([]);
-    setStep(1);
-    setMaxStep(1); // client info stays valid
+    setStep(0);
+    setMaxStep(2); // client info stays valid
   };
 
   const saveDraft = () => {
@@ -1278,9 +1132,9 @@ export default function DevisCreate() {
   };
 
   const canNext =
-    step === 0 ? clientId !== ''
-    : step === 1 ? activeDesigns.length > 0
-    : step === 2 ? !montageStale
+    step === 0 ? sectionId !== null
+    : step === 1 ? serviceId !== null
+    : step === 2 ? clientId !== ''
     : true;
 
   const savedDevis = devisId ? db.devis.get(devisId) : undefined;
@@ -1690,26 +1544,21 @@ export default function DevisCreate() {
 
   // ------------------------------- step 3: service fields --------------------
 
-  const setField = (id: string, v: FieldValues[string]) => {
-    setFieldValues((fv) => ({ ...fv, [id]: v }));
-    if (id === 'faces' || id === 'contour-cut') {
-      setMontage(null);
-      setMontageSig('');
-    }
-  };
+  const setField = (id: string, v: FieldValues[string]) => setFieldValues((fv) => ({ ...fv, [id]: v }));
+  const dimensionFieldId = firstDimensionFieldId(service);
   const uploadStickers = useMemo<Sticker[]>(() => {
     const bleed = service?.defaultBleedMm ?? 2;
-    if (designs.length > 0) {
-      return designs.map((design) => ({
-        id: design.id,
-        name: design.name,
-        widthMm: design.widthMm,
-        heightMm: design.heightMm,
-        bleed: design.bleedMm ?? { top: bleed, bottom: bleed, left: bleed, right: bleed },
-        bleedLinked: !design.bleedMm,
-        quantity: design.quantity,
-        asset: design.artwork,
-        cutContour: design.cutContour,
+    if (designAssets.length > 0) {
+      return designAssets.map((asset) => ({
+        id: asset.id,
+        name: designNameFromAsset(asset),
+        widthMm: asset.widthMm,
+        heightMm: asset.heightMm,
+        bleed: asset.detectedBleedMm ?? { top: bleed, bottom: bleed, left: bleed, right: bleed },
+        bleedLinked: !asset.detectedBleedMm,
+        quantity,
+        asset,
+        cutContour: cutContourAssets.find((contour) => contour.match?.status || contour.fileName),
       }));
     }
     if (currentDims) {
@@ -1726,273 +1575,144 @@ export default function DevisCreate() {
       ];
     }
     return [];
-  }, [service, designs, currentDims, quantity]);
-
-  const updateDesign = (id: string, patch: Partial<DevisDesign>) => {
-    setDesigns((prev) => prev.map((design) => (design.id === id ? { ...design, ...patch } : design)));
-    setMontage(null);
-    setMontageSig('');
-  };
-
-  const addBlankDesign = () => {
-    setDesigns((prev) => [...prev, blankDesign(service, prev.length)]);
-    setMontage(null);
-    setMontageSig('');
-  };
-
-  const removeDesign = (id: string) => {
-    setDesigns((prev) => {
-      const next = prev.filter((design) => design.id !== id);
-      return next.length > 0 ? next : [blankDesign(service, 0)];
-    });
-    setMontage(null);
-    setMontageSig('');
-  };
+  }, [service, designAssets, cutContourAssets, currentDims, quantity]);
 
   const addDesignFiles = (assets: DesignFileAsset[]) => {
     if (assets.length === 0) return;
     setDesignAssets((prev) => [...prev, ...assets]);
-    setDesigns((prev) => {
-      const baseQuantity = prev[0]?.quantity ?? quantity;
-      const incoming = assets.map((asset) => designFromAsset(asset, service, baseQuantity));
-      if (prev.length === 1 && !prev[0].artwork) return incoming;
-      return [...prev, ...incoming].slice(0, 12);
-    });
-    setMontage(null);
-    setMontageSig('');
+    const first = assets[0];
+    if (dimensionFieldId) {
+      setField(dimensionFieldId, { widthMm: first.widthMm, heightMm: first.heightMm });
+      setMontage(null);
+      setMontageSig('');
+    }
   };
 
-  const attachCutContour = (stickerId: string, asset: DesignFileAsset) => {
+  const attachCutContour = (_stickerId: string, asset: DesignFileAsset) => {
     setCutContourAssets((prev) => [...prev, asset]);
-    setDesigns((prev) => prev.map((design) => (design.id === stickerId ? { ...design, cutContour: asset } : design)));
-    setMontage(null);
-    setMontageSig('');
-  };
-
-  const openStudioWithCurrentJob = () => {
-    if (activeDesigns.length === 0) return;
-    const bleed = service?.defaultBleedMm ?? 2;
-    const studioState = {
-      kind: 'digital',
-      machineId: 'mc-versant',
-      margins: { top: 4, bottom: 4, left: 4, right: 4 },
-      pinceMm: 12,
-      sheetW: montage?.sheetWidthMm ?? 320,
-      sheetH: montage?.sheetHeightMm ?? 450,
-      customSheet: false,
-      autoSuggest: true,
-      calcMode: 'quantity',
-      stickers: activeDesigns.map((design) => ({
-        id: design.id,
-        name: design.name,
-        widthMm: design.widthMm,
-        heightMm: design.heightMm,
-        bleed: design.bleedMm ?? defaultBleedBox(bleed),
-        bleedLinked: !design.bleedMm,
-        quantity: design.quantity,
-        asset: design.artwork,
-        cutContour: design.cutContour,
-      })),
-      bleedShared: defaultBleedBox(bleed),
-      method: currentMethod,
-      gutterMm: 10,
-      gripMm: 10,
-      cutMethod: fieldValues['contour-cut'] === true ? 'cutcontour' : 'guillotine',
-      sharedCut: false,
-      doubleCut: true,
-      defaultGapMm: 0,
-      pairGaps: {},
-    };
-    localStorage.setItem(STUDIO_STATE_KEY, JSON.stringify(studioState));
-  };
-
-  const importStudioResult = () => {
-    try {
-      const raw = localStorage.getItem(STUDIO_RESULT_KEY);
-      if (!raw) {
-        toast.error('لا يوجد مخطط معتمد من Studio بعد');
-        return;
-      }
-      const parsed = JSON.parse(raw) as { result?: MontageResult; placed?: MontageResult['placed'] };
-      if (!parsed.result) {
-        toast.error('مخطط Studio غير صالح');
-        return;
-      }
-      setMontage({ ...parsed.result, placed: parsed.placed ?? parsed.result.placed });
-      setMontageSig(currentSig);
-      setManualPrice(null);
-      toast.success('تم استيراد مخطط Studio إلى العرض');
-    } catch {
-      toast.error('تعذّر قراءة مخطط Studio');
-    }
-  };
-
-  const productTemplates = useMemo(() => db.services.list().filter((s) => !isServiceDisabled(s.id)), []);
-  const productionFields = service?.fields.filter((f) => f.id !== 'quantity' && f.id !== dimensionFieldId) ?? [];
-
-  const renderProductionField = (f: Service['fields'][number], i: number) => {
-    const v = fieldValues[f.id];
-    const anim = {
-      initial: { opacity: 0, y: 16 },
-      animate: { opacity: 1, y: 0 },
-      transition: { delay: i * 0.04, duration: 0.28, ease: EASE },
-    } as const;
-    if (f.type === 'select' && f.options) {
-      if (f.id === 'faces') {
-        return (
-          <motion.div key={f.id} {...anim}>
-            {fieldLabel(f.label, f.required)}
-            <div className="flex flex-wrap gap-2">
-              {f.options.map((o) => {
-                const active = v === o.id;
-                return (
-                  <button
-                    key={o.id}
-                    type="button"
-                    onClick={() => setField(f.id, o.id)}
-                    className={cn(
-                      'flex items-center gap-2 rounded-[10px] border px-4 py-2.5 text-[14px] transition-all',
-                      active
-                        ? 'border-[var(--cyan-600)] bg-[var(--cyan-50)] font-semibold text-[var(--ink-900)]'
-                        : 'border-[var(--line-strong)] bg-white text-[var(--ink-700)] hover:border-[var(--cyan-500)]',
-                    )}
-                  >
-                    {active && <Check size={14} className="text-[var(--cyan-600)]" />}
-                    <span dir="ltr" className="font-latin">{o.latinLabel ?? o.label}</span>
-                    <span className="text-[13px] text-[var(--ink-500)]">{o.label}</span>
-                  </button>
-                );
-              })}
-            </div>
-          </motion.div>
-        );
-      }
-      return (
-        <motion.div key={f.id} {...anim}>
-          <SelectWithPrice
-            label={f.required ? `${f.label} *` : f.label}
-            options={f.options}
-            value={typeof v === 'string' ? v : undefined}
-            onChange={(id) => setField(f.id, id)}
-          />
-        </motion.div>
-      );
-    }
-    if (f.type === 'yesno') {
-      const opt = f.options?.[0];
-      return (
-        <motion.div key={f.id} {...anim} className="rounded-[10px] border border-[var(--line)] px-4 py-3">
-          <YesNoToggle
-            checked={v === true}
-            onChange={(b) => setField(f.id, b)}
-            label={f.label}
-            latinLabel={f.latinName}
-            priceDelta={opt?.priceDelta}
-            deltaUnit={opt?.deltaUnit}
-          />
-        </motion.div>
-      );
-    }
-    return null;
   };
 
   const stepFields = service && (
-    <SectionCard title="التصاميم والكميات">
+    <SectionCard title={`حقول الخدمة — ${service.name}`}>
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_260px]">
         <div className="space-y-5">
-          <div>
-            {fieldLabel('قالب سريع', false, 'القالب يملأ المقاس الافتراضي فقط؛ الورق والطباعة في المرحلة التالية')}
-            <select
-              value={serviceId ?? ''}
-              onChange={(e) => selectService(e.target.value)}
-              className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] bg-white px-3 text-[14px] outline-none focus:border-[var(--cyan-600)]"
-            >
-              {productTemplates.map((template) => (
-                <option key={template.id} value={template.id}>
-                  {template.name}{template.latinName ? ` — ${template.latinName}` : ''}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className="space-y-3">
-            {designs.map((design, index) => (
-              <motion.div
-                key={design.id}
-                initial={{ opacity: 0, y: 14 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: index * 0.04, duration: 0.28, ease: EASE }}
-                className="rounded-[12px] border border-[var(--line)] bg-white p-4"
-              >
-                <div className="mb-3 flex items-center justify-between gap-2">
-                  <input
-                    value={design.name}
-                    onChange={(e) => updateDesign(design.id, { name: e.target.value })}
-                    className="h-9 min-w-0 flex-1 rounded-[8px] border border-transparent bg-[var(--paper-100)] px-3 text-[14px] font-semibold outline-none focus:border-[var(--cyan-600)] focus:bg-white"
+          {service.fields.map((f, i) => {
+            const v = fieldValues[f.id];
+            const anim = {
+              initial: { opacity: 0, y: 16 },
+              animate: { opacity: 1, y: 0 },
+              transition: { delay: i * 0.05, duration: 0.3, ease: EASE },
+            } as const;
+            if (f.type === 'number') {
+              return (
+                <motion.div key={f.id} {...anim}>
+                  <NumberField
+                    label={f.required ? `${f.label} *` : f.label}
+                    value={typeof v === 'number' ? v : Number(v) || undefined}
+                    onChange={(n) => setField(f.id, n)}
+                    min={f.min}
+                    max={f.max}
+                    step={f.step ?? 1}
+                    unitSuffix={f.id === 'quantity' ? 'نسخة' : undefined}
+                    presets={f.id === 'quantity' ? QTY_PRESETS : undefined}
                   />
-                  <button
-                    type="button"
-                    onClick={() => removeDesign(design.id)}
-                    className="grid h-8 w-8 place-items-center rounded-[8px] text-[var(--ink-400)] transition-colors hover:bg-[#FEE2E2] hover:text-[var(--danger-600)]"
-                    aria-label="حذف التصميم"
-                  >
-                    <X size={15} />
-                  </button>
-                </div>
-                <div className="grid gap-3 md:grid-cols-[1fr_1fr_150px]">
-                  <label className="text-[12px] font-medium text-[var(--ink-500)]">
-                    العرض mm
-                    <input
-                      dir="ltr"
-                      type="number"
-                      min={1}
-                      value={design.widthMm}
-                      onChange={(e) => updateDesign(design.id, { widthMm: Number(e.target.value) || 0 })}
-                      className="font-latin mt-1 h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)]"
-                    />
-                  </label>
-                  <label className="text-[12px] font-medium text-[var(--ink-500)]">
-                    الطول mm
-                    <input
-                      dir="ltr"
-                      type="number"
-                      min={1}
-                      value={design.heightMm}
-                      onChange={(e) => updateDesign(design.id, { heightMm: Number(e.target.value) || 0 })}
-                      className="font-latin mt-1 h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)]"
-                    />
-                  </label>
-                  <label className="text-[12px] font-medium text-[var(--ink-500)]">
-                    الكمية
-                    <input
-                      dir="ltr"
-                      type="number"
-                      min={1}
-                      step={1}
-                      value={design.quantity}
-                      onChange={(e) => updateDesign(design.id, { quantity: Number(e.target.value) || 0 })}
-                      className="font-latin mt-1 h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)]"
-                    />
-                  </label>
-                </div>
-                <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-[var(--ink-400)]">
-                  {design.artwork && <span dir="ltr" className="rounded-full bg-[var(--paper-100)] px-2 py-0.5">{design.artwork.fileName}</span>}
-                  {design.cutContour && <span className="rounded-full bg-[var(--cyan-50)] px-2 py-0.5 text-[var(--cyan-600)]">tracé découpe مرتبط</span>}
-                </div>
+                </motion.div>
+              );
+            }
+            if (f.type === 'dimensions') {
+              return (
+                <motion.div key={f.id} {...anim}>
+                  {f.id === 'format' && (
+                    <p className="mb-1 text-[11px] text-[var(--ink-400)]">المقاس النهائي بعد القص، بدون Bleed.</p>
+                  )}
+                  <DimensionGroup
+                    label={f.required ? `${f.label} *` : f.label}
+                    value={isDim(v) ? v : { widthMm: 0, heightMm: 0 }}
+                    onChange={(d) => setField(f.id, d)}
+                    unit={unit}
+                    onUnitChange={setUnit}
+                  />
+                </motion.div>
+              );
+            }
+            if (f.type === 'select' && f.options) {
+              // الوجوه (Recto / Recto Verso) render as radio cards, others as dropdown
+              if (f.id === 'faces') {
+                return (
+                  <motion.div key={f.id} {...anim}>
+                    {fieldLabel(f.label, f.required)}
+                    <div className="flex flex-wrap gap-2">
+                      {f.options.map((o) => {
+                        const active = v === o.id;
+                        return (
+                          <button
+                            key={o.id}
+                            type="button"
+                            onClick={() => setField(f.id, o.id)}
+                            className={cn(
+                              'flex items-center gap-2 rounded-[10px] border px-4 py-2.5 text-[14px] transition-all',
+                              active
+                                ? 'border-[var(--cyan-600)] bg-[var(--cyan-50)] font-semibold text-[var(--ink-900)]'
+                                : 'border-[var(--line-strong)] bg-white text-[var(--ink-700)] hover:border-[var(--cyan-500)]',
+                            )}
+                          >
+                            {active && <Check size={14} className="text-[var(--cyan-600)]" />}
+                            <span dir="ltr" className="font-latin">{o.latinLabel ?? o.label}</span>
+                            <span className="text-[13px] text-[var(--ink-500)]">{o.label}</span>
+                            {o.priceDelta !== 0 ? (
+                              <span dir="ltr" className="font-latin text-[13px] font-semibold text-[var(--cyan-600)]">
+                                +{o.priceDelta} دج/نسخة
+                              </span>
+                            ) : (
+                              <span className="text-[12px] text-[var(--ink-400)]">أساسي</span>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </motion.div>
+                );
+              }
+              return (
+                <motion.div key={f.id} {...anim}>
+                  <SelectWithPrice
+                    label={f.required ? `${f.label} *` : f.label}
+                    options={f.options}
+                    value={typeof v === 'string' ? v : undefined}
+                    onChange={(id) => setField(f.id, id)}
+                  />
+                </motion.div>
+              );
+            }
+            if (f.type === 'yesno') {
+              const opt = f.options?.[0];
+              return (
+                <motion.div key={f.id} {...anim} className="rounded-[10px] border border-[var(--line)] px-4 py-3">
+                  <YesNoToggle
+                    checked={v === true}
+                    onChange={(b) => setField(f.id, b)}
+                    label={f.label}
+                    latinLabel={f.latinName}
+                    priceDelta={opt?.priceDelta}
+                    deltaUnit={opt?.deltaUnit}
+                  />
+                </motion.div>
+              );
+            }
+            // text
+            return (
+              <motion.div key={f.id} {...anim}>
+                {fieldLabel(f.label, f.required)}
+                <input
+                  value={typeof v === 'string' ? v : ''}
+                  onChange={(e) => setField(f.id, e.target.value)}
+                  placeholder={f.placeholder}
+                  className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
+                />
               </motion.div>
-            ))}
-          </div>
-
-          <button
-            type="button"
-            onClick={addBlankDesign}
-            className="flex h-10 items-center gap-1.5 rounded-[10px] border border-[var(--line-strong)] bg-white px-4 text-[14px] font-medium text-[var(--ink-700)] hover:bg-[var(--paper-100)]"
-          >
-            <Plus size={15} />
-            إضافة تصميم
-          </button>
-
-          <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.18, duration: 0.3, ease: EASE }}>
+            );
+          })}
+          <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: service.fields.length * 0.05, duration: 0.3, ease: EASE }}>
             {fieldLabel('ملفات التصميم و tracé découpe')}
             <DesignFileUploader
               stickers={uploadStickers}
@@ -2039,8 +1759,7 @@ export default function DevisCreate() {
             </div>
           </motion.div>
           <div className="mt-2 space-y-1 text-[11px] text-[var(--ink-400)]">
-            <div className="flex justify-between"><span>التصاميم</span><span dir="ltr" className="font-latin">{activeDesigns.length}</span></div>
-            <div className="flex justify-between"><span>إجمالي الكمية</span><span dir="ltr" className="font-latin">{quantity}</span></div>
+            <div className="flex justify-between"><span>الكمية</span><span dir="ltr" className="font-latin">{quantity}</span></div>
             {montage && (
               <div className="flex justify-between"><span>الأوراق</span><span dir="ltr" className="font-latin">{montage.sheetsNeeded}</span></div>
             )}
@@ -2058,32 +1777,14 @@ export default function DevisCreate() {
 
   const stepMontage = (
     <SectionCard
-      title="الإنتاج والمونتاج"
+      title="المونتاج والحساب المتقدم"
       actions={
         <span className="inline-flex items-center gap-1 rounded-full bg-[var(--paper-100)] px-2.5 py-1 text-[11px] font-medium text-[var(--ink-500)]">
           <Sparkles size={12} className="text-[var(--cyan-600)]" />
-          يحسب عدد الأوراق الحقيقي
+          اختياري / متقدم
         </span>
       }
     >
-      <div className="mb-5 rounded-[12px] border border-[var(--line)] bg-[var(--paper-50)] p-4">
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <h3 className="text-[15px] font-semibold text-[var(--ink-900)]">إعدادات الإنتاج</h3>
-            <p className="mt-0.5 text-[12px] text-[var(--ink-500)]">هذه القيم تطبق على مجموعة التصاميم الحالية، ويمكن تقسيمها لاحقًا إذا اختلف الورق أو طريقة الطباعة.</p>
-          </div>
-          <div className="rounded-full bg-white px-3 py-1 text-[12px] text-[var(--ink-500)] ring-1 ring-[var(--line)]">
-            <span dir="ltr" className="font-latin">{activeDesigns.length}</span> تصاميم ·{' '}
-            <span dir="ltr" className="font-latin">{quantity}</span> نسخة
-          </div>
-        </div>
-        <div className="grid gap-4 md:grid-cols-2">
-          {productionFields.length > 0 ? productionFields.map(renderProductionField) : (
-            <p className="text-[13px] text-[var(--ink-500)]">لا توجد حقول إنتاج إضافية لهذا القالب.</p>
-          )}
-        </div>
-      </div>
-
       {montageLoading ? (
         <div className="space-y-3" aria-busy="true">
           {[0, 1, 2].map((i) => (
@@ -2119,20 +1820,6 @@ export default function DevisCreate() {
               className="h-12 rounded-[10px] px-4 text-[14px] font-medium text-[var(--ink-500)] underline decoration-transparent underline-offset-4 transition-all hover:text-[var(--ink-700)] hover:decoration-[var(--ink-400)]"
             >
               تخطَّ (سعر يدوي)
-            </button>
-            <Link
-              to="/montage"
-              onClick={openStudioWithCurrentJob}
-              className="flex h-12 items-center gap-2 rounded-[10px] border border-[var(--line-strong)] bg-white px-4 text-[14px] font-semibold text-[var(--ink-700)] transition-colors hover:bg-[var(--paper-100)]"
-            >
-              فتح Studio
-            </Link>
-            <button
-              type="button"
-              onClick={importStudioResult}
-              className="h-12 rounded-[10px] px-4 text-[14px] font-medium text-[var(--ink-500)] transition-colors hover:bg-[var(--paper-200)] hover:text-[var(--ink-700)]"
-            >
-              استيراد مخطط معتمد
             </button>
           </div>
         </div>
@@ -2185,18 +1872,10 @@ export default function DevisCreate() {
                   </button>
                   <Link
                     to="/montage"
-                    onClick={openStudioWithCurrentJob}
                     className="flex h-9 items-center gap-1.5 rounded-[8px] border border-[var(--line-strong)] bg-white px-3 text-[13px] font-medium text-[var(--ink-700)] transition-colors hover:bg-[var(--paper-100)]"
                   >
                     تعديل في الاستوديو
                   </Link>
-                  <button
-                    type="button"
-                    onClick={importStudioResult}
-                    className="flex h-9 items-center gap-1.5 rounded-[8px] border border-[var(--line-strong)] bg-white px-3 text-[13px] font-medium text-[var(--ink-700)] transition-colors hover:bg-[var(--paper-100)]"
-                  >
-                    استيراد من Studio
-                  </button>
                   <button
                     type="button"
                     onClick={() => {
@@ -2319,34 +1998,6 @@ export default function DevisCreate() {
               </motion.li>
             ))}
           </ul>
-          {designAllocations.length > 0 && (
-            <div className="mt-5 overflow-hidden rounded-[12px] border border-[var(--line)]">
-              <div className="border-b border-[var(--line)] bg-[var(--paper-50)] px-3 py-2 text-[13px] font-semibold text-[var(--ink-800)]">
-                سعر كل تصميم داخل الورقة
-              </div>
-              <div className="divide-y divide-[var(--line)]">
-                {designAllocations.map((row) => (
-                  <div key={row.designId} className="grid grid-cols-[minmax(0,1fr)_90px_90px] gap-2 px-3 py-2 text-[12px]">
-                    <div className="min-w-0">
-                      <div className="truncate font-medium text-[var(--ink-900)]">{row.name}</div>
-                      <div className="text-[11px] text-[var(--ink-400)]">
-                        <span dir="ltr" className="font-latin">{row.copiesPerSheet}</span> في الورقة ·{' '}
-                        <span dir="ltr" className="font-latin">{row.areaShare}%</span> من التكلفة
-                      </div>
-                    </div>
-                    <div className="text-end">
-                      <div className="text-[var(--ink-400)]">الوحدة</div>
-                      <div dir="ltr" className="font-latin font-semibold text-[var(--ink-900)]">{formatDA(row.unitPrice)}</div>
-                    </div>
-                    <div className="text-end">
-                      <div className="text-[var(--ink-400)]">الإجمالي</div>
-                      <div dir="ltr" className="font-latin font-semibold text-[var(--cyan-600)]">{formatDA(row.allocatedTotal)}</div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
         </div>
 
         {/* totals + margin editor */}
@@ -2537,9 +2188,7 @@ export default function DevisCreate() {
     </div>
   );
 
-  void stepSection;
-  void stepService;
-  const stepContent = [stepInfo, stepFields, stepMontage, stepReview, stepDone][step];
+  const stepContent = [stepSection, stepService, stepInfo, stepFields, stepMontage, stepReview, stepDone][step];
 
   // ------------------------------- render ------------------------------------
 
@@ -2563,7 +2212,7 @@ export default function DevisCreate() {
                 مسودة <span dir="ltr" className="font-latin font-semibold">{savedDevis.number}</span> — تُحفظ تلقائيًا
               </>
             ) : (
-              '4 مراحل سريعة — التصاميم أولًا ثم الإنتاج والسعر.'
+              'سبع خطوات — والسعر بجانب كل خيار.'
             )}
           </p>
         </div>
@@ -2624,18 +2273,17 @@ export default function DevisCreate() {
           </AnimatePresence>
 
           {/* nav */}
-          {step < 4 && (
+          {step < 6 && step > 0 && (
             <div className="mt-6 flex items-center justify-between">
               <button
                 type="button"
                 onClick={() => setStep((s) => Math.max(0, s - 1))}
-                disabled={step === 0}
                 className="flex h-11 items-center gap-1.5 rounded-[10px] px-4 text-[14px] font-medium text-[var(--ink-500)] transition-colors hover:bg-[var(--paper-200)] hover:text-[var(--ink-700)]"
               >
                 <ChevronRight size={16} />
                 رجوع
               </button>
-              {step < 2 && (
+              {step < 4 && (
                 <button
                   type="button"
                   onClick={tryNext}
@@ -2646,7 +2294,7 @@ export default function DevisCreate() {
                   <ChevronLeft size={16} />
                 </button>
               )}
-              {step === 2 && (
+              {step === 4 && (
                 <button
                   type="button"
                   onClick={() => {
@@ -2663,7 +2311,7 @@ export default function DevisCreate() {
                   <ChevronLeft size={16} />
                 </button>
               )}
-              {step === 3 && (
+              {step === 5 && (
                 <button
                   type="button"
                   onClick={addItem}
@@ -2714,16 +2362,7 @@ export default function DevisCreate() {
                         <span dir="ltr" className="font-latin">{it.serviceName}</span>
                       </div>
                       <div className="text-[11px] text-[var(--ink-400)]">
-                        {it.designs && it.designs.length > 1 ? (
-                          <>
-                            <span dir="ltr" className="font-latin">{it.designs.length}</span> تصاميم ·{' '}
-                            <span dir="ltr" className="font-latin">{it.montageResult?.sheetsNeeded ?? '—'}</span> ورقة
-                          </>
-                        ) : (
-                          <>
-                            <span dir="ltr" className="font-latin">{it.quantity}</span> نسخة
-                          </>
-                        )}
+                        <span dir="ltr" className="font-latin">{it.quantity}</span> نسخة
                       </div>
                     </div>
                     <span dir="ltr" className="font-latin shrink-0 text-[13px] font-semibold tabular-nums text-[var(--ink-900)]">
