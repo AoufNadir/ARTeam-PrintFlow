@@ -30,8 +30,6 @@ export default function RulesTab({ service, rulesKey, onRulesChanged }: Props) {
   const [editValue, setEditValue] = useState('');
   const [flashId, setFlashId] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [formulaUnlocked, setFormulaUnlocked] = useState(false);
-  const [confirmUnlock, setConfirmUnlock] = useState(false);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps -- rulesKey is an intentional bump key: re-read rules from storage after each publish
   const version = useMemo(() => db.currentRulesVersion(), [rulesKey]);
@@ -160,26 +158,16 @@ export default function RulesTab({ service, rulesKey, onRulesChanged }: Props) {
       {/* formula mini-builder */}
       <div className="rounded-[12px] border border-[var(--line)] bg-white p-4">
         <div className="mb-3 flex items-center justify-between">
-          <h4 className="text-[14px] font-semibold text-[var(--ink-900)]">ترتيب الحساب (معادلة المرحلة)</h4>
-          {formulaUnlocked ? (
-            <Chip tint="warning">وضع التعديل المتقدم</Chip>
-          ) : (
-            <Btn variant="ghost" size="sm" onClick={() => setConfirmUnlock(true)}>
-              <Lock size={13} /> تعديل متقدم
-            </Btn>
-          )}
+          <h4 className="text-[14px] font-semibold text-[var(--ink-900)]">ترتيب الحساب</h4>
+          <Chip tint="paper">للعرض فقط</Chip>
         </div>
         <div dir="ltr" className="flex flex-wrap items-center gap-1.5 text-[13px]">
           {['تكلفة الورق', 'تكلفة الطباعة', 'القص', 'التشطيب'].map((t, i) => (
             <span key={t} className="flex items-center gap-1.5">
               {i > 0 && <span className="font-latin text-[var(--ink-400)]">+</span>}
               <span
-                className={cn(
-                  'inline-flex items-center gap-1 rounded-full border border-[var(--line)] bg-[var(--paper-100)] px-2.5 py-1 text-[12px] font-medium text-[var(--ink-700)]',
-                  formulaUnlocked && 'cursor-grab border-[var(--cyan-500)] bg-[var(--cyan-50)]',
-                )}
+                className="inline-flex items-center gap-1 rounded-full border border-[var(--line)] bg-[var(--paper-100)] px-2.5 py-1 text-[12px] font-medium text-[var(--ink-700)]"
               >
-                {formulaUnlocked && <GripVertical size={11} className="text-[var(--ink-400)]" />}
                 {t}
               </span>
             </span>
@@ -190,45 +178,12 @@ export default function RulesTab({ service, rulesKey, onRulesChanged }: Props) {
               <span className="rounded-full border border-[var(--cyan-100)] bg-[var(--cyan-50)] px-2.5 py-1 text-[12px] font-medium text-[var(--cyan-600)]">{t}</span>
             </span>
           ))}
-          {formulaUnlocked && (
-            <button type="button" className="grid h-7 w-7 place-items-center rounded-full border border-dashed border-[var(--line-strong)] text-[var(--ink-400)] hover:border-[var(--cyan-500)] hover:text-[var(--cyan-600)]">
-              <Plus size={13} />
-            </button>
-          )}
         </div>
         <p className="mt-2 text-[11px] text-[var(--ink-400)]">
-          وضع القراءة الآمن مفعّل افتراضيًا — المعادلة تُبنى تلقائيًا من القواعد المفعّلة.
+          هذا هو الترتيب الفعلي في محرك التسعير — يُبنى تلقائيًا من القواعد المفعّلة ولا يُعدَّل يدويًا.
         </p>
       </div>
 
-      {/* unlock confirm */}
-      <Modal
-        open={confirmUnlock}
-        onClose={() => setConfirmUnlock(false)}
-        title="تعديل متقدم للمعادلة"
-        size="sm"
-        footer={
-          <>
-            <Btn variant="ghost" onClick={() => setConfirmUnlock(false)}>
-              إلغاء
-            </Btn>
-            <Btn
-              variant="danger"
-              onClick={() => {
-                setFormulaUnlocked(true);
-                setConfirmUnlock(false);
-                toast.warning('فُتح وضع التعديل المتقدم — رتّب الرموز بحذر');
-              }}
-            >
-              فتح التعديل
-            </Btn>
-          </>
-        }
-      >
-        <p className="text-[13px] leading-5 text-[var(--ink-700)]">
-          تغيير ترتيب الحساب قد يكسر أسعار الخدمة. هل أنت متأكد أنك تريد فتح وضع التعديل المتقدم؟
-        </p>
-      </Modal>
 
       <HistoryModal open={historyOpen} onClose={() => setHistoryOpen(false)} current={version} onRestored={onRulesChanged} />
     </div>

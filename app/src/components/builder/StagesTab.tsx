@@ -20,8 +20,6 @@ export default function StagesTab({ service, meta, setMeta, onUpdate }: Props) {
   const stages = service.stages ?? [];
   const conditional = meta.conditionalStages[service.id] ?? [];
   const [adderAt, setAdderAt] = useState<number | null>(null); // insertion index
-  const [editingIdx, setEditingIdx] = useState<number | null>(null);
-  const [nameDraft, setNameDraft] = useState('');
 
   const setStages = (next: string[]) => onUpdate({ stages: next });
 
@@ -68,27 +66,11 @@ export default function StagesTab({ service, meta, setMeta, onUpdate }: Props) {
                   className="group relative w-56 rounded-[14px] border border-[var(--line)] bg-white p-4 shadow-[var(--shadow-card)]"
                 >
                   <div className="mb-2 flex items-start justify-between gap-2">
-                    {editingIdx === i ? (
-                      <input
-                        autoFocus
-                        value={nameDraft}
-                        onChange={(e) => setNameDraft(e.target.value)}
-                        onBlur={() => setEditingIdx(null)}
-                        onKeyDown={(e) => e.key === 'Enter' && setEditingIdx(null)}
-                        className="h-8 w-full rounded-[6px] border border-[var(--cyan-600)] px-2 text-[13px] outline-none"
-                      />
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEditingIdx(i);
-                          setNameDraft(stageLabel(st));
-                        }}
-                        className="text-start text-[14px] font-semibold text-[var(--ink-900)] hover:text-[var(--cyan-600)]"
-                      >
-                        {stageLabel(st)}
-                      </button>
-                    )}
+                    {/* stage names come from a fixed vocabulary (STAGE_DEFS) —
+                        the old inline rename discarded whatever was typed */}
+                    <span className="text-start text-[14px] font-semibold text-[var(--ink-900)]">
+                      {stageLabel(st)}
+                    </span>
                     <button
                       type="button"
                       aria-label="إزالة المرحلة"

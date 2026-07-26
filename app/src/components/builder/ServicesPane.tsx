@@ -53,7 +53,17 @@ export default function ServicesPane({ section, services, meta, setMeta, activeI
       fields: [
         { id: 'quantity', label: 'الكمية', type: 'number', required: true, min: 1, step: 50, defaultValue: 500 },
       ],
-      pricingRuleIds: ['rule-waste', 'rule-overhead', 'rule-margin'],
+      // Base cost rules must be attached, not just the percentages: waste /
+      // overhead / margin all multiply the production cost, so a service with
+      // only those three prices every quote at zero.
+      pricingRuleIds: [
+        'rule-paper-sheet',
+        'rule-print-face-digital',
+        'rule-cut-sheet',
+        'rule-waste',
+        'rule-overhead',
+        'rule-margin',
+      ],
       stages: ['impression'],
     };
     if (template !== 'empty') {

@@ -9,8 +9,16 @@ export type Unit = 'mm' | 'cm';
 
 export type FieldType = 'number' | 'select' | 'yesno' | 'text' | 'dimensions';
 
-/** Unit basis shown next to a price delta, e.g. "+10 دج/نسخة" */
-export type DeltaUnit = 'perCopy' | 'perSheet' | 'perFace' | 'perM2' | 'fixed' | 'percent';
+/**
+ * Unit basis shown next to a price delta, e.g. "+10 دج/نسخة".
+ *
+ * `perM2` is the area of ONE FINISHED PIECE × quantity — right for grand format,
+ * where the piece is what gets printed. `perSheetM2` is the area of the PRESS
+ * SHEET × sheet count — the correct basis for anything applied to whole sheets
+ * before cutting (lamination, varnish), where per-copy pricing swings wildly
+ * with piece size.
+ */
+export type DeltaUnit = 'perCopy' | 'perSheet' | 'perFace' | 'perM2' | 'perSheetM2' | 'fixed' | 'percent';
 
 export interface FieldOption {
   id: string;
@@ -57,7 +65,7 @@ export interface Section {
 
 // ------------------------------- Pricing rules -----------------------------
 
-export type PricingBasis = 'perSheet' | 'perFace' | 'perM2' | 'perCopy' | 'fixed' | 'percent';
+export type PricingBasis = 'perSheet' | 'perFace' | 'perM2' | 'perSheetM2' | 'perCopy' | 'fixed' | 'percent';
 
 export interface PricingRule {
   id: string;
@@ -68,6 +76,15 @@ export interface PricingRule {
   appliesTo?: 'paper' | 'printing' | 'cutting' | 'finishing' | 'global';
   /** Semantic key for global percent rules — robust alternative to id-string matching */
   kind?: 'waste' | 'overhead' | 'margin';
+  /**
+   * Apply only when this service field is chosen. Lets a finishing price live in
+   * the versioned rule set (editable in Settings, frozen into every Devis)
+   * instead of being buried in a field option the user cannot find.
+   * A yes/no field must be `true`; a select field must hold a non-empty value.
+   */
+  requiresField?: string;
+  /** Narrow `requiresField` further to specific select-option ids. */
+  requiresOption?: string[];
   enabled: boolean;
 }
 

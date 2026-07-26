@@ -32,6 +32,11 @@ export interface PriceInput {
   facesPerSheet?: 1 | 2;
   /** area of ONE piece in m² (for perM2 bases) */
   pieceAreaM2?: number;
+  /**
+   * Area of ONE PRESS SHEET in m² (for the perSheetM2 basis). Comes from the
+   * montage result; falls back to DEFAULT_SHEET when no montage ran.
+   */
+  sheetAreaM2?: number;
   /** size of ONE piece in mm — used to estimate sheets when no montage ran */
   pieceSize?: DimensionValue;
   /** extra priced option deltas already resolved (DA per deltaUnit) */
@@ -57,6 +62,9 @@ function round(n: number): number {
  * result always wins when available.
  */
 export const DEFAULT_SHEET = { widthMm: 320, heightMm: 450, marginMm: 5, bleedMm: 4 } as const;
+
+/** Area of DEFAULT_SHEET in m² — the perSheetM2 fallback when no montage ran. */
+export const DEFAULT_SHEET_AREA_M2 = (DEFAULT_SHEET.widthMm / 1000) * (DEFAULT_SHEET.heightMm / 1000);
 
 /** How many pieces of `piece` fit on the default sheet (best of the two rotations). */
 export function estimateCopiesPerSheet(piece: DimensionValue): number {
@@ -131,6 +139,9 @@ export function computePrice(input: PriceInput): PriceBreakdown {
   const sheets = input.sheetsNeeded ?? estimateSheets(quantity, input.pieceSize);
   const faces = input.facesPerSheet ?? 1;
   const totalM2 = (input.pieceAreaM2 ?? 0) * quantity;
+  // whole-sheet area actually run through the press (lamination, varnish…)
+  const sheetAreaM2 = input.sheetAreaM2 ?? DEFAULT_SHEET_AREA_M2;
+  const totalSheetM2 = sheetAreaM2 * sheets;
 
   const out = { ...EMPTY };
 
@@ -151,6 +162,7 @@ export function computePrice(input: PriceInput): PriceBreakdown {
       case 'perSheet': addTo(od.category, od.delta * sheets); break;
       case 'perFace': addTo(od.category, od.delta * sheets * faces); break;
       case 'perM2': addTo(od.category, od.delta * totalM2); break;
+      case 'perSheetM2': addTo(od.category, od.delta * totalSheetM2); break;
       case 'fixed': addTo(od.category, od.delta); break;
       default: break;
     }
@@ -163,6 +175,7 @@ export function computePrice(input: PriceInput): PriceBreakdown {
       case 'perSheet': addTo(cat, rule.value * sheets); break;
       case 'perFace': addTo(cat, rule.value * sheets * faces); break;
       case 'perM2': addTo(cat, rule.value * totalM2); break;
+      case 'perSheetM2': addTo(cat, rule.value * totalSheetM2); break;
       case 'perCopy': addTo(cat, rule.value * quantity); break;
       case 'fixed': addTo(cat, rule.value); break;
       default: break;
@@ -205,6 +218,18 @@ export function computePrice(input: PriceInput): PriceBreakdown {
   out.waste = round(out.waste);
   out.overhead = round(out.overhead);
   return out;
+}
+
+/**
+ * Is a conditional rule active for these field values? Rules without
+ * `requiresField` are unconditional and always pass.
+ */
+export function ruleConditionMet(rule: PricingRule, fieldValues: FieldValues): boolean {
+  if (!rule.requiresField) return true;
+  const v = fieldValues[rule.requiresField];
+  if (v === undefined || v === null || v === false || v === '') return false;
+  if (rule.requiresOption?.length) return typeof v === 'string' && rule.requiresOption.includes(v);
+  return true;
 }
 
 // --------------------------- service-level helper ----------------------------
@@ -299,6 +324,10 @@ export function priceItem(
     ? rules.filter((r) => service.pricingRuleIds.includes(r.id))
     : rules;
 
+  // conditional rules: a finishing price attached to a field only counts when
+  // that field was actually chosen (yes/no true, or a matching select option)
+  applicable = applicable.filter((r) => ruleConditionMet(r, fieldValues));
+
   // override the fixed per-sheet paper rule with the catalog paper price
   if (paperRate !== undefined) {
     const rate = paperRate;
@@ -315,5 +344,8 @@ export function priceItem(
     facesPerSheet: montage?.facesPerSheet ?? facesPerSheet,
     pieceAreaM2,
     pieceSize,
+    sheetAreaM2: montage
+      ? (montage.sheetWidthMm / 1000) * (montage.sheetHeightMm / 1000)
+      : undefined,
   });
 }

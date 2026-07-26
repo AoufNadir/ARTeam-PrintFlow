@@ -10,6 +10,7 @@
 import {
   SEED_MACHINES,
   SEED_PAPERS,
+  SEED_PRICING_RULES,
   SEED_RULES_VERSION,
   SEED_SECTIONS,
   SEED_SERVICES,
@@ -31,7 +32,7 @@ import { DEFAULT_TVA_RATE, devisTotals } from '@/components/devis/devis-utils';
 
 const PREFIX = 'arteam-printflow:';
 const SEEDED_KEY = `${PREFIX}seeded-v1`;
-const DATA_VERSION = 2;
+const DATA_VERSION = 3;
 const SCHEMA_VERSION_KEY = `${PREFIX}schema-version`;
 
 type EntityMap = {
@@ -228,7 +229,62 @@ function migrateStorage(): void {
     rows.length !== migrated.length ||
     rows.some((row, index) => JSON.stringify(row) !== JSON.stringify(migrated[index]));
   if (changed) writeAll('devis', migrated);
+  if (current < 3) migrateFinishingRules();
   localStorage.setItem(SCHEMA_VERSION_KEY, String(DATA_VERSION));
+}
+
+/**
+ * v3 — finishing costs moved out of field options into conditional rules.
+ *
+ * Installations seeded before this carry the per-copy pelliculage delta (which
+ * billed a whole-sheet operation per piece) and no rule for arrondi / contour
+ * cut / eyelets at all (silently free). Published rule versions are append-only
+ * history, so this only touches the LIVE catalog and the current rule set —
+ * existing Devis keep their frozen snapshot and their totals never move.
+ */
+function migrateFinishingRules(): void {
+  const FINISHING_IDS = SEED_PRICING_RULES.filter((r) => r.requiresField).map((r) => r.id);
+  const bySvc: Record<string, string[]> = {
+    'svc-carte-visite': ['rule-pelliculage', 'rule-arrondi'],
+    'svc-depliant': ['rule-pelliculage'],
+    'svc-etiquettes': ['rule-contour-cut'],
+    'svc-grand-format': ['rule-eyelets'],
+  };
+
+  // 1) add the new rules to the live version, drop the dead perM2 pelliculage
+  const version = list('pricingRuleVersions').reduce(
+    (a, b) => (b.version > a.version ? b : a),
+    list('pricingRuleVersions')[0] ?? SEED_RULES_VERSION,
+  );
+  const have = new Set(version.rules.map((r) => r.id));
+  const additions = SEED_PRICING_RULES.filter((r) => FINISHING_IDS.includes(r.id) && !have.has(r.id));
+  if (additions.length > 0 || have.has('rule-pelliculage-m2')) {
+    const rules = [...version.rules.filter((r) => r.id !== 'rule-pelliculage-m2'), ...additions];
+    const versions = list('pricingRuleVersions').map((v) => (v.id === version.id ? { ...v, rules } : v));
+    writeAll('pricingRuleVersions', versions);
+  }
+
+  // 2) attach them to their services and neutralise the per-copy pelliculage delta
+  const services = list('services').map((svc) => {
+    let next = svc;
+    const wanted = (bySvc[svc.id] ?? []).filter((id) => !svc.pricingRuleIds.includes(id));
+    if (wanted.length > 0) {
+      next = { ...next, pricingRuleIds: [...next.pricingRuleIds, ...wanted] };
+    }
+    const pell = next.fields.find((f) => f.id === 'pelliculage');
+    if (pell?.options?.some((o) => o.priceDelta !== 0)) {
+      next = {
+        ...next,
+        fields: next.fields.map((f) =>
+          f.id === 'pelliculage'
+            ? { ...f, options: f.options?.map((o) => ({ ...o, priceDelta: 0 })) }
+            : f,
+        ),
+      };
+    }
+    return next;
+  });
+  writeAll('services', services);
 }
 
 function devisHasSendBlocker(devis: Devis): boolean {

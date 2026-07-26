@@ -20,7 +20,19 @@ export const SEED_PRICING_RULES: PricingRule[] = [
   { id: 'rule-print-face-offset', name: 'طباعة أوفست للوجه', latinName: 'Impression offset / face', basis: 'perFace', value: 7, appliesTo: 'printing', enabled: true },
   { id: 'rule-offset-setup', name: 'تحضير الأوفست', latinName: 'Calage offset', basis: 'fixed', value: 4500, appliesTo: 'printing', enabled: true },
   { id: 'rule-cut-sheet', name: 'القص', latinName: 'Coupe', basis: 'perSheet', value: 2.5, appliesTo: 'cutting', enabled: true },
-  { id: 'rule-pelliculage-m2', name: 'التغليف البلاستيكي', latinName: 'Pelliculage', basis: 'perM2', value: 90, appliesTo: 'finishing', enabled: true },
+  // Finishing prices live here (not inside field options) so they are editable
+  // in Settings, versioned, and frozen into every Devis. Each one is CONDITIONAL
+  // on the field that offers it, so it only costs money when actually chosen.
+  //
+  // Pelliculage is billed on the area of the PRESS SHEET, because the whole
+  // sheet goes through the laminator before cutting. Billing it per copy made
+  // the same job swing from ~60 DA/sheet (business cards) to a few DA/sheet
+  // (A4 flyers) for identical work.
+  { id: 'rule-pelliculage', name: 'التغليف البلاستيكي', latinName: 'Pelliculage', basis: 'perSheetM2', value: 90, appliesTo: 'finishing', requiresField: 'pelliculage', requiresOption: ['pell-mat', 'pell-brillant'], enabled: true },
+  // Priced at 0 until the shop sets its real rate in Settings → قواعد التسعير.
+  { id: 'rule-arrondi', name: 'الزوايا المدورة', latinName: 'Coins arrondis', basis: 'perCopy', value: 0, appliesTo: 'cutting', requiresField: 'rounded-corners', enabled: true },
+  { id: 'rule-contour-cut', name: 'القص على المحيط', latinName: 'CutContour', basis: 'perCopy', value: 0, appliesTo: 'cutting', requiresField: 'contour-cut', enabled: true },
+  { id: 'rule-eyelets', name: 'العيون المعدنية', latinName: 'Œillets', basis: 'perCopy', value: 0, appliesTo: 'finishing', requiresField: 'eyelets', enabled: true },
   { id: 'rule-waste', name: 'معامل الهدر', latinName: 'Déchets', basis: 'percent', value: 5, appliesTo: 'global', kind: 'waste', enabled: true },
   { id: 'rule-overhead', name: 'المصاريف العامة', latinName: 'Frais généraux', basis: 'percent', value: 8, appliesTo: 'global', kind: 'overhead', enabled: true },
   { id: 'rule-margin', name: 'هامش الربح', latinName: 'Marge', basis: 'percent', value: 25, appliesTo: 'global', kind: 'margin', enabled: true },
@@ -55,10 +67,12 @@ const facesOptions = [
   { id: 'recto-verso', label: 'وجهان', latinLabel: 'Recto Verso', priceDelta: 2, deltaUnit: 'perCopy' as const },
 ];
 
+// The choice lives here; the PRICE lives in `rule-pelliculage` (perSheetM2),
+// so it stays editable in Settings and cannot be charged twice.
 const pelliculageOptions = [
   { id: 'pell-none', label: 'بدون', latinLabel: 'Sans pelliculage', priceDelta: 0, deltaUnit: 'perCopy' as const },
-  { id: 'pell-mat', label: 'تغليف مطفي', latinLabel: 'Pelliculage Mat', priceDelta: 3, deltaUnit: 'perCopy' as const },
-  { id: 'pell-brillant', label: 'تغليف لامع', latinLabel: 'Pelliculage Brillant', priceDelta: 3, deltaUnit: 'perCopy' as const },
+  { id: 'pell-mat', label: 'تغليف مطفي', latinLabel: 'Pelliculage Mat', priceDelta: 0, deltaUnit: 'perCopy' as const },
+  { id: 'pell-brillant', label: 'تغليف لامع', latinLabel: 'Pelliculage Brillant', priceDelta: 0, deltaUnit: 'perCopy' as const },
 ];
 
 export const SEED_SERVICES: Service[] = [
@@ -71,7 +85,7 @@ export const SEED_SERVICES: Service[] = [
     defaultPieceSize: { widthMm: 85, heightMm: 55 },
     defaultBleedMm: 2,
     stages: ['impression', 'pelliculage', 'coupe'],
-    pricingRuleIds: ['rule-paper-sheet', 'rule-print-face-digital', 'rule-cut-sheet', 'rule-waste', 'rule-overhead', 'rule-margin'],
+    pricingRuleIds: ['rule-paper-sheet', 'rule-print-face-digital', 'rule-cut-sheet', 'rule-pelliculage', 'rule-arrondi', 'rule-waste', 'rule-overhead', 'rule-margin'],
     fields: [
       { id: 'quantity', label: 'الكمية', type: 'number', required: true, min: 50, step: 50, defaultValue: 500 },
       { id: 'paper', label: 'نوع الورق', type: 'select', required: true, defaultValue: 'pap-couche-350', options: paperOptions },
@@ -106,7 +120,7 @@ export const SEED_SERVICES: Service[] = [
     defaultPieceSize: { widthMm: 297, heightMm: 210 },
     defaultBleedMm: 3,
     stages: ['impression', 'pliage', 'coupe'],
-    pricingRuleIds: ['rule-paper-sheet', 'rule-print-face-offset', 'rule-offset-setup', 'rule-cut-sheet', 'rule-waste', 'rule-overhead', 'rule-margin'],
+    pricingRuleIds: ['rule-paper-sheet', 'rule-print-face-offset', 'rule-offset-setup', 'rule-cut-sheet', 'rule-pelliculage', 'rule-waste', 'rule-overhead', 'rule-margin'],
     fields: [
       { id: 'quantity', label: 'الكمية', type: 'number', required: true, min: 250, step: 250, defaultValue: 1000 },
       { id: 'format', label: 'الحجم المفتوح', type: 'dimensions', required: true, defaultValue: { widthMm: 297, heightMm: 210 } },
@@ -128,7 +142,7 @@ export const SEED_SERVICES: Service[] = [
     defaultPieceSize: { widthMm: 60, heightMm: 40 },
     defaultBleedMm: 2,
     stages: ['impression', 'coupe'],
-    pricingRuleIds: ['rule-paper-sheet', 'rule-print-face-digital', 'rule-cut-sheet', 'rule-waste', 'rule-overhead', 'rule-margin'],
+    pricingRuleIds: ['rule-paper-sheet', 'rule-print-face-digital', 'rule-cut-sheet', 'rule-contour-cut', 'rule-waste', 'rule-overhead', 'rule-margin'],
     fields: [
       { id: 'quantity', label: 'الكمية', type: 'number', required: true, min: 100, step: 100, defaultValue: 1000 },
       { id: 'format', label: 'حجم الملصق', type: 'dimensions', required: true, defaultValue: { widthMm: 60, heightMm: 40 } },
@@ -145,7 +159,7 @@ export const SEED_SERVICES: Service[] = [
     defaultPieceSize: { widthMm: 2000, heightMm: 1000 },
     defaultBleedMm: 20,
     stages: ['impression', 'finition'],
-    pricingRuleIds: ['rule-print-face-digital', 'rule-waste', 'rule-overhead', 'rule-margin'],
+    pricingRuleIds: ['rule-print-face-digital', 'rule-eyelets', 'rule-waste', 'rule-overhead', 'rule-margin'],
     fields: [
       { id: 'quantity', label: 'الكمية', type: 'number', required: true, min: 1, step: 1, defaultValue: 1 },
       { id: 'format', label: 'الأبعاد', type: 'dimensions', required: true, defaultValue: { widthMm: 2000, heightMm: 1000 } },

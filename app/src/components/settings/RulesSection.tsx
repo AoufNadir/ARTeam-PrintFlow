@@ -31,6 +31,20 @@ const ROWS: DefaultRow[] = [
   { ruleId: null, label: 'أقل قيمة عرض', suffix: 'دج', fallback: 1500 },
 ];
 
+/**
+ * Finishing operations. Each is charged only when its field is chosen, so a
+ * price of 0 here means the shop does the work for free — hence the explicit
+ * "بلا سعر" warning rather than a silent zero.
+ */
+const FINISHING_ROWS: DefaultRow[] = [
+  { ruleId: 'rule-pelliculage', label: 'التغليف البلاستيكي', suffix: 'دج/م² ورقة', fallback: 90 },
+  { ruleId: 'rule-arrondi', label: 'الزوايا المدورة', suffix: 'دج/نسخة', fallback: 0 },
+  { ruleId: 'rule-contour-cut', label: 'القص على المحيط', suffix: 'دج/نسخة', fallback: 0 },
+  { ruleId: 'rule-eyelets', label: 'العيون المعدنية', suffix: 'دج/نسخة', fallback: 0 },
+];
+
+const ALL_ROWS = [...ROWS, ...FINISHING_ROWS];
+
 const MIN_QUOTE_KEY = 'arteam-printflow:min-quote';
 
 /** Section 4 — قواعد التسعير العامة (#rules): defaults + version history. */
@@ -54,7 +68,7 @@ export default function RulesSection({ rulesKey, onRulesChanged }: Props) {
   };
 
   // dirty = at least one draft holds a VALID number that REALLY differs from the stored value
-  const dirtyRows = ROWS.filter((r) => {
+  const dirtyRows = ALL_ROWS.filter((r) => {
     const v = draftValue(r);
     return v !== undefined && v !== valueOf(r);
   });
@@ -63,7 +77,7 @@ export default function RulesSection({ rulesKey, onRulesChanged }: Props) {
   const saveAll = () => {
     // build the next rule set, skipping non-numeric input entirely
     const next = version.rules.map((r) => {
-      const row = ROWS.find((x) => x.ruleId === r.id);
+      const row = ALL_ROWS.find((x) => x.ruleId === r.id);
       const v = row ? draftValue(row) : undefined;
       return v === undefined ? r : { ...r, value: v };
     });
@@ -96,44 +110,50 @@ export default function RulesSection({ rulesKey, onRulesChanged }: Props) {
     }
   };
 
+  const renderRow = (row: DefaultRow, i: number, warnZero = false) => {
+    const rule = row.ruleId ? version.rules.find((r) => r.id === row.ruleId) : undefined;
+    const invalid = drafts[row.label] !== undefined && draftValue(row) === undefined;
+    const effective = draftValue(row) ?? valueOf(row);
+    return (
+      <motion.div
+        key={row.label}
+        initial={{ opacity: 0, y: 12 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: i * 0.04 }}
+        className="rounded-[10px] border border-[var(--line)] p-3"
+      >
+        <div className="mb-1.5 flex items-center gap-2">
+          <span className="flex-1 text-[13px] font-medium text-[var(--ink-700)]">{row.label}</span>
+          {rule && <Chip tint="cyan">{BASIS_LABELS[rule.basis]}</Chip>}
+        </div>
+        <div className={cn(
+          'flex h-10 items-stretch overflow-hidden rounded-[8px] border bg-white transition-shadow focus-within:shadow-[var(--shadow-focus)]',
+          invalid ? 'border-[var(--danger-600)]' : 'border-[var(--line-strong)] focus-within:border-[var(--cyan-600)]',
+        )}>
+          <input
+            dir="ltr"
+            inputMode="decimal"
+            value={drafts[row.label] ?? String(valueOf(row))}
+            onChange={(e) => setDrafts((d) => ({ ...d, [row.label]: e.target.value }))}
+            className="font-latin w-full px-3 text-[15px] tabular-nums outline-none"
+          />
+          <span className="grid place-items-center border-s border-[var(--line)] bg-[var(--paper-100)] px-3 text-[12px] text-[var(--ink-500)]">
+            {row.suffix}
+          </span>
+        </div>
+        {invalid && <p className="mt-1 text-[11px] text-[var(--danger-600)]">قيمة غير رقمية — ستُتجاهل عند الحفظ</p>}
+        {!invalid && warnZero && effective === 0 && (
+          <p className="mt-1 text-[11px] font-medium text-[#B45309]">بلا سعر — هذه الخطوة تُنفَّذ مجانًا في العروض</p>
+        )}
+      </motion.div>
+    );
+  };
+
   return (
     <div className="space-y-4">
       <SectionCard title="قواعد التسعير العامة">
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {ROWS.map((row, i) => {
-            const rule = row.ruleId ? version.rules.find((r) => r.id === row.ruleId) : undefined;
-            const invalid = drafts[row.label] !== undefined && draftValue(row) === undefined;
-            return (
-              <motion.div
-                key={row.label}
-                initial={{ opacity: 0, y: 12 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: i * 0.04 }}
-                className="rounded-[10px] border border-[var(--line)] p-3"
-              >
-                <div className="mb-1.5 flex items-center gap-2">
-                  <span className="flex-1 text-[13px] font-medium text-[var(--ink-700)]">{row.label}</span>
-                  {rule && <Chip tint="cyan">{BASIS_LABELS[rule.basis]}</Chip>}
-                </div>
-                <div className={cn(
-                  'flex h-10 items-stretch overflow-hidden rounded-[8px] border bg-white transition-shadow focus-within:shadow-[var(--shadow-focus)]',
-                  invalid ? 'border-[var(--danger-600)]' : 'border-[var(--line-strong)] focus-within:border-[var(--cyan-600)]',
-                )}>
-                  <input
-                    dir="ltr"
-                    inputMode="decimal"
-                    value={drafts[row.label] ?? String(valueOf(row))}
-                    onChange={(e) => setDrafts((d) => ({ ...d, [row.label]: e.target.value }))}
-                    className="font-latin w-full px-3 text-[15px] tabular-nums outline-none"
-                  />
-                  <span className="grid place-items-center border-s border-[var(--line)] bg-[var(--paper-100)] px-3 text-[12px] text-[var(--ink-500)]">
-                    {row.suffix}
-                  </span>
-                </div>
-                {invalid && <p className="mt-1 text-[11px] text-[var(--danger-600)]">قيمة غير رقمية — ستُتجاهل عند الحفظ</p>}
-              </motion.div>
-            );
-          })}
+          {ROWS.map((row, i) => renderRow(row, i))}
         </div>
         <div className="mt-3 flex items-center justify-between gap-3">
           <p className="text-[11px] text-[var(--ink-400)]">القواعد الخاصة بالخدمة تتجاوز هذه القيم.</p>
@@ -147,6 +167,15 @@ export default function RulesSection({ rulesKey, onRulesChanged }: Props) {
               </Btn>
             </motion.div>
           )}
+        </div>
+      </SectionCard>
+
+      <SectionCard title="أسعار التشطيب">
+        <p className="mb-3 text-[12px] text-[var(--ink-500)]">
+          تُحتسب فقط عند اختيار الخيار في العرض. التغليف يُحسب على مساحة الورقة المطبوعة كاملةً — لأن الورقة كلها تمرّ في آلة التغليف قبل القص.
+        </p>
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          {FINISHING_ROWS.map((row, i) => renderRow(row, i, true))}
         </div>
       </SectionCard>
 

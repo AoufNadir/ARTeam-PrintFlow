@@ -16,8 +16,8 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import type { DeltaUnit, FieldOption, FieldType, Service, ServiceField } from '@/lib/types';
-import { uid } from '@/lib/storage';
-import { DELTA_UNIT_LABELS } from '@/lib/units';
+import { db, uid } from '@/lib/storage';
+import { BASIS_LABELS, DELTA_UNIT_LABELS } from '@/lib/units';
 import PriceChip from '@/components/ds/PriceChip';
 import YesNoToggle from '@/components/ds/YesNoToggle';
 import { Btn, Chip, FieldLabel, inputCls } from '@/components/settings/Overlay';
@@ -52,6 +52,13 @@ export default function FieldsTab({ service, onUpdate }: Props) {
 
   const fields = service.fields;
   const selected = fields.find((f) => f.id === selectedId) ?? null;
+
+  // conditional rules that price this field — their value lives in Settings
+  const linkedRules = selected
+    ? db
+        .currentRules()
+        .filter((r) => r.requiresField === selected.id && service.pricingRuleIds.includes(r.id))
+    : [];
 
   const setFields = (next: ServiceField[]) => onUpdate({ fields: next });
 
@@ -270,17 +277,9 @@ export default function FieldsTab({ service, onUpdate }: Props) {
                 </div>
               )}
               {selected.type === 'dimensions' && (
-                <div>
-                  <FieldLabel>الوحدة الافتراضية</FieldLabel>
-                  <div dir="ltr" className="flex w-32 overflow-hidden rounded-[8px] border border-[var(--line-strong)]">
-                    {(['mm', 'cm'] as const).map((u) => (
-                      <span key={u} className={cn('font-latin flex-1 py-1.5 text-center text-[12px] font-semibold', u === 'mm' ? 'bg-[var(--cyan-600)] text-white' : 'bg-white text-[var(--ink-500)]')}>
-                        {u}
-                      </span>
-                    ))}
-                  </div>
-                  <p className="mt-1 text-[11px] text-[var(--ink-400)]">التخزين الداخلي بالمليمتر دائمًا — التحويل تلقائي.</p>
-                </div>
+                <p className="text-[11px] text-[var(--ink-400)]">
+                  التخزين الداخلي بالمليمتر دائمًا — الوحدة المعروضة تُختار من العرض نفسه.
+                </p>
               )}
               {selected.type === 'select' && (
                 <OptionsEditor field={selected} onChange={(opts) => patchField(selected.id, { options: opts })} />
@@ -290,11 +289,21 @@ export default function FieldsTab({ service, onUpdate }: Props) {
               )}
               <div>
                 <FieldLabel>ربط بقاعدة تسعير</FieldLabel>
-                <div className="flex h-10 items-center rounded-[8px] border border-[var(--line)] bg-[var(--paper-100)] px-3 text-[13px] text-[var(--ink-500)]">
-                  {RULE_LINKS[selected.id] ? (
+                <div className="rounded-[8px] border border-[var(--line)] bg-[var(--paper-100)] px-3 py-2.5 text-[13px] text-[var(--ink-500)]">
+                  {linkedRules.length > 0 ? (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {linkedRules.map((r) => (
+                        <Chip key={r.id} tint={r.value === 0 ? 'paper' : 'cyan'}>
+                          {r.name}
+                          {r.value === 0 ? ' — بلا سعر' : ` — ${r.value} ${BASIS_LABELS[r.basis] ?? ''}`}
+                        </Chip>
+                      ))}
+                      <span className="text-[11px] text-[var(--ink-400)]">تُضبط قيمتها من الإعدادات › قواعد التسعير</span>
+                    </div>
+                  ) : RULE_LINKS[selected.id] ? (
                     <Chip tint="cyan">مرتبط: {RULE_LINKS[selected.id]}</Chip>
                   ) : (
-                    'بدون قاعدة — لا يؤثر على السعر'
+                    'بدون قاعدة — السعر يأتي من فروق الخيارات أعلاه فقط'
                   )}
                 </div>
               </div>
@@ -355,7 +364,8 @@ function OptionsEditor({ field, onChange }: { field: ServiceField; onChange: (op
                 <option value="base">أساسي</option>
                 <option value="perCopy">+ لكل نسخة</option>
                 <option value="perSheet">+ لكل ورقة</option>
-                <option value="perM2">+ لكل م²</option>
+                <option value="perM2">+ لكل م² (مساحة القطعة)</option>
+                <option value="perSheetM2">+ لكل م² ورقة مطبوعة</option>
                 <option value="fixed">+ ثابت</option>
               </select>
               <input

@@ -114,6 +114,7 @@ export const DELTA_UNIT_LABELS: Record<string, string> = {
   perSheet: 'دج/ورقة',
   perFace: 'دج/وجه',
   perM2: 'دج/م²',
+  perSheetM2: 'دج/م² ورقة',
   fixed: 'دج',
   percent: '%',
 };
@@ -122,6 +123,7 @@ export const BASIS_LABELS: Record<string, string> = {
   perSheet: 'لكل ورقة',
   perFace: 'لكل وجه',
   perM2: 'لكل م²',
+  perSheetM2: 'لكل م² ورقة',
   perCopy: 'لكل نسخة',
   fixed: 'ثابت',
   percent: '%',
