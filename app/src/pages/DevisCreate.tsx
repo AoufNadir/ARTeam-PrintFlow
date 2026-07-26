@@ -76,13 +76,19 @@ import type {
   QuantityOption,
   Section,
   Service,
+  ServiceField,
   SheetAlternative,
 } from '@/lib/types';
 import { formatDA, formatPercent, round2 } from '@/lib/units';
 import { cn } from '@/lib/utils';
 
 const EASE = [0.22, 0.68, 0.26, 1] as [number, number, number, number];
-const PHASES = ['العميل والعرض', 'الخدمات والتصاميم', 'التسعير والشروط', 'المراجعة'];
+// Phase titles must describe what the phase actually contains:
+//   0 → steps 0-2 (section, service, quote identity)
+//   1 → steps 3-4 (service fields, montage)
+//   2 → step 5   (price breakdown of the current item)
+//   3 → step 6   (commercial terms + quote review)
+const PHASES = ['الخدمة والعميل', 'المواصفات والمونتاج', 'السعر', 'الشروط والمراجعة'];
 const QTY_PRESETS = [100, 250, 500, 1000, 2000];
 const QUANTITY_COMPARE = [500, 1000, 2000];
 const DRAFT_RESTORE_KEY = 'arteam-printflow:devis-active-draft';
@@ -114,10 +120,43 @@ function compareAssetToDims(asset: DesignFileAsset, dims: DimensionValue | undef
   return { key: 'size', label: 'المقاس', status: 'error', message: `مقاس الملف مختلف عن الطلب بـ ${round2(best)} مم.` };
 }
 
-function montageStateFrom(montage: MontageResult | null, montageStale: boolean, manualPrice: number | null): MontageState {
+/**
+ * Montage confidence recorded on the item. Without a montage the price rests on
+ * `estimateSheets` (a fixed 320×450 grid guess), so the item is `estimated`
+ * whether or not the user typed a manual unit price — both are unverified by
+ * the engine. `invalid` is reserved for a montage the engine rejected.
+ */
+function montageStateFrom(montage: MontageResult | null, montageStale: boolean): MontageState {
   if (montageStale) return 'stale';
   if (montage) return 'confirmed';
-  return manualPrice !== null ? 'estimated' : 'estimated';
+  return 'estimated';
+}
+
+/** Sheet + machine a montage was computed against. */
+type SheetChoice = { w: number; h: number; machineId: string };
+
+const DEFAULT_SHEET_CHOICE: SheetChoice = { w: 320, h: 450, machineId: 'machine-digital-versant' };
+
+/**
+ * Identity of the inputs a montage result depends on. The adopted sheet/machine
+ * belong in it: adopting an alternative changes the sheet count, so a result
+ * computed for another sheet must not survive as if it were current.
+ */
+function montageSignature(
+  quantity: number,
+  dims: DimensionValue | undefined,
+  method: PrintMethod,
+  sheet: SheetChoice,
+): string {
+  return JSON.stringify({
+    q: quantity,
+    w: dims?.widthMm,
+    h: dims?.heightMm,
+    m: method,
+    sw: sheet.w,
+    sh: sheet.h,
+    machine: sheet.machineId,
+  });
 }
 
 function attachmentOf(kind: DevisAttachment['kind'], asset: DesignFileAsset, linkedDesignId?: string): DevisAttachment {
@@ -627,6 +666,9 @@ export default function DevisCreate() {
   const [montageSig, setMontageSig] = useState('');
   const [montageLoading, setMontageLoading] = useState(false);
   const [manualPrice, setManualPrice] = useState<number | null>(null);
+  /** sheet/machine the current result was computed on — survives «إعادة الحساب» */
+  const [montageSheet, setMontageSheet] = useState<SheetChoice>(DEFAULT_SHEET_CHOICE);
+  const [skipMontageConfirm, setSkipMontageConfirm] = useState(false);
 
   // step 6 — review
   const [marginPct, setMarginPct] = useState<number | null>(null);
@@ -665,8 +707,8 @@ export default function DevisCreate() {
   const currentMethod = useMemo((): PrintMethod => (fieldValues['faces'] === 'recto' ? 'recto' : 'recto-verso'), [fieldValues]);
 
   const currentSig = useMemo(
-    () => JSON.stringify({ q: quantity, w: currentDims?.widthMm, h: currentDims?.heightMm, m: currentMethod }),
-    [quantity, currentDims, currentMethod],
+    () => montageSignature(quantity, currentDims, currentMethod, montageSheet),
+    [quantity, currentDims, currentMethod, montageSheet],
   );
   const montageStale = montage !== null && montageSig !== currentSig;
 
@@ -822,6 +864,7 @@ export default function DevisCreate() {
     setFieldValues(initFieldValues(svc));
     setMontage(null);
     setMontageSig('');
+    setMontageSheet(DEFAULT_SHEET_CHOICE);
     setManualPrice(null);
     setMarginPct(null);
     setOverrideReason('');
@@ -835,8 +878,29 @@ export default function DevisCreate() {
 
   const goToPhase = (phase: number) => {
     const target = [0, 3, 5, 6][phase] ?? 0;
-    if (phase <= phaseForStep(maxStep)) setStep(Math.min(target, maxStep));
+    if (phase > phaseForStep(maxStep)) return;
+    const next = Math.min(target, maxStep);
+    // the price screen reads `montage.sheetsNeeded`; jumping there past a stale
+    // result would show a price built on the previous quantity/size/sheet
+    if (next === 5 && montageStale) {
+      toast.error('تغيّرت مدخلات المونتاج — أعد الحساب قبل مراجعة السعر');
+      setStep(Math.min(4, maxStep));
+      return;
+    }
+    setStep(next);
   };
+
+  /** First required service field left empty, if any. */
+  const missingRequiredField = (): ServiceField | undefined =>
+    service?.fields.find((f) => {
+      if (!f.required) return false;
+      const v = fieldValues[f.id];
+      if (v === undefined || v === null) return true;
+      if (typeof v === 'string' && v.trim() === '') return true;
+      if (f.type === 'number') return !(Number(v) > 0);
+      if (f.type === 'dimensions') return !isDim(v) || v.widthMm <= 0 || v.heightMm <= 0;
+      return false;
+    });
 
   const tryNext = () => {
     if (step === 2 && !clientId) {
@@ -844,16 +908,24 @@ export default function DevisCreate() {
       toast.error('العميل مطلوب');
       return;
     }
-    if (step === 3 && quantity <= 0) {
-      toast.error('أدخل كمية صحيحة');
-      return;
+    if (step === 3) {
+      if (quantity <= 0) {
+        toast.error('أدخل كمية صحيحة');
+        return;
+      }
+      const missing = missingRequiredField();
+      if (missing) {
+        toast.error(`${missing.label} مطلوب`);
+        return;
+      }
     }
     const n = Math.min(step + 1, 6);
     setStep(n);
     setMaxStep((m) => Math.max(m, n));
   };
 
-  const runMontage = (sheet?: { w: number; h: number; machineId?: string }) => {
+  /** Recompute on `sheet`, or on the sheet the current result already uses. */
+  const runMontage = (sheet?: SheetChoice) => {
     if (!service || !currentDims) {
       toast.error('حدّد مقاس المنتج أولًا');
       return;
@@ -861,17 +933,19 @@ export default function DevisCreate() {
     const bleed = service.defaultBleedMm ?? 2;
     const method = currentMethod;
     const dims = currentDims;
+    const chosen = sheet ?? montageSheet;
+    const qty = quantity;
     setMontageLoading(true);
     window.setTimeout(() => {
       const result = computeMontage({
-        sheetWidthMm: sheet?.w ?? 320,
-        sheetHeightMm: sheet?.h ?? 450,
+        sheetWidthMm: chosen.w,
+        sheetHeightMm: chosen.h,
         pieceWidthMm: dims.widthMm,
         pieceHeightMm: dims.heightMm,
         bleedMm: { top: bleed, bottom: bleed, left: bleed, right: bleed },
-        quantity,
+        quantity: qty,
         method,
-        machineId: sheet?.machineId ?? 'machine-digital-versant',
+        machineId: chosen.machineId,
       });
       setMontageLoading(false);
       if (!result) {
@@ -879,19 +953,29 @@ export default function DevisCreate() {
         return;
       }
       setMontage(result);
-      setMontageSig(currentSig);
+      setMontageSheet(chosen);
+      // signature built from the values actually used, not from the memo — the
+      // memo still reflects the previous sheet at this point in the tick
+      setMontageSig(montageSignature(qty, dims, method, chosen));
       setManualPrice(null);
       toast.success('تم حساب المونتاج الذكي');
     }, 650);
   };
 
   const adoptAlternative = (alt: SheetAlternative) => {
-    runMontage({ w: alt.sheetWidthMm, h: alt.sheetHeightMm, machineId: alt.machineId });
+    runMontage({
+      w: alt.sheetWidthMm,
+      h: alt.sheetHeightMm,
+      machineId: alt.machineId ?? montageSheet.machineId,
+    });
   };
 
+  /** Drop the montage and price from the geometric estimate instead. */
   const skipMontage = () => {
     setManualPrice(breakdown ? breakdown.unitPrice : 0);
     setMontage(null);
+    setMontageSig('');
+    setMontageSheet(DEFAULT_SHEET_CHOICE);
     tryNext();
   };
 
@@ -927,7 +1011,7 @@ export default function DevisCreate() {
 
   const doAddItem = () => {
     if (!service || !final) return;
-    const itemMontageState = montageStateFrom(montage, montageStale, manualPrice);
+    const itemMontageState = montageStateFrom(montage, montageStale);
     const attachments = [
       ...designAssets.map((asset) => attachmentOf('artwork', asset)),
       ...cutContourAssets.map((asset) => attachmentOf('cut-contour', asset, asset.match ? asset.id : undefined)),
@@ -1041,6 +1125,7 @@ export default function DevisCreate() {
     setFieldValues({});
     setMontage(null);
     setMontageSig('');
+    setMontageSheet(DEFAULT_SHEET_CHOICE);
     setManualPrice(null);
     setMarginPct(null);
     setOverrideReason('');
@@ -1490,56 +1575,66 @@ export default function DevisCreate() {
           />
           <p className="mt-1 text-[11px] text-[var(--ink-400)]">لا تظهر في PDF.</p>
         </motion.div>
-        <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.385, duration: 0.35, ease: EASE }} className="md:col-span-2">
-          {fieldLabel('ملاحظات وشروط تظهر للعميل')}
-          <textarea
-            value={clientNotes}
-            onChange={(e) => setClientNotes(e.target.value)}
-            rows={3}
-            placeholder="ملاحظات تجارية تظهر في PDF العميل…"
-            className="w-full rounded-[8px] border border-[var(--line-strong)] px-3 py-2 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
-          />
-        </motion.div>
-        <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.44, duration: 0.35, ease: EASE }}>
-          {fieldLabel('شروط الدفع')}
-          <input
-            value={paymentTerms}
-            onChange={(e) => setPaymentTerms(e.target.value)}
-            className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
-          />
-        </motion.div>
-        <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.495, duration: 0.35, ease: EASE }}>
-          {fieldLabel('مدة الإنجاز')}
-          <input
-            value={deliveryDelay}
-            onChange={(e) => setDeliveryDelay(e.target.value)}
-            placeholder="مثلاً: 3 أيام عمل بعد اعتماد BAT"
-            className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
-          />
-        </motion.div>
-        <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.55, duration: 0.35, ease: EASE }}>
-          {fieldLabel('طريقة التسليم')}
-          <input
-            value={deliveryMethod}
-            onChange={(e) => setDeliveryMethod(e.target.value)}
-            placeholder="استلام من المطبعة / توصيل"
-            className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
-          />
-        </motion.div>
-        <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.605, duration: 0.35, ease: EASE }}>
-          {fieldLabel('قالب المستند')}
-          <select
-            value={documentLanguage}
-            onChange={(e) => setDocumentLanguage(e.target.value as 'ar' | 'fr' | 'bilingual')}
-            className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] bg-white px-3 text-[14px] outline-none focus:border-[var(--cyan-600)]"
-          >
-            <option value="ar">عربي</option>
-            <option value="fr">Français</option>
-            <option value="bilingual">ثنائي اللغة</option>
-          </select>
-        </motion.div>
       </div>
+      <p className="mt-4 text-[12px] text-[var(--ink-400)]">
+        الشروط التجارية (الدفع، التسليم، لغة المستند) تُضبط في المرحلة الأخيرة بعد ظهور السعر.
+      </p>
     </SectionCard>
+  );
+
+  // ---------------- commercial terms (quote level, rendered in step 6) -------
+
+  const termsFields = (
+    <div className="grid gap-4 md:grid-cols-2">
+      <div className="md:col-span-2">
+        {fieldLabel('ملاحظات وشروط تظهر للعميل')}
+        <textarea
+          value={clientNotes}
+          onChange={(e) => setClientNotes(e.target.value)}
+          rows={3}
+          placeholder="ملاحظات تجارية تظهر في PDF العميل…"
+          className="w-full rounded-[8px] border border-[var(--line-strong)] px-3 py-2 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
+        />
+      </div>
+      <div>
+        {fieldLabel('شروط الدفع')}
+        <input
+          value={paymentTerms}
+          onChange={(e) => setPaymentTerms(e.target.value)}
+          className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
+        />
+      </div>
+      <div>
+        {fieldLabel('مدة الإنجاز')}
+        <input
+          value={deliveryDelay}
+          onChange={(e) => setDeliveryDelay(e.target.value)}
+          placeholder="مثلاً: 3 أيام عمل بعد اعتماد BAT"
+          className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
+        />
+      </div>
+      <div>
+        {fieldLabel('طريقة التسليم')}
+        <input
+          value={deliveryMethod}
+          onChange={(e) => setDeliveryMethod(e.target.value)}
+          placeholder="استلام من المطبعة / توصيل"
+          className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] px-3 text-[14px] outline-none focus:border-[var(--cyan-600)] focus:shadow-[var(--shadow-focus)]"
+        />
+      </div>
+      <div>
+        {fieldLabel('قالب المستند')}
+        <select
+          value={documentLanguage}
+          onChange={(e) => setDocumentLanguage(e.target.value as 'ar' | 'fr' | 'bilingual')}
+          className="h-10 w-full rounded-[8px] border border-[var(--line-strong)] bg-white px-3 text-[14px] outline-none focus:border-[var(--cyan-600)]"
+        >
+          <option value="ar">عربي</option>
+          <option value="fr">Français</option>
+          <option value="bilingual">ثنائي اللغة</option>
+        </select>
+      </div>
+    </div>
   );
 
   // ------------------------------- step 3: service fields --------------------
@@ -1819,7 +1914,7 @@ export default function DevisCreate() {
               onClick={skipMontage}
               className="h-12 rounded-[10px] px-4 text-[14px] font-medium text-[var(--ink-500)] underline decoration-transparent underline-offset-4 transition-all hover:text-[var(--ink-700)] hover:decoration-[var(--ink-400)]"
             >
-              تخطَّ (سعر يدوي)
+              تخطَّ — سعر تقديري
             </button>
           </div>
         </div>
@@ -1880,6 +1975,8 @@ export default function DevisCreate() {
                     type="button"
                     onClick={() => {
                       setMontage(null);
+                      setMontageSig('');
+                      setMontageSheet(DEFAULT_SHEET_CHOICE);
                       setManualPrice(breakdown ? breakdown.unitPrice : 0);
                     }}
                     className="flex h-9 items-center gap-1.5 rounded-[8px] px-3 text-[13px] font-medium text-[var(--ink-500)] underline decoration-transparent underline-offset-4 hover:decoration-[var(--ink-400)]"
@@ -2121,6 +2218,7 @@ export default function DevisCreate() {
   const lastItem = items[items.length - 1];
 
   const stepDone = (
+    <div className="space-y-5">
     <div className="relative overflow-hidden rounded-[14px] border border-[var(--line)] bg-white px-6 py-12 text-center shadow-[var(--shadow-card)]">
       <PaperConfetti key={lastItem?.id ?? 'none'} />
       <div className="flex justify-center">
@@ -2185,6 +2283,15 @@ export default function DevisCreate() {
           حفظ وإنهاء
         </button>
       </motion.div>
+    </div>
+
+    {/* commercial terms — negotiated once the price is known, not before */}
+    <SectionCard title="الشروط التجارية">
+      <p className="mb-4 text-[12px] text-[var(--ink-500)]">
+        تُطبَّق على العرض كله وتظهر في مستند العميل. المبالغ (الخصم، TVA، المصاريف، التسبيق) في ملخص العرض جانبًا.
+      </p>
+      {termsFields}
+    </SectionCard>
     </div>
   );
 
@@ -2299,11 +2406,13 @@ export default function DevisCreate() {
                   type="button"
                   onClick={() => {
                     if (montageStale) {
-                      toast.error('تغيّرت الكمية أو المقاس بعد حساب المونتاج — أعد الحساب قبل المتابعة');
+                      toast.error('تغيّرت مدخلات المونتاج — أعد الحساب قبل المتابعة');
                       return;
                     }
+                    // never skip silently: without a montage the price is a
+                    // geometric guess, and the item is saved as «تقديري»
                     if (montage || manualPrice !== null) tryNext();
-                    else skipMontage();
+                    else setSkipMontageConfirm(true);
                   }}
                   className="flex h-11 items-center gap-1.5 rounded-[10px] bg-[var(--cyan-600)] px-6 text-[14px] font-semibold text-white transition-all hover:-translate-y-px hover:bg-[var(--cyan-500)] active:translate-y-0 active:scale-[0.97]"
                 >
@@ -2848,6 +2957,21 @@ export default function DevisCreate() {
           doAddItem();
         }}
         onCancel={() => setNegativeMarginConfirm(false)}
+      />
+
+      {/* skipping the montage is a pricing decision — make it explicit */}
+      <ConfirmDialog
+        open={skipMontageConfirm}
+        danger={false}
+        title="المتابعة بدون مونتاج؟"
+        message="بدون حساب المونتاج يُقدَّر عدد الأوراق من المقاس فقط (ورقة افتراضية 32×45 بلا هوامش ماكينة ولا طريقة قص)، وسيُحفظ البند بسعر تقديري. احسب المونتاج للحصول على عدد أوراق حقيقي."
+        confirmLabel="متابعة بسعر تقديري"
+        cancelLabel="رجوع للحساب"
+        onConfirm={() => {
+          setSkipMontageConfirm(false);
+          skipMontage();
+        }}
+        onCancel={() => setSkipMontageConfirm(false)}
       />
     </motion.div>
   );
