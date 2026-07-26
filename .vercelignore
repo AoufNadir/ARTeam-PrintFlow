@@ -5,4 +5,4 @@ app/.env.*.local
 *.zip
 test-results/
 app/test-results/
-package-lock.json
+/package-lock.json

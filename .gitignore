@@ -7,3 +7,6 @@ test-results
 app/test-results
 app/.env.local
 app/.env.*.local
+
+.vercel
+.env*
