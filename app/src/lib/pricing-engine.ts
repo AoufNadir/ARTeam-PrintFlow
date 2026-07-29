@@ -289,8 +289,11 @@ export function priceItem(
       pieceAreaM2 = (v.widthMm / 1000) * (v.heightMm / 1000);
     }
   }
+  if (service.designInputMode === 'fixed-template' && service.defaultPieceSize) {
+    pieceSize = { ...service.defaultPieceSize };
+  }
   const detectedSize = fieldValues[DESIGN_SIZE_FIELD];
-  if (!pieceSize && isDimension(detectedSize)) {
+  if (!pieceSize && service.designInputMode !== 'fixed-template' && isDimension(detectedSize)) {
     pieceSize = { widthMm: detectedSize.widthMm, heightMm: detectedSize.heightMm };
   }
   if (!pieceSize && service.defaultPieceSize) {

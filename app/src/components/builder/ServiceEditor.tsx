@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { Archive, Copy, Eye, MoreHorizontal, Pencil } from 'lucide-react';
 import { toast } from 'sonner';
-import type { Section, Service } from '@/lib/types';
+import type { DesignInputMode, MontageMode, Section, Service } from '@/lib/types';
 import { db, uid } from '@/lib/storage';
 import { Chip, Modal, Btn } from '@/components/settings/Overlay';
 import { SERVICE_BASIS_LABELS, type BuilderMeta } from './meta';
@@ -121,6 +121,30 @@ export default function ServiceEditor({ service, section, meta, setMeta, refresh
           </span>
         )}
         <Chip tint="cyan">{SERVICE_BASIS_LABELS[basis]}</Chip>
+        <label className="flex items-center gap-2 text-[11px] text-[var(--ink-500)]">
+          المونتاج في Devis
+          <select
+            value={section?.printCategory === 'other' ? 'disabled' : service.montageMode ?? 'disabled'}
+            disabled={!section || section.printCategory === 'other'}
+            onChange={(event) => update({ montageMode: event.target.value as MontageMode })}
+            className="h-8 rounded-[7px] border border-[var(--line-strong)] bg-white px-2 text-[12px] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <option value="disabled">معطل</option>
+            <option value="optional">اختياري</option>
+            <option value="required">إجباري</option>
+          </select>
+        </label>
+        <label className="flex items-center gap-2 text-[11px] text-[var(--ink-500)]">
+          مدخل التصميم
+          <select
+            value={service.designInputMode ?? 'standard'}
+            onChange={(event) => update({ designInputMode: event.target.value as DesignInputMode })}
+            className="h-8 rounded-[7px] border border-[var(--line-strong)] bg-white px-2 text-[12px]"
+          >
+            <option value="standard">عادي</option>
+            <option value="fixed-template">قالب ثابت</option>
+          </select>
+        </label>
         <div className="ms-auto flex items-center gap-1.5">
           <button
             type="button"

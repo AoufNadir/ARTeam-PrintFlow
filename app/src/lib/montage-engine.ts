@@ -1432,7 +1432,10 @@ function evaluateCandidates(
   if (strict.pieces.length > 0) packLists.push({ pieces: strict.pieces, source: 'shelf' });
   const strictCols = shelfPack(workArea.h, workArea.w, groups, gap);
   if (strictCols.pieces.length > 0) packLists.push({ pieces: transposeFixedPieces(strictCols.pieces), source: 'shelf' });
-  if (groups.length > 1) {
+  {
+    // Runs for single-group sheets too (not just groups.length > 1): mixed-
+    // orientation MaxRects packs can beat any one-orientation shelf grid —
+    // same rationale as fixedPackCandidates (fixed-per-sheet mode).
     const byAreaDesc = [...groups].sort((a, b) => b.cellW * b.cellH - a.cellW * a.cellH);
     const byHeightDesc = [...groups].sort((a, b) => Math.max(b.cellW, b.cellH) - Math.max(a.cellW, a.cellH));
     const byWidthDesc = [...groups].sort((a, b) => b.cellW - a.cellW);
@@ -1606,7 +1609,11 @@ function evaluate(
     if (
       !best ||
       c.runWaste < best.runWaste - 1e-9 ||
-      (Math.abs(c.runWaste - best.runWaste) <= 1e-9 && c.ratioDev < best.ratioDev)
+      (Math.abs(c.runWaste - best.runWaste) <= 1e-9 &&
+        (c.ratioDev < best.ratioDev ||
+          // exact tie on both: don't silently default to iteration order
+          // (rows-before-columns-before-blocks) — prefer real extra yield.
+          (c.ratioDev === best.ratioDev && c.result.copiesPerSheet > best.result.copiesPerSheet)))
     ) {
       best = c;
     }
@@ -2641,8 +2648,15 @@ export function computeMontageVariants(input: MontageInput, machine?: Machine): 
       if (Math.abs(b.runWaste - a.runWaste) <= 1e-9) {
         if (b.ratioDev < a.ratioDev - 1e-9) return b;
         if (Math.abs(b.ratioDev - a.ratioDev) <= 1e-9) {
-          if (guillotine && familyRank(b) < familyRank(a)) return b;
-          if ((!guillotine || familyRank(b) === familyRank(a)) && b.cutScore < a.cutScore) return b;
+          // A tie on runWaste/ratioDev does NOT mean a tie on copies actually
+          // placed per sheet (both can be capped at the same sheetsNeeded
+          // while one packs more copies) — real yield outranks the family/
+          // cut-simplicity style preference below.
+          if (b.result.copiesPerSheet > a.result.copiesPerSheet) return b;
+          if (b.result.copiesPerSheet === a.result.copiesPerSheet) {
+            if (guillotine && familyRank(b) < familyRank(a)) return b;
+            if ((!guillotine || familyRank(b) === familyRank(a)) && b.cutScore < a.cutScore) return b;
+          }
         }
       }
       return a;

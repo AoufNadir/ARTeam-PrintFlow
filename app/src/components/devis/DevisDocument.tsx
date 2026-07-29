@@ -5,8 +5,9 @@ import VersionBadge from '@/components/ds/VersionBadge';
 import StatusPill from '@/components/ds/StatusPill';
 import { db } from '@/lib/storage';
 import { loadCompanySettings } from '@/lib/company-settings';
-import type { Client, Devis, Project, Unit } from '@/lib/types';
-import { formatDA } from '@/lib/units';
+import type { Client, Devis, ProductionStage, Project, Unit } from '@/lib/types';
+import { isBillableDevisItem, isCustomProjectItem, PRODUCTION_STAGE_LABELS } from '@/lib/custom-project';
+import { formatDA, formatDimension } from '@/lib/units';
 import {
   addDays,
   devisTotals,
@@ -28,6 +29,17 @@ export interface DevisDocumentProps {
 }
 
 const EASE = [0.22, 0.68, 0.26, 1] as [number, number, number, number];
+
+function stagePublicSpec(stage: ProductionStage, unit: Unit): string {
+  const parts = [
+    stage.paper?.name,
+    stage.sheetSize?.label,
+    stage.productSize ? formatDimension(stage.productSize.widthMm, stage.productSize.heightMm, unit) : undefined,
+    stage.printMethod === 'recto-verso' ? 'وجهان' : stage.printMethod === 'recto' ? 'وجه واحد' : stage.printMethod,
+    stage.colorLabel,
+  ];
+  return parts.filter(Boolean).join(' · ');
+}
 
 /**
  * A4-proportioned "paper" Devis document: letterhead, client block, items
@@ -114,8 +126,9 @@ export default function DevisDocument({ devis, client, project, unit, animated =
             </tr>
           </thead>
           <tbody>
-            {devis.items.map((item, i) => {
-              const service = db.services.get(item.serviceId);
+            {devis.items.filter(isBillableDevisItem).map((item, i) => {
+              const custom = isCustomProjectItem(item);
+              const service = custom ? undefined : db.services.get(item.serviceId);
               const spec = itemSpecAr(service, item);
               const { dims, qty } = itemDims(service, item, unit);
               return (
@@ -129,14 +142,26 @@ export default function DevisDocument({ devis, client, project, unit, animated =
                   <td className="py-2.5 pe-2"><span dir="ltr" className="font-latin text-[var(--ink-400)]">{i + 1}</span></td>
                   <td className="py-2.5 pe-2">
                     <div className="font-semibold text-[var(--ink-900)]">
-                      <span dir="ltr" className="font-latin">{item.serviceName}</span>
+                      <span dir={custom ? 'rtl' : 'ltr'} className={custom ? '' : 'font-latin'}>{item.serviceName}</span>
                       {spec && <span className="font-normal text-[var(--ink-700)]"> — {spec}</span>}
                     </div>
-                    <div className="mt-0.5 text-[11px] text-[var(--ink-400)]">
+                    {!custom && <div className="mt-0.5 text-[11px] text-[var(--ink-400)]">
                       {dims && <span dir="ltr" className="font-latin">{dims}</span>}
                       {dims && ' — '}
                       <span dir="ltr" className="font-latin">{qty}</span> نسخة
-                    </div>
+                    </div>}
+                    {custom && (
+                      <div className="mt-2 overflow-hidden rounded-[7px] border border-[var(--line)] text-[10px] font-normal">
+                        <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-2 bg-[var(--paper-100)] px-2 py-1 text-[var(--ink-500)]"><span>المرحلة</span><span>الكمية</span><span>الأوراق</span></div>
+                        {item.customProject.stages.map((stage) => (
+                          <div key={stage.id} className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-2 border-t border-[var(--line)] px-2 py-1.5">
+                            <span><span className="block">{stage.name} — {PRODUCTION_STAGE_LABELS[stage.kind]}</span>{stagePublicSpec(stage, unit) && <span className="mt-0.5 block text-[9px] text-[var(--ink-400)]">{stagePublicSpec(stage, unit)}</span>}</span>
+                            <span dir="ltr" className="font-latin">{stage.quantity}</span>
+                            <span dir="ltr" className="font-latin">{stage.montageResult?.sheetsNeeded ?? stage.calculation.sheets ?? '—'}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </td>
                   <td className="py-2.5 text-end"><span dir="ltr" className="font-latin tabular-nums">{qty}</span></td>
                   <td className="py-2.5 text-end"><span dir="ltr" className="font-latin tabular-nums">{formatDA(item.unitPrice)}</span></td>

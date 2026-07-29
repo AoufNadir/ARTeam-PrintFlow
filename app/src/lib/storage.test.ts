@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { db } from './storage';
 import type { Devis } from './types';
+import { isCustomProjectItem } from './custom-project';
 
 class MemoryStorage {
   private rows = new Map<string, string>();
@@ -77,29 +78,59 @@ describe('local devis repository migration', () => {
   it('normalizes legacy quotes without losing the commercial total', () => {
     const created = db.devis.create(legacyDevis());
 
-    expect(created.dataVersion).toBe(2);
+    expect(created.dataVersion).toBe(4);
     expect(created.revision).toBe(1);
     expect(created.items[0].order).toBe(0);
-    expect(created.items[0].montageState).toBe('estimated');
+    expect(created.items[0].kind).toBe('service');
+    expect(isCustomProjectItem(created.items[0]) ? undefined : created.items[0].montageState).toBeUndefined();
     expect(created.internalNotes).toBe('internal only');
     expect(created.taxRate).toBe(0.19);
     expect(created.totals?.ttc).toBe(1190);
     expect(created.total).toBe(1190);
   });
 
-  it('blocks sending when a line has stale montage or preflight errors', () => {
+  it('migrates v2 catalog categories once and disables legacy service montage', () => {
+    localStorage.clear();
+    localStorage.setItem('arteam-printflow:seeded-v1', '1');
+    localStorage.setItem('arteam-printflow:schema-version', '2');
+    localStorage.setItem('arteam-printflow:sections', JSON.stringify([
+      { id: 'sec-offset-old', name: 'طباعة أوفست', serviceIds: ['svc-old'] },
+      { id: 'sec-other-old', name: 'Grand Format', serviceIds: [] },
+    ]));
+    localStorage.setItem('arteam-printflow:services', JSON.stringify([
+      { id: 'svc-old', sectionId: 'sec-offset-old', name: 'خدمة قديمة', fields: [], pricingRuleIds: [] },
+    ]));
+    localStorage.setItem('arteam-printflow:devis', '[]');
+
+    db.ensureSeeded();
+
+    expect(db.sections.get('sec-offset-old')?.printCategory).toBe('offset');
+    expect(db.sections.get('sec-other-old')?.printCategory).toBe('other');
+    expect(db.services.get('svc-old')?.montageMode).toBe('disabled');
+    expect(db.services.get('svc-old')?.designInputMode).toBe('standard');
+    expect(localStorage.getItem('arteam-printflow:schema-version')).toBe('4');
+  });
+
+  it('marks the seeded Carte Visite service as a fixed template', () => {
+    expect(db.services.get('svc-carte-visite')?.designInputMode).toBe('fixed-template');
+  });
+
+  it('blocks ready and sent when a line has stale montage or preflight errors', () => {
+    const legacyItem = legacyDevis().items[0];
+    if (isCustomProjectItem(legacyItem)) throw new Error('Expected a service item');
     const created = db.devis.create({
       ...legacyDevis(),
       id: 'devis-stale',
       items: [
         {
-          ...legacyDevis().items[0],
+          ...legacyItem,
           montageState: 'stale',
           preflight: [{ key: 'montage', label: 'المونتاج', status: 'error' }],
         },
       ],
     });
 
+    expect(db.devis.transitionStatus(created.id, 'ready')).toBeUndefined();
     expect(db.devis.transitionStatus(created.id, 'sent')).toBeUndefined();
     expect(db.devis.get(created.id)?.status).toBe('draft');
   });

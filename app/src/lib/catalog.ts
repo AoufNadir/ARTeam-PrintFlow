@@ -70,6 +70,7 @@ export const SEED_SERVICES: Service[] = [
     description: 'بطاقات عمل 8.5×5.5 سم',
     defaultPieceSize: { widthMm: 85, heightMm: 55 },
     defaultBleedMm: 2,
+    designInputMode: 'fixed-template',
     stages: ['impression', 'pelliculage', 'coupe'],
     pricingRuleIds: ['rule-paper-sheet', 'rule-print-face-digital', 'rule-cut-sheet', 'rule-waste', 'rule-overhead', 'rule-margin'],
     fields: [
@@ -163,9 +164,9 @@ export const SEED_SERVICES: Service[] = [
 // from `Service.sectionId` (the single source of truth), preserving the order
 // in which services appear in SEED_SERVICES.
 const SECTION_DEFS: Omit<Section, 'serviceIds'>[] = [
-  { id: 'sec-digital', name: 'طباعة رقمية', latinName: 'Impression numérique', description: 'كميات صغيرة ومتوسطة، تسليم سريع' },
-  { id: 'sec-offset', name: 'أوفست', latinName: 'Offset', description: 'كميات كبيرة بجودة عالية' },
-  { id: 'sec-grand-format', name: 'تنسيق كبير', latinName: 'Grand Format', description: 'لافتات، بانرات، لوحات إشهارية' },
+  { id: 'sec-digital', name: 'طباعة رقمية', latinName: 'Impression numérique', description: 'كميات صغيرة ومتوسطة، تسليم سريع', printCategory: 'digital' },
+  { id: 'sec-offset', name: 'أوفست', latinName: 'Offset', description: 'كميات كبيرة بجودة عالية', printCategory: 'offset' },
+  { id: 'sec-grand-format', name: 'تنسيق كبير', latinName: 'Grand Format', description: 'لافتات، بانرات، لوحات إشهارية', printCategory: 'other' },
 ];
 
 export const SEED_SECTIONS: Section[] = SECTION_DEFS.map((s) => ({

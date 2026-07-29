@@ -3,7 +3,8 @@
 // formatting, TVA math, and human/Latin item-spec strings.
 // ---------------------------------------------------------------------------
 
-import type { Client, Devis, DevisDiscount, DevisItem, DevisTotals, DimensionValue, Service, Unit } from '@/lib/types';
+import type { Client, Devis, DevisDiscount, DevisItem, DevisTotals, DimensionValue, Service, ServiceDevisItem, Unit } from '@/lib/types';
+import { isCustomProjectItem } from '@/lib/custom-project';
 import { formatDimension } from '@/lib/units';
 
 export const DEFAULT_TVA_RATE = 0.19;
@@ -63,9 +64,17 @@ export interface DevisTotalsInput {
  * Fixed commercial calculation order:
  * items HT -> discounts -> fees -> TVA -> TTC -> advance -> balance.
  */
-export function devisTotals(items: Pick<DevisItem, 'total' | 'discount'>[], input: DevisTotalsInput = {}): DevisTotals {
-  const itemsGross = money(items.reduce((s, it) => s + it.total, 0));
-  const itemDiscounts = money(items.reduce((s, it) => s + discountAmount(it.discount, it.total), 0));
+export interface DevisTotalsItem {
+  total: number;
+  discount?: DevisDiscount;
+  kind?: 'service' | 'custom-project';
+  customProject?: { completion: 'draft' | 'complete' };
+}
+
+export function devisTotals(items: DevisTotalsItem[], input: DevisTotalsInput = {}): DevisTotals {
+  const billable = items.filter((item) => item.kind !== 'custom-project' || item.customProject?.completion === 'complete');
+  const itemsGross = money(billable.reduce((s, it) => s + it.total, 0));
+  const itemDiscounts = money(billable.reduce((s, it) => s + discountAmount(it.discount, it.total), 0));
   const itemsHt = money(Math.max(0, itemsGross - itemDiscounts));
   const quoteDiscount = discountAmount(input.discount, itemsHt);
   const extraFees = money((input.extraFees ?? []).reduce((s, fee) => s + Math.max(0, fee.amount || 0), 0));
@@ -88,7 +97,7 @@ function isDim(v: unknown): v is DimensionValue {
   return typeof v === 'object' && v !== null && 'widthMm' in v && 'heightMm' in v;
 }
 
-function quantityOf(item: Pick<DevisItem, 'fieldValues' | 'quantity'>): number {
+function quantityOf(item: Pick<ServiceDevisItem, 'fieldValues' | 'quantity'>): number {
   const q = item.fieldValues['quantity'];
   return typeof q === 'number' ? q : Number(q) || item.quantity;
 }
@@ -98,7 +107,7 @@ function quantityOf(item: Pick<DevisItem, 'fieldValues' | 'quantity'>): number {
  * "Papier Couché 350g, Recto Verso, Pelliculage Mat".
  */
 export function itemSpecLatin(service: Service | undefined, item: DevisItem): string {
-  if (!service) return '';
+  if (!service || isCustomProjectItem(item)) return '';
   const parts: string[] = [];
   for (const f of service.fields) {
     const v = item.fieldValues[f.id];
@@ -113,7 +122,7 @@ export function itemSpecLatin(service: Service | undefined, item: DevisItem): st
 
 /** Arabic spec line: "ورق كوشيه 350غ، وجهان، تغليف مطفي". */
 export function itemSpecAr(service: Service | undefined, item: DevisItem): string {
-  if (!service) return '';
+  if (!service || isCustomProjectItem(item)) return '';
   const parts: string[] = [];
   for (const f of service.fields) {
     const v = item.fieldValues[f.id];
@@ -128,6 +137,7 @@ export function itemSpecAr(service: Service | undefined, item: DevisItem): strin
 
 /** Dimension micro line: "9 × 5.5 cm — 1000 نسخة" (dimension part is LTR). */
 export function itemDims(service: Service | undefined, item: DevisItem, unit: Unit): { dims: string | null; qty: number } {
+  if (isCustomProjectItem(item)) return { dims: null, qty: item.customProject.finalQuantity };
   let dims: string | null = null;
   if (service) {
     for (const f of service.fields) {

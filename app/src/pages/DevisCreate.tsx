@@ -38,6 +38,7 @@ import {
 } from '@/components/ds';
 import { CropMarks } from '@/components/ds/SectionCard';
 import ConfirmDialog from '@/components/devis/ConfirmDialog';
+import CustomProjectWizard from '@/components/devis/CustomProjectWizard';
 import FlipNumber from '@/components/devis/FlipNumber';
 import MontageThumb from '@/components/devis/MontageThumb';
 import DevisDocument from '@/components/devis/DevisDocument';
@@ -64,6 +65,7 @@ import {
 import { logAudit } from '@/components/settings/audit';
 import { designNameFromAsset, type DesignFileAsset } from '@/lib/design-file-types';
 import { computeMontage } from '@/lib/montage-engine';
+import { resolveMontageMode } from '@/lib/montage-policy';
 import { DESIGN_SIZE_FIELD, percentRule, priceItem, type FieldValues } from '@/lib/pricing-engine';
 import {
   consumeMontageCommit,
@@ -71,12 +73,14 @@ import {
   saveMontageSession,
 } from '@/lib/montage-session';
 import { db, uid } from '@/lib/storage';
+import { buildCustomProjectItem, isCustomProjectItem, montageSignatureForStage } from '@/lib/custom-project';
 import type {
   Client,
   DevisAttachment,
   DevisDiscount,
   Devis,
   DevisItem,
+  CustomProjectDevisItem,
   DevisStatus,
   DimensionValue,
   MachineKind,
@@ -85,24 +89,27 @@ import type {
   MontageInput,
   PreflightCheck,
   PrintMethod,
+  ProductionStage,
   Project,
   QuantityOption,
   Section,
   Service,
+  ServiceDevisItem,
   SheetAlternative,
 } from '@/lib/types';
 import { formatDA, formatPercent, round2 } from '@/lib/units';
 import { cn } from '@/lib/utils';
 
 const EASE = [0.22, 0.68, 0.26, 1] as [number, number, number, number];
-const PHASES = ['البداية', 'التصميم', 'المونتاج', 'الإنتاج والسعر'];
+const PHASES = ['العميل', 'نوع الطباعة', 'الخدمة', 'الخيارات', 'التسعير'];
 const QTY_PRESETS = [100, 250, 500, 1000, 2000];
 const QUANTITY_COMPARE = [500, 1000, 2000];
 const DRAFT_RESTORE_KEY = 'arteam-printflow:devis-active-draft';
 
 type SaveState = 'idle' | 'saving' | 'saved' | 'failed';
 
-interface DevisMontageSessionPayload {
+interface ServiceMontageSessionPayload {
+  target?: { kind: 'service' };
   sectionId: string | null;
   serviceId: string | null;
   fieldValues: FieldValues;
@@ -110,6 +117,12 @@ interface DevisMontageSessionPayload {
   cutContourAssets: DesignFileAsset[];
   cutContourLinks: Record<string, string>;
 }
+
+interface CustomStageMontageSessionPayload {
+  target: { kind: 'customStage'; itemId: string; stageId: string; sectionId: string };
+}
+
+type DevisMontageSessionPayload = ServiceMontageSessionPayload | CustomStageMontageSessionPayload;
 
 function isDim(v: unknown): v is DimensionValue {
   return typeof v === 'object' && v !== null && 'widthMm' in v && 'heightMm' in v;
@@ -157,20 +170,26 @@ function buildPreflight({
   designAssets,
   cutContours,
   montageState,
+  includeMontage,
+  includeArtwork = true,
 }: {
   dims?: DimensionValue;
   designAssets: DesignFileAsset[];
   cutContours: DesignFileAsset[];
-  montageState: MontageState;
+  montageState?: MontageState;
+  includeMontage?: boolean;
+  includeArtwork?: boolean;
 }): PreflightCheck[] {
-  const checks: PreflightCheck[] = [
-    {
+  const checks: PreflightCheck[] = [];
+  if (includeArtwork) {
+    checks.push({
       key: 'file',
       label: 'الملف',
       status: designAssets.length > 0 ? 'ok' : 'warning',
       message: designAssets.length > 0 ? undefined : 'لم يُربط ملف تصميم بعد.',
-    },
-    {
+    });
+  }
+  if (includeMontage && montageState) checks.push({
       key: 'montage',
       label: 'المونتاج',
       status: montageState === 'confirmed' ? 'ok' : montageState === 'estimated' ? 'warning' : 'error',
@@ -180,24 +199,24 @@ function buildPreflight({
           : montageState === 'estimated'
             ? 'السعر تقديري ويمكن حفظه كمسودة.'
             : 'يجب إعادة حساب المونتاج قبل الإرسال.',
-    },
-  ];
-  if (designAssets[0]) checks.push(compareAssetToDims(designAssets[0], dims));
-  const hasCutNeed = designAssets.some((asset) => asset.hasEmbeddedCutContour) || cutContours.length > 0;
-  checks.push({
-    key: 'cut-contour',
-    label: 'tracé découpe',
-    status: !hasCutNeed || cutContours.length > 0 ? 'ok' : 'warning',
-    message: hasCutNeed && cutContours.length === 0 ? 'تم رصد مسار قص محتمل داخل التصميم؛ اربط ملف tracé عند الحاجة.' : undefined,
-  });
+    });
+  if (includeArtwork) {
+    if (designAssets[0]) checks.push(compareAssetToDims(designAssets[0], dims));
+    const hasCutNeed = designAssets.some((asset) => asset.hasEmbeddedCutContour) || cutContours.length > 0;
+    checks.push({
+      key: 'cut-contour',
+      label: 'tracé découpe',
+      status: !hasCutNeed || cutContours.length > 0 ? 'ok' : 'warning',
+      message: hasCutNeed && cutContours.length === 0 ? 'تم رصد مسار قص محتمل داخل التصميم؛ اربط ملف tracé عند الحاجة.' : undefined,
+    });
+  }
   return checks;
 }
 
 function phaseForStep(step: number): number {
-  if (step <= 2) return 0;
-  if (step === 3) return 1;
-  if (step === 4) return 2;
-  return 3;
+  if (step <= 2) return step;
+  if (step <= 4) return 3;
+  return 4;
 }
 
 function isDesignField(fieldId: string, type: Service['fields'][number]['type']): boolean {
@@ -210,12 +229,13 @@ function serviceAllowsMultipleDesigns(service: Service | undefined): boolean {
   return key.includes('etiquette') || key.includes('étiquette') || key.includes('ملصق') || key.includes('multi');
 }
 
-function serviceNeedsSheetMontage(service: Service | undefined): boolean {
-  if (!service) return false;
-  return service.pricingRuleIds.some((id) => id.includes('paper') || id.includes('sheet') || id.includes('cut'));
+function isFixedTemplateService(service: Service | undefined): boolean {
+  return service?.designInputMode === 'fixed-template';
 }
 
 function machineKindFromSection(section: Section | undefined, service: Service | undefined): MachineKind {
+  if (section?.printCategory === 'offset') return 'offset';
+  if (section?.printCategory === 'digital') return 'digital';
   const key = `${section?.id ?? service?.sectionId ?? ''} ${section?.name ?? ''} ${section?.latinName ?? ''}`.toLowerCase();
   return key.includes('offset') || key.includes('أوفست') ? 'offset' : 'digital';
 }
@@ -668,6 +688,8 @@ export default function DevisCreate() {
   const [sectionId, setSectionId] = useState<string | null>(null);
   const [serviceId, setServiceId] = useState<string | null>(null);
   const [serviceSearch, setServiceSearch] = useState('');
+  const [customMode, setCustomMode] = useState(false);
+  const [customEditingItemId, setCustomEditingItemId] = useState<string | null>(null);
 
   // step 3 — general info (hydrated from the edited draft when present)
   const [clientId, setClientId] = useState(() => editDevis?.clientId ?? '');
@@ -737,7 +759,10 @@ export default function DevisCreate() {
   const project: Project | undefined = projectId ? db.projects.get(projectId) : undefined;
   const allowsMultipleDesigns = serviceAllowsMultipleDesigns(service);
   const maxDesigns = allowsMultipleDesigns ? 12 : 1;
-  const requiresMontage = serviceNeedsSheetMontage(service);
+  const serviceMontageMode = resolveMontageMode(section, service);
+  const allowsMontage = serviceMontageMode !== 'disabled';
+  const requiresMontage = serviceMontageMode === 'required';
+  const fixedTemplate = isFixedTemplateService(service);
   const designFields = useMemo(
     () => service?.fields.filter((field) => isDesignField(field.id, field.type)) ?? [],
     [service],
@@ -755,6 +780,7 @@ export default function DevisCreate() {
 
   const currentDims = useMemo((): DimensionValue | undefined => {
     if (!service) return undefined;
+    if (isFixedTemplateService(service) && service.defaultPieceSize) return service.defaultPieceSize;
     const df = service.fields.find((f) => f.type === 'dimensions');
     const v = df ? fieldValues[df.id] : undefined;
     const detected = fieldValues[DESIGN_SIZE_FIELD];
@@ -771,7 +797,7 @@ export default function DevisCreate() {
       JSON.stringify({
         method: currentMethod,
         cutMethod: cutMethodFromFields(fieldValues),
-        designs:
+        groups:
           designAssets.length > 0
             ? designAssets.map((asset) => ({
                 id: designAssets.length > 1 ? asset.id : 'primary',
@@ -902,10 +928,16 @@ export default function DevisCreate() {
     () => devisTotals(items, { discount: quoteDiscount, extraFees, taxRate, advance }),
     [items, quoteDiscount, extraFees, taxRate, advance],
   );
-  const editingItem = useMemo(() => items.find((item) => item.id === editingItemId), [items, editingItemId]);
-  const editingService = useMemo(() => (editingItem ? db.services.get(editingItem.serviceId) : undefined), [editingItem]);
+  const editingItem = useMemo(
+    () => items.find((item): item is ServiceDevisItem => item.id === editingItemId && !isCustomProjectItem(item)),
+    [items, editingItemId],
+  );
+  const editingService = useMemo(
+    () => (editingItem && !isCustomProjectItem(editingItem) ? db.services.get(editingItem.serviceId) : undefined),
+    [editingItem],
+  );
   const editingDimFieldId = firstDimensionFieldId(editingService);
-  const editingDims = editingDimFieldId && editingItem && isDim(editingItem.fieldValues[editingDimFieldId])
+  const editingDims = editingDimFieldId && editingItem && !isCustomProjectItem(editingItem) && isDim(editingItem.fieldValues[editingDimFieldId])
     ? editingItem.fieldValues[editingDimFieldId]
     : editingService?.defaultPieceSize;
 
@@ -992,13 +1024,18 @@ export default function DevisCreate() {
   };
 
   const selectSection = (id: string) => {
-    if (sectionId === id) return;
+    if (sectionId === id) {
+      setStep(2);
+      setMaxStep((current) => Math.max(current, 2));
+      return;
+    }
+    if (items.length > 0 && sectionId && !window.confirm('تغيير نوع الطباعة لن يحذف البنود الحالية، لكنه سيبدأ بندًا جديدًا ضمن النوع المختار. هل تريد المتابعة؟')) return;
     setSectionId(id);
     setServiceId(null);
     setServiceSearch('');
     window.setTimeout(() => {
-      setStep(1);
-      setMaxStep((m) => Math.max(m, 1));
+      setStep(2);
+      setMaxStep((m) => Math.max(m, 2));
     }, 350);
   };
 
@@ -1015,19 +1052,29 @@ export default function DevisCreate() {
     setDesignAssets([]);
     setCutContourAssets([]);
     setCutContourLinks({});
+    setCustomMode(false);
+    setCustomEditingItemId(null);
     window.setTimeout(() => {
-      setStep(2);
-      setMaxStep((m) => Math.max(m, 2));
+      setStep(3);
+      setMaxStep((m) => Math.max(m, 3));
     }, 350);
   };
 
+  const selectCustomProject = () => {
+    setServiceId(null);
+    setCustomMode(true);
+    setCustomEditingItemId(null);
+    setStep(3);
+    setMaxStep((current) => Math.max(current, 3));
+  };
+
   const goToPhase = (phase: number) => {
-    const target = [0, 3, 4, 5][phase] ?? 0;
+    const target = [0, 1, 2, 3, 5][phase] ?? 0;
     if (phase <= phaseForStep(maxStep)) setStep(Math.min(target, maxStep));
   };
 
   const tryNext = () => {
-    if (step === 2 && !clientId) {
+    if (step === 0 && !clientId) {
       setClientError(true);
       toast.error('العميل مطلوب');
       return;
@@ -1036,7 +1083,7 @@ export default function DevisCreate() {
       toast.error('أدخل كمية صحيحة');
       return;
     }
-    const n = Math.min(step + 1, 7);
+    const n = step === 3 && !allowsMontage ? 5 : Math.min(step + 1, 6);
     setStep(n);
     setMaxStep((m) => Math.max(m, n));
   };
@@ -1114,6 +1161,7 @@ export default function DevisCreate() {
       createdAt: new Date().toISOString(),
       state,
       payload: {
+        target: { kind: 'service' },
         sectionId,
         serviceId,
         fieldValues,
@@ -1121,6 +1169,54 @@ export default function DevisCreate() {
         cutContourAssets,
         cutContourLinks,
       },
+    });
+    navigate(`/montage?session=${encodeURIComponent(sessionId)}`);
+  };
+
+  const openCustomStageStudio = (itemId: string, stage: ProductionStage) => {
+    if (!sectionId || !stage.machine || !stage.sheetSize || !stage.productSize) {
+      toast.error('اختر الماكينة والورقة والمقاس النهائي قبل فتح الاستوديو');
+      return;
+    }
+    const bleed = stage.montageInput?.bleedMm ?? { top: 2, bottom: 2, left: 2, right: 2 };
+    const fallbackMachine = defaultStudioMachine(stage.machine.kind);
+    const state: MontageUIState = {
+      kind: stage.machine.kind,
+      machineId: stage.machine.id ?? fallbackMachine.id,
+      margins: { ...stage.machine.margins },
+      pinceMm: stage.machine.priseDePince ?? 12,
+      sheetW: stage.sheetSize.widthMm,
+      sheetH: stage.sheetSize.heightMm,
+      customSheet: true,
+      autoSuggest: true,
+      calcMode: 'quantity',
+      stickers: [{
+        id: `custom-stage-${stage.id}`,
+        name: stage.name,
+        widthMm: stage.productSize.widthMm,
+        heightMm: stage.productSize.heightMm,
+        bleed,
+        bleedLinked: true,
+        quantity: stage.quantity,
+      }],
+      bleedShared: bleed,
+      method: stage.printMethod ?? 'recto',
+      gutterMm: stage.montageInput?.gutterMm ?? 10,
+      gripMm: stage.montageInput?.gripMm ?? 10,
+      cutMethod: stage.montageInput?.cutMethod ?? 'guillotine',
+      sharedCut: false,
+      doubleCut: true,
+      defaultGapMm: stage.montageInput?.defaultGapMm ?? 0,
+      pairGaps: stage.montageInput?.pairGaps ?? {},
+    };
+    const sessionId = makeMontageSessionId();
+    saveMontageSession<MontageUIState, DevisMontageSessionPayload>({
+      id: sessionId,
+      source: 'devis',
+      returnTo: `${window.location.pathname}${window.location.search}`,
+      createdAt: new Date().toISOString(),
+      state,
+      payload: { target: { kind: 'customStage', itemId, stageId: stage.id, sectionId } },
     });
     navigate(`/montage?session=${encodeURIComponent(sessionId)}`);
   };
@@ -1172,6 +1268,10 @@ export default function DevisCreate() {
 
   const addItem = () => {
     if (!service || !final) return;
+    if (requiresMontage && !montage) {
+      toast.error('هذه الخدمة تتطلب اعتماد المونتاج قبل إضافتها');
+      return;
+    }
     // never persist a stale montage: the sheet count no longer matches the
     // current quantity/dimensions → force an explicit recalculation first
     if (montageStale) {
@@ -1188,7 +1288,8 @@ export default function DevisCreate() {
 
   const doAddItem = () => {
     if (!service || !final) return;
-    const itemMontageState = montageStateFrom(montage, montageStale, manualPrice);
+    const includeMontage = allowsMontage && (requiresMontage || montage !== null);
+    const itemMontageState = includeMontage ? montageStateFrom(montage, montageStale, manualPrice) : undefined;
     const attachments = [
       ...designAssets.map((asset) => attachmentOf('artwork', asset)),
       ...cutContourAssets.map((asset) => attachmentOf('cut-contour', asset, cutContourLinks[asset.id])),
@@ -1198,10 +1299,13 @@ export default function DevisCreate() {
       designAssets,
       cutContours: cutContourAssets,
       montageState: itemMontageState,
+      includeMontage,
+      includeArtwork: !fixedTemplate,
     });
-    const item: DevisItem = {
+    const item: ServiceDevisItem = {
       id: uid('item'),
       order: items.length,
+      kind: 'service',
       serviceId: service.id,
       serviceName: service.latinName ?? service.name,
       quantity,
@@ -1224,8 +1328,8 @@ export default function DevisCreate() {
       logAudit('margin', `تعديل سعر/هامش في ${saved.number}: ${overrideReason || 'بدون سبب مفصل'}`, saved.number);
     }
     flashSaved();
-    setStep(7);
-    setMaxStep(7);
+    setStep(6);
+    setMaxStep(6);
   };
 
   const removeItem = (id: string) => {
@@ -1242,11 +1346,22 @@ export default function DevisCreate() {
   const duplicateItem = (id: string) => {
     const index = items.findIndex((item) => item.id === id);
     if (index === -1) return;
-    const copy: DevisItem = {
-      ...structuredClone(items[index]),
+    const source = structuredClone(items[index]);
+    const copy: DevisItem = isCustomProjectItem(source) ? {
+      ...source,
       id: uid('item'),
       order: index + 1,
-      serviceName: `${items[index].serviceName} copy`,
+      serviceName: `${source.serviceName} (نسخة)`,
+      customProject: {
+        ...source.customProject,
+        name: `${source.customProject.name} (نسخة)`,
+        stages: source.customProject.stages.map((stage) => ({ ...stage, id: uid('stage') })),
+      },
+    } : {
+      ...source,
+      id: uid('item'),
+      order: index + 1,
+      serviceName: `${source.serviceName} copy`,
     };
     const nextItems = normalizeItemOrder([...items.slice(0, index + 1), copy, ...items.slice(index + 1)]);
     setItems(nextItems);
@@ -1273,6 +1388,7 @@ export default function DevisCreate() {
   };
 
   const recalcItem = (item: DevisItem, fields: FieldValues, qty: number): DevisItem => {
+    if (isCustomProjectItem(item)) return item;
     const itemService = db.services.get(item.serviceId);
     if (!itemService) return { ...item, fieldValues: fields, quantity: qty };
     const montageIsConfirmed = item.montageState === 'confirmed';
@@ -1298,6 +1414,8 @@ export default function DevisCreate() {
   const addAnother = () => {
     setSectionId(null);
     setServiceId(null);
+    setCustomMode(false);
+    setCustomEditingItemId(null);
     setServiceSearch('');
     setFieldValues({});
     setMontage(null);
@@ -1308,8 +1426,8 @@ export default function DevisCreate() {
     setDesignAssets([]);
     setCutContourAssets([]);
     setCutContourLinks({});
-    setStep(0);
-    setMaxStep(2); // client info stays valid
+    setStep(1);
+    setMaxStep(1); // client info stays valid
   };
 
   const saveDraft = () => {
@@ -1347,10 +1465,9 @@ export default function DevisCreate() {
   const hasSendBlocker = useMemo(
     () =>
       items.some(
-        (item) =>
-          item.montageState === 'invalid' ||
-          item.montageState === 'stale' ||
-          item.preflight?.some((check) => check.status === 'error'),
+        (item) => isCustomProjectItem(item)
+          ? item.customProject.completion !== 'complete' || Boolean(item.preflight?.some((check) => check.status === 'error'))
+          : item.montageState === 'invalid' || item.montageState === 'stale' || Boolean(item.preflight?.some((check) => check.status === 'error')),
       ),
     [items],
   );
@@ -1358,6 +1475,10 @@ export default function DevisCreate() {
   const markReady = () => {
     if (items.length === 0) {
       toast.error('أضف بندًا واحدًا على الأقل');
+      return;
+    }
+    if (hasSendBlocker) {
+      toast.error('أكمل كل المشاريع والمراحل قبل جعل العرض جاهزًا');
       return;
     }
     const saved = persistDevis(items, 'ready');
@@ -1394,9 +1515,9 @@ export default function DevisCreate() {
   };
 
   const canNext =
-    step === 0 ? sectionId !== null
-    : step === 1 ? serviceId !== null
-    : step === 2 ? clientId !== ''
+    step === 0 ? clientId !== ''
+    : step === 1 ? sectionId !== null
+    : step === 2 ? serviceId !== null || customMode
     : true;
 
   const savedDevis = devisId ? db.devis.get(devisId) : undefined;
@@ -1499,7 +1620,36 @@ export default function DevisCreate() {
     const commit = consumeMontageCommit<MontageUIState, DevisMontageSessionPayload>(sessionId);
     if (commit) {
       const payload = commit.session.payload;
-      if (payload) {
+      if (payload?.target?.kind === 'customStage') {
+        const target = payload.target;
+        const nextItems = items.map((item, itemIndex) => {
+          if (item.id !== target.itemId || !isCustomProjectItem(item)) return item;
+          const stages = item.customProject.stages.map((stage) => {
+            if (stage.id !== target.stageId) return stage;
+            const nextStage: ProductionStage = {
+              ...stage,
+              montageInput: commit.input,
+              montageResult: { ...commit.result, placed: commit.placed },
+              montageState: 'confirmed',
+            };
+            return { ...nextStage, montageSignature: montageSignatureForStage(nextStage) };
+          });
+          return buildCustomProjectItem(item.id, item.order ?? itemIndex, {
+            ...item.customProject,
+            completion: 'draft',
+            stages,
+          }, rules);
+        });
+        setItems(nextItems);
+        persistDevis(nextItems, 'draft', { silent: true });
+        setSectionId(target.sectionId);
+        setServiceId(null);
+        setCustomEditingItemId(target.itemId);
+        setCustomMode(true);
+        setStep(3);
+        setMaxStep((m) => Math.max(m, 3));
+        toast.success('تم اعتماد مخطط الاستوديو داخل مرحلة المشروع');
+      } else if (payload && 'sectionId' in payload) {
         setSectionId(payload.sectionId);
         setServiceId(payload.serviceId);
         setFieldValues(payload.fieldValues);
@@ -1507,26 +1657,30 @@ export default function DevisCreate() {
         setCutContourAssets(payload.cutContourAssets);
         setCutContourLinks(payload.cutContourLinks ?? {});
       }
-      setMontage({ ...commit.result, placed: commit.placed });
-      setMontageSig(signatureFromMontageInput(commit.input));
-      setManualPrice(null);
-      setStep(5);
-      setMaxStep((m) => Math.max(m, 5));
-      toast.success('تم اعتماد مخطط الاستوديو داخل العرض');
+      if (payload?.target?.kind !== 'customStage') {
+        setMontage({ ...commit.result, placed: commit.placed });
+        setMontageSig(signatureFromMontageInput(commit.input));
+        setManualPrice(null);
+        setStep(5);
+        setMaxStep((m) => Math.max(m, 5));
+        toast.success('تم اعتماد مخطط الاستوديو داخل العرض');
+      }
     } else {
       toast.error('تعذر استرجاع مخطط الاستوديو');
     }
     params.delete('montageSession');
     const nextQuery = params.toString();
     navigate(`${window.location.pathname}${nextQuery ? `?${nextQuery}` : ''}`, { replace: true });
+    // The montage commit is intentionally consumed once from the first restored draft snapshot.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [navigate]);
 
-  // ------------------------------- step 0: section ---------------------------
+  // ------------------------------- step 1: section ---------------------------
 
   const stepSection = (
     <div>
-      <h1 className="text-[27px] leading-9 font-bold text-[var(--ink-900)]">ما نوع العمل؟</h1>
-      <p className="mt-1 text-[13px] text-[var(--ink-500)]">اختر القسم الرئيسي — يمكنك إضافة أقسام جديدة من منشئ المنتجات.</p>
+      <h1 className="text-[27px] leading-9 font-bold text-[var(--ink-900)]">اختر نوع الطباعة</h1>
+      <p className="mt-1 text-[13px] text-[var(--ink-500)]">رقمية أو أوفست، وتبقى الأقسام الأخرى متاحة تحت «خدمات أخرى».</p>
       <div className="mt-5 grid gap-5 [grid-template-columns:repeat(auto-fill,minmax(220px,1fr))]">
         {sections.map((s, i) => {
           const Icon = sectionIcon(s);
@@ -1583,7 +1737,7 @@ export default function DevisCreate() {
     </div>
   );
 
-  // ------------------------------- step 1: service ---------------------------
+  // ------------------------------- step 2: service ---------------------------
 
   const sectionServices = sectionId ? db.services.bySection(sectionId).filter((s) => !isServiceDisabled(s.id)) : [];
   const filteredServices = sectionServices.filter(
@@ -1605,7 +1759,7 @@ export default function DevisCreate() {
               onClick={() => {
                 setSectionId(null);
                 setServiceId(null);
-                setStep(0);
+                setStep(1);
               }}
               className="grid h-4 w-4 place-items-center rounded-full hover:bg-[var(--cyan-600)] hover:text-white"
             >
@@ -1624,6 +1778,19 @@ export default function DevisCreate() {
           className="w-full bg-transparent text-[14px] outline-none"
         />
       </div>
+      <button
+        type="button"
+        onClick={selectCustomProject}
+        className="mt-4 flex w-full items-start gap-4 rounded-[14px] border-2 border-dashed border-[var(--cyan-500)] bg-[var(--cyan-50)] p-5 text-start transition-all hover:-translate-y-0.5 hover:border-[var(--cyan-600)]"
+      >
+        <span className="grid h-11 w-11 shrink-0 place-items-center rounded-[11px] bg-white text-[var(--cyan-600)] shadow-sm"><Puzzle size={22} /></span>
+        <span className="min-w-0 flex-1">
+          <span className="block text-[16px] font-bold text-[var(--ink-900)]">مشروع مخصص</span>
+          <span dir="ltr" className="font-latin block text-start text-[12px] text-[var(--cyan-600)]">Projet personnalisé</span>
+          <span className="mt-1 block text-[12px] leading-5 text-[var(--ink-500)]">استعمل هذا الخيار عندما يكون المشروع مكوّنًا من عدة مراحل طباعة أو عدة أنواع ورق أو يحتاج حسابًا خاصًا.</span>
+        </span>
+        <ChevronLeft size={17} className="mt-3 shrink-0 text-[var(--cyan-600)]" />
+      </button>
       {filteredServices.length === 0 ? (
         <EmptyState
           className="mt-5"
@@ -1711,7 +1878,9 @@ export default function DevisCreate() {
             clients={clients}
             value={clientId}
             onChange={(id) => {
+              if (items.length > 0 && clientId && id !== clientId && !window.confirm('كل البنود مرتبطة بعميل واحد. هل تريد نقل هذا الـDevis كاملًا إلى العميل الجديد؟')) return;
               setClientId(id);
+              if (id !== clientId) setProjectId('');
               setClientError(false);
             }}
             onCreateNew={() => setClientModal(true)}
@@ -1979,57 +2148,105 @@ export default function DevisCreate() {
 
   const stepDesign = service && (
     <SectionCard
-      title={`التصاميم — ${service.name}`}
+      title={fixedTemplate ? `تفاصيل ${service.name}` : `خيارات الخدمة — ${service.name}`}
       actions={
-        <span className="rounded-full bg-[var(--paper-100)] px-2.5 py-1 text-[11px] font-medium text-[var(--ink-500)]">
-          {allowsMultipleDesigns ? 'عدة تصاميم' : 'تصميم واحد'}
-        </span>
+        fixedTemplate && currentDims ? (
+          <span className="rounded-full bg-[var(--cyan-50)] px-2.5 py-1 text-[11px] font-medium text-[var(--cyan-600)]">
+            قالب ثابت · <span dir="ltr" className="font-latin">{round2(currentDims.widthMm)}×{round2(currentDims.heightMm)} mm</span>
+          </span>
+        ) : (
+          <span className="rounded-full bg-[var(--paper-100)] px-2.5 py-1 text-[11px] font-medium text-[var(--ink-500)]">
+            {allowsMultipleDesigns ? 'عدة تصاميم' : 'تصميم واحد'}
+          </span>
+        )
       }
     >
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_260px]">
-        <div className="space-y-5">
-          {designFields.map(renderServiceField)}
-          {!designFields.some((field) => field.type === 'dimensions') && currentDims && (
-            <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: designFields.length * 0.05, duration: 0.3, ease: EASE }}>
-              <p className="mb-1 text-[11px] text-[var(--ink-400)]">المقاس النهائي بعد القص، بدون Bleed.</p>
-              <DimensionGroup
-                label="مقاس التصميم *"
-                value={currentDims}
-                onChange={(d) => setField(DESIGN_SIZE_FIELD, d)}
-                unit={unit}
-                onUnitChange={setUnit}
-              />
-            </motion.div>
-          )}
-          <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: (designFields.length + 1) * 0.05, duration: 0.3, ease: EASE }}>
-            {fieldLabel('ملفات التصميم و tracé découpe')}
-            <DesignFileUploader
-              stickers={uploadStickers}
-              maxDesigns={allowsMultipleDesigns ? maxDesigns : Math.max(1, uploadStickers.length + 1)}
-              onAddDesigns={addDesignFiles}
-              onAttachCutContour={attachCutContour}
-            />
-            {(designAssets.length > 0 || cutContourAssets.length > 0) && (
-              <div className="mt-2 space-y-1 rounded-[10px] border border-[var(--line)] bg-[var(--paper-50)] p-2 text-[11px] text-[var(--ink-500)]">
-                {designAssets.map((asset) => (
-                  <div key={asset.id} className="flex items-center justify-between gap-2">
-                    <span className="truncate" dir="ltr">{asset.fileName}</span>
-                    <span dir="ltr" className="font-latin shrink-0">{round2(asset.widthMm)}×{round2(asset.heightMm)} mm</span>
+      <div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_270px]">
+        <div className="space-y-6">
+          <div className="space-y-5">
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="text-[16px] leading-6 font-semibold text-[var(--ink-900)]">الكمية والقالب</h3>
+              {service.latinName && <span dir="ltr" className="font-latin text-[12px] text-[var(--ink-400)]">{service.latinName}</span>}
+            </div>
+            {designFields.map(renderServiceField)}
+            {fixedTemplate && currentDims && (
+              <motion.div
+                initial={{ opacity: 0, y: 16 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: designFields.length * 0.05, duration: 0.3, ease: EASE }}
+                className="flex flex-wrap items-center justify-between gap-3 rounded-[10px] border border-[var(--line)] bg-[var(--paper-50)] px-4 py-3 text-[13px]"
+              >
+                <span className="font-medium text-[var(--ink-700)]">مقاس Carte Visite المعتمد</span>
+                <span dir="ltr" className="font-latin font-semibold text-[var(--ink-900)]">
+                  {round2(currentDims.widthMm)} × {round2(currentDims.heightMm)} mm
+                </span>
+              </motion.div>
+            )}
+            {!fixedTemplate && !designFields.some((field) => field.type === 'dimensions') && currentDims && (
+              <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: designFields.length * 0.05, duration: 0.3, ease: EASE }}>
+                <p className="mb-1 text-[11px] text-[var(--ink-400)]">المقاس النهائي بعد القص، بدون Bleed.</p>
+                <DimensionGroup
+                  label="مقاس التصميم *"
+                  value={currentDims}
+                  onChange={(d) => setField(DESIGN_SIZE_FIELD, d)}
+                  unit={unit}
+                  onUnitChange={setUnit}
+                />
+              </motion.div>
+            )}
+            {!fixedTemplate && (
+              <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: (designFields.length + 1) * 0.05, duration: 0.3, ease: EASE }}>
+                {fieldLabel('ملفات التصميم و tracé découpe')}
+                <DesignFileUploader
+                  stickers={uploadStickers}
+                  maxDesigns={allowsMultipleDesigns ? maxDesigns : Math.max(1, uploadStickers.length + 1)}
+                  onAddDesigns={addDesignFiles}
+                  onAttachCutContour={attachCutContour}
+                />
+                {(designAssets.length > 0 || cutContourAssets.length > 0) && (
+                  <div className="mt-2 space-y-1 rounded-[10px] border border-[var(--line)] bg-[var(--paper-50)] p-2 text-[11px] text-[var(--ink-500)]">
+                    {designAssets.map((asset) => (
+                      <div key={asset.id} className="flex items-center justify-between gap-2">
+                        <span className="truncate" dir="ltr">{asset.fileName}</span>
+                        <span dir="ltr" className="font-latin shrink-0">{round2(asset.widthMm)}×{round2(asset.heightMm)} mm</span>
+                      </div>
+                    ))}
+                    {cutContourAssets.map((asset) => (
+                      <div key={asset.id} className="flex items-center justify-between gap-2 text-[var(--cyan-600)]">
+                        <span className="truncate" dir="ltr">tracé: {asset.fileName}</span>
+                        <span>{asset.match?.status === 'matched' ? 'مطابق' : asset.match?.status === 'review' ? 'مراجعة' : 'تحذير'}</span>
+                      </div>
+                    ))}
                   </div>
-                ))}
-                {cutContourAssets.map((asset) => (
-                  <div key={asset.id} className="flex items-center justify-between gap-2 text-[var(--cyan-600)]">
-                    <span className="truncate" dir="ltr">tracé: {asset.fileName}</span>
-                    <span>{asset.match?.status === 'matched' ? 'مطابق' : asset.match?.status === 'review' ? 'مراجعة' : 'تحذير'}</span>
-                  </div>
-                ))}
+                )}
+              </motion.div>
+            )}
+          </div>
+
+          <div className="space-y-5 border-t border-[var(--line)] pt-5">
+            <div>
+              <h3 className="text-[16px] leading-6 font-semibold text-[var(--ink-900)]">الورق والطباعة والتشطيب</h3>
+              <p className="mt-1 text-[12px] text-[var(--ink-400)]">كل اختيارات الإنتاج في نفس الخطوة.</p>
+            </div>
+            {montageStale && (
+              <div className="flex items-start gap-2 rounded-[10px] border border-[#F59E0B]/40 bg-[#FEF3C7] px-3 py-2.5 text-[12px] leading-5 text-[#92400E]">
+                <Info size={15} className="mt-0.5 shrink-0" />
+                <span>تغيّر خيار يؤثر على المونتاج. أعد الحساب قبل إضافة الخدمة إلى العرض.</span>
               </div>
             )}
-          </motion.div>
+            {productionFields.length > 0 ? (
+              productionFields.map(renderServiceField)
+            ) : (
+              <EmptyState
+                title="لا توجد اختيارات إنتاج إضافية"
+                helper="هذه الخدمة تُسعّر من المقاس والكمية والمونتاج فقط."
+                className="py-8"
+              />
+            )}
+          </div>
         </div>
 
-        {/* live price ticker */}
-        <div className="border-t border-[var(--line)] pt-4 lg:border-s lg:border-t-0 lg:ps-6 lg:pt-0">
+        <div className="border-t border-[var(--line)] pt-4 md:border-s md:border-t-0 md:ps-6 md:pt-0">
           <div className="text-[11px] font-medium tracking-[0.04em] text-[var(--ink-400)]">تقدير السعر</div>
           <motion.div
             key={final ? Math.round(final.unitPrice * 100) : 0}
@@ -2049,6 +2266,12 @@ export default function DevisCreate() {
           </motion.div>
           <div className="mt-2 space-y-1 text-[11px] text-[var(--ink-400)]">
             <div className="flex justify-between"><span>الكمية</span><span dir="ltr" className="font-latin">{quantity}</span></div>
+            {fixedTemplate && currentDims && (
+              <div className="flex justify-between">
+                <span>القالب</span>
+                <span dir="ltr" className="font-latin">{round2(currentDims.widthMm)}×{round2(currentDims.heightMm)} mm</span>
+              </div>
+            )}
             {montage && (
               <div className="flex justify-between"><span>الأوراق</span><span dir="ltr" className="font-latin">{montage.sheetsNeeded}</span></div>
             )}
@@ -2057,6 +2280,46 @@ export default function DevisCreate() {
               <VersionBadge version={rulesVersion.version} />
             </div>
           </div>
+
+          {allowsMontage && (
+            <div className="mt-4 border-t border-[var(--line)] pt-4">
+              <div className="text-[11px] font-medium tracking-[0.04em] text-[var(--ink-400)]">المونتاج</div>
+              {montage ? (
+                <div className="mt-3 space-y-3 rounded-[12px] border border-[var(--line)] bg-[var(--paper-50)] p-3 text-[12px] text-[var(--ink-600)]">
+                  <MontageThumb result={montage} width={190} />
+                  <div className="space-y-1.5">
+                    <div className="flex justify-between">
+                      <span>مقاس الورقة</span>
+                      <span dir="ltr" className="font-latin font-semibold">{Math.round(montage.sheetWidthMm)}×{Math.round(montage.sheetHeightMm)} mm</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>نسخ/ورقة</span>
+                      <span dir="ltr" className="font-latin font-semibold">{montage.copiesPerSheet}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>الأوراق</span>
+                      <span dir="ltr" className="font-latin font-semibold">{montage.sheetsNeeded}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>الهدر</span>
+                      <span dir="ltr" className="font-latin font-semibold">{formatPercent(montage.wastePercent)}</span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={openStudio}
+                    className="h-9 w-full rounded-[8px] border border-[var(--line-strong)] bg-white text-[13px] font-medium text-[var(--ink-700)] transition-colors hover:bg-[var(--paper-100)]"
+                  >
+                    تعديل في الاستوديو
+                  </button>
+                </div>
+              ) : (
+                <div className="mt-3 rounded-[12px] border border-dashed border-[var(--line-strong)] bg-[var(--paper-100)] p-4 text-center text-[12px] text-[var(--ink-500)]">
+                  {requiresMontage ? 'لم يتم اعتماد المونتاج بعد.' : 'المونتاج اختياري لهذه الخدمة.'}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </SectionCard>
@@ -2070,7 +2333,7 @@ export default function DevisCreate() {
       actions={
         <span className="inline-flex items-center gap-1 rounded-full bg-[var(--paper-100)] px-2.5 py-1 text-[11px] font-medium text-[var(--ink-500)]">
           <Sparkles size={12} className="text-[var(--cyan-600)]" />
-          اختياري / متقدم
+          {requiresMontage ? 'مطلوب لهذه الخدمة' : 'اختياري / متقدم'}
         </span>
       }
     >
@@ -2110,13 +2373,13 @@ export default function DevisCreate() {
             >
               فتح Studio
             </button>
-            <button
+            {!requiresMontage && <button
               type="button"
               onClick={skipMontage}
               className="h-12 rounded-[10px] px-4 text-[14px] font-medium text-[var(--ink-500)] underline decoration-transparent underline-offset-4 transition-all hover:text-[var(--ink-700)] hover:decoration-[var(--ink-400)]"
             >
               تخطَّ (سعر يدوي)
-            </button>
+            </button>}
           </div>
         </div>
       ) : (
@@ -2173,7 +2436,7 @@ export default function DevisCreate() {
                   >
                     تعديل في الاستوديو
                   </button>
-                  <button
+                  {!requiresMontage && <button
                     type="button"
                     onClick={() => {
                       setMontage(null);
@@ -2182,7 +2445,7 @@ export default function DevisCreate() {
                     className="flex h-9 items-center gap-1.5 rounded-[8px] px-3 text-[13px] font-medium text-[var(--ink-500)] underline decoration-transparent underline-offset-4 hover:decoration-[var(--ink-400)]"
                   >
                     إزالة المونتاج (سعر يدوي)
-                  </button>
+                  </button>}
                 </div>
               </div>
               <MontageThumb result={montage} width={170} />
@@ -2233,80 +2496,7 @@ export default function DevisCreate() {
     </SectionCard>
   );
 
-  // ------------------------------- step 5: production ------------------------
-
-  const stepProduction = service && (
-    <SectionCard
-      title="الإنتاج — الورق والطباعة والتشطيب"
-      actions={
-        montage ? (
-          <span className="inline-flex items-center gap-1 rounded-full bg-[var(--cyan-50)] px-2.5 py-1 text-[11px] font-medium text-[var(--cyan-600)]">
-            <Sparkles size={12} />
-            {montage.sheetsNeeded} ورقة
-          </span>
-        ) : undefined
-      }
-    >
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_260px]">
-        <div className="space-y-5">
-          {montageStale && (
-            <div className="flex items-start gap-2 rounded-[10px] border border-[#F59E0B]/40 bg-[#FEF3C7] px-3 py-2.5 text-[12px] leading-5 text-[#92400E]">
-              <Info size={15} className="mt-0.5 shrink-0" />
-              <span>تغيّر خيار يؤثر على المونتاج. أعد الحساب قبل إضافة الخدمة إلى العرض.</span>
-            </div>
-          )}
-          {productionFields.length > 0 ? (
-            productionFields.map(renderServiceField)
-          ) : (
-            <EmptyState
-              title="لا توجد اختيارات إنتاج إضافية"
-              helper="هذه الخدمة تُسعّر من المقاس والكمية والمونتاج فقط."
-              className="py-8"
-            />
-          )}
-        </div>
-        <div className="border-t border-[var(--line)] pt-4 lg:border-s lg:border-t-0 lg:ps-6 lg:pt-0">
-          <div className="text-[11px] font-medium tracking-[0.04em] text-[var(--ink-400)]">نتيجة المونتاج</div>
-          {montage ? (
-            <div className="mt-3 space-y-3 rounded-[12px] border border-[var(--line)] bg-[var(--paper-50)] p-3 text-[12px] text-[var(--ink-600)]">
-              <MontageThumb result={montage} width={190} />
-              <div className="space-y-1.5">
-                <div className="flex justify-between">
-                  <span>مقاس الورقة</span>
-                  <span dir="ltr" className="font-latin font-semibold">{Math.round(montage.sheetWidthMm)}×{Math.round(montage.sheetHeightMm)} mm</span>
-                </div>
-                <div className="flex justify-between">
-                  <span>نسخ/ورقة</span>
-                  <span dir="ltr" className="font-latin font-semibold">{montage.copiesPerSheet}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span>الأوراق</span>
-                  <span dir="ltr" className="font-latin font-semibold">{montage.sheetsNeeded}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span>الهدر</span>
-                  <span dir="ltr" className="font-latin font-semibold">{formatPercent(montage.wastePercent)}</span>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={openStudio}
-                className="h-9 w-full rounded-[8px] border border-[var(--line-strong)] bg-white text-[13px] font-medium text-[var(--ink-700)] transition-colors hover:bg-[var(--paper-100)]"
-              >
-                تعديل في الاستوديو
-              </button>
-            </div>
-          ) : (
-            <div className="mt-3 rounded-[12px] border border-dashed border-[var(--line-strong)] bg-[var(--paper-100)] p-4 text-center text-[12px] text-[var(--ink-500)]">
-              لم يتم اعتماد مونتاج بعد.
-            </div>
-          )}
-        </div>
-      </div>
-    </SectionCard>
-  );
-
-  // ------------------------------- step 6: price review ----------------------
+  // ------------------------------- step 5: price review ----------------------
 
   const reviewLines = breakdown
     ? [
@@ -2482,7 +2672,7 @@ export default function DevisCreate() {
             </div>
           </div>
 
-          {designPriceRows.length > 0 && (
+          {!fixedTemplate && designPriceRows.length > 0 && (
             <div className="mt-4 rounded-[12px] border border-[var(--line)] bg-white p-4">
               <div className="mb-2 text-[13px] font-semibold text-[var(--ink-800)]">سعر كل تصميم</div>
               <div className="space-y-2">
@@ -2580,7 +2770,46 @@ export default function DevisCreate() {
     </div>
   );
 
-  const stepContent = [stepSection, stepService, stepInfo, stepDesign, stepMontage, stepProduction, stepReview, stepDone][step];
+  const customInitialItem = customEditingItemId
+    ? items.find((item): item is CustomProjectDevisItem => item.id === customEditingItemId && isCustomProjectItem(item))
+    : undefined;
+
+  const upsertCustomItem = (item: CustomProjectDevisItem, completed: boolean) => {
+    const index = items.findIndex((row) => row.id === item.id);
+    const nextItems = normalizeItemOrder(index >= 0
+      ? items.map((row) => row.id === item.id ? item : row)
+      : [...items, item]);
+    setItems(nextItems);
+    persistDevis(nextItems, 'draft', { silent: !completed });
+    if (completed) {
+      setCustomEditingItemId(item.id);
+      flashSaved();
+      setCustomMode(false);
+      setStep(6);
+      setMaxStep(6);
+      toast.success('تمت إضافة المشروع المخصص إلى العرض');
+    }
+  };
+
+  const customProjectContent = customMode && section ? (
+    <CustomProjectWizard
+      key={customInitialItem?.id ?? `${section.id}-new`}
+      section={section}
+      rules={rules}
+      defaultMargin={defaultMargin}
+      taxRate={taxRate}
+      unit={unit}
+      onUnitChange={setUnit}
+      initialItem={customInitialItem}
+      order={customInitialItem?.order ?? items.length}
+      onDraftChange={(item) => upsertCustomItem(item, false)}
+      onComplete={(item) => upsertCustomItem(item, true)}
+      onOpenStudio={openCustomStageStudio}
+      onBack={() => { setCustomMode(false); setStep(2); }}
+    />
+  ) : null;
+
+  const stepContent = customProjectContent ?? [stepInfo, stepSection, stepService, stepDesign, stepMontage, stepReview, stepDone][step];
 
   // ------------------------------- render ------------------------------------
 
@@ -2633,21 +2862,21 @@ export default function DevisCreate() {
       </div>
 
       {/* stepper (fixed at content top) */}
-      <div className="sticky top-[80px] z-30 hidden rounded-[14px] border border-[var(--line)] bg-white/95 px-5 py-4 shadow-[var(--shadow-card)] backdrop-blur md:block">
+      {!customMode && <div className="sticky top-[80px] z-30 hidden rounded-[14px] border border-[var(--line)] bg-white/95 px-5 py-4 shadow-[var(--shadow-card)] backdrop-blur md:block">
         <StageStepper steps={PHASES} current={phaseForStep(step)} onStepClick={goToPhase} />
-      </div>
+      </div>}
       {/* mobile stepper */}
-      <div className="rounded-[12px] border border-[var(--line)] bg-white px-4 py-3 md:hidden">
+      {!customMode && <div className="rounded-[12px] border border-[var(--line)] bg-white px-4 py-3 md:hidden">
         <div className="flex items-center justify-between text-[13px]">
           <span className="font-semibold text-[var(--ink-900)]">{PHASES[phaseForStep(step)]}</span>
           <span className="text-[var(--ink-500)]">
-            المرحلة <span dir="ltr" className="font-latin">{phaseForStep(step) + 1}</span> من <span dir="ltr" className="font-latin">4</span>
+            المرحلة <span dir="ltr" className="font-latin">{phaseForStep(step) + 1}</span> من <span dir="ltr" className="font-latin">5</span>
           </span>
         </div>
         <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[var(--paper-100)]">
-          <motion.div className="h-full rounded-full bg-[var(--cyan-500)]" animate={{ width: `${((phaseForStep(step) + 1) / 4) * 100}%` }} transition={{ duration: 0.3 }} />
+          <motion.div className="h-full rounded-full bg-[var(--cyan-500)]" animate={{ width: `${((phaseForStep(step) + 1) / 5) * 100}%` }} transition={{ duration: 0.3 }} />
         </div>
-      </div>
+      </div>}
 
       <div className="grid grid-cols-1 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
         {/* main wizard column */}
@@ -2665,17 +2894,19 @@ export default function DevisCreate() {
           </AnimatePresence>
 
           {/* nav */}
-          {step < 7 && step > 0 && (
-            <div className="mt-6 flex items-center justify-between">
-              <button
-                type="button"
-                onClick={() => setStep((s) => Math.max(0, s - 1))}
-                className="flex h-11 items-center gap-1.5 rounded-[10px] px-4 text-[14px] font-medium text-[var(--ink-500)] transition-colors hover:bg-[var(--paper-200)] hover:text-[var(--ink-700)]"
-              >
-                <ChevronRight size={16} />
-                رجوع
-              </button>
-              {step < 4 && (
+          {!customMode && step < 6 && (
+            <div className={cn('mt-6 flex items-center', step > 0 ? 'justify-between' : 'justify-end')}>
+              {step > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setStep((current) => current === 5 ? (allowsMontage ? 4 : 3) : Math.max(0, current - 1))}
+                  className="flex h-11 items-center gap-1.5 rounded-[10px] px-4 text-[14px] font-medium text-[var(--ink-500)] transition-colors hover:bg-[var(--paper-200)] hover:text-[var(--ink-700)]"
+                >
+                  <ChevronRight size={16} />
+                  رجوع
+                </button>
+              )}
+              {step < 3 && (
                 <button
                   type="button"
                   onClick={tryNext}
@@ -2686,29 +2917,26 @@ export default function DevisCreate() {
                   <ChevronLeft size={16} />
                 </button>
               )}
+              {step === 3 && (
+                <button
+                  type="button"
+                  onClick={tryNext}
+                  className="flex h-11 items-center gap-1.5 rounded-[10px] bg-[var(--cyan-600)] px-6 text-[14px] font-semibold text-white transition-all hover:-translate-y-px hover:bg-[var(--cyan-500)] active:translate-y-0 active:scale-[0.97]"
+                >
+                  {allowsMontage ? 'التالي: المونتاج' : 'التالي: مراجعة السعر'}
+                  <ChevronLeft size={16} />
+                </button>
+              )}
               {step === 4 && (
                 <button
                   type="button"
                   onClick={() => {
                     if (montageStale) {
-                      toast.error('تغيّرت الكمية أو المقاس بعد حساب المونتاج — أعد الحساب قبل المتابعة');
+                      toast.error('أعد حساب المونتاج قبل مراجعة السعر');
                       return;
                     }
-                    if (montage || manualPrice !== null || !requiresMontage) tryNext();
-                    else skipMontage();
-                  }}
-                  className="flex h-11 items-center gap-1.5 rounded-[10px] bg-[var(--cyan-600)] px-6 text-[14px] font-semibold text-white transition-all hover:-translate-y-px hover:bg-[var(--cyan-500)] active:translate-y-0 active:scale-[0.97]"
-                >
-                  التالي: الإنتاج
-                  <ChevronLeft size={16} />
-                </button>
-              )}
-              {step === 5 && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (montageStale) {
-                      toast.error('أعد حساب المونتاج قبل مراجعة السعر');
+                    if (requiresMontage && !montage) {
+                      toast.error('هذه الخدمة تتطلب اعتماد المونتاج');
                       return;
                     }
                     tryNext();
@@ -2719,14 +2947,13 @@ export default function DevisCreate() {
                   <ChevronLeft size={16} />
                 </button>
               )}
-              {step === 6 && (
+              {step === 5 && (
                 <button
                   type="button"
                   onClick={addItem}
                   className="flex h-11 items-center gap-1.5 rounded-[10px] bg-[var(--cyan-600)] px-6 text-[14px] font-semibold text-white transition-all hover:-translate-y-px hover:bg-[var(--cyan-500)] active:translate-y-0 active:scale-[0.97]"
                 >
-                  <Plus size={16} />
-                  إضافة إلى العرض
+                  <Plus size={16} /> إضافة إلى العرض
                 </button>
               )}
             </div>
@@ -2770,16 +2997,27 @@ export default function DevisCreate() {
                         <span dir="ltr" className="font-latin">{it.serviceName}</span>
                       </div>
                       <div className="text-[11px] text-[var(--ink-400)]">
-                        <span dir="ltr" className="font-latin">{it.quantity}</span> نسخة
+                        {isCustomProjectItem(it) ? (
+                          <><span dir="ltr" className="font-latin">{it.customProject.stages.length}</span> مراحل · <span dir="ltr" className="font-latin">{it.quantity}</span> وحدة {it.customProject.completion === 'draft' && <span className="ms-1 rounded-full bg-amber-50 px-1.5 text-amber-700">قيد الإعداد</span>}</>
+                        ) : <><span dir="ltr" className="font-latin">{it.quantity}</span> نسخة</>}
                       </div>
                     </div>
                     <span dir="ltr" className="font-latin shrink-0 text-[13px] font-semibold tabular-nums text-[var(--ink-900)]">
-                      {formatDA(it.total)}
+                      {formatDA(isCustomProjectItem(it) ? it.customProject.totals.priceHt : it.total)}
                     </span>
                     <button
                       type="button"
                       aria-label="تعديل"
-                      onClick={() => setEditingItemId(it.id)}
+                      onClick={() => {
+                        if (isCustomProjectItem(it)) {
+                          setSectionId(it.customProject.sourceSectionId);
+                          setCustomEditingItemId(it.id);
+                          setCustomMode(true);
+                          setStep(3);
+                        } else {
+                          setEditingItemId(it.id);
+                        }
+                      }}
                       className="grid h-6 w-6 shrink-0 place-items-center rounded-[6px] text-[var(--ink-400)] transition-colors hover:bg-[var(--cyan-50)] hover:text-[var(--cyan-600)]"
                     >
                       <Pencil size={13} />
@@ -3098,6 +3336,7 @@ export default function DevisCreate() {
                   presets={QTY_PRESETS}
                   onChange={(q) =>
                     updateExistingItem(editingItem.id, (item) => {
+                      if (isCustomProjectItem(item)) return item;
                       const fields = { ...item.fieldValues, quantity: Math.max(1, Math.floor(q)) };
                       return recalcItem(item, fields, Math.max(1, Math.floor(q)));
                     })
@@ -3111,6 +3350,7 @@ export default function DevisCreate() {
                     onUnitChange={setUnit}
                     onChange={(dims) =>
                       updateExistingItem(editingItem.id, (item) => {
+                        if (isCustomProjectItem(item)) return item;
                         const fields = { ...item.fieldValues, [editingDimFieldId]: dims };
                         return recalcItem(item, fields, item.quantity);
                       })

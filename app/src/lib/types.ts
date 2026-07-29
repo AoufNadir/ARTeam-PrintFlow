@@ -6,6 +6,9 @@
 import type { DesignFileAsset } from './design-file-types';
 
 export type Unit = 'mm' | 'cm';
+export type PrintCategory = 'digital' | 'offset' | 'other';
+export type MontageMode = 'disabled' | 'optional' | 'required';
+export type DesignInputMode = 'standard' | 'fixed-template';
 
 export type FieldType = 'number' | 'select' | 'yesno' | 'text' | 'dimensions';
 
@@ -44,6 +47,10 @@ export interface Service {
   pricingRuleIds: string[];
   defaultPieceSize?: { widthMm: number; heightMm: number };
   defaultBleedMm?: number;
+  /** Explicit opt-in for quote montage. Missing legacy values normalize to disabled. */
+  montageMode?: MontageMode;
+  /** Fixed-template services already know their final format and do not ask for artwork sizing in Devis. */
+  designInputMode?: DesignInputMode;
   stages?: string[]; // e.g. ["impression", "pelliculage", "coupe"]
 }
 
@@ -53,6 +60,8 @@ export interface Section {
   latinName?: string;
   description?: string;
   serviceIds: string[];
+  /** Production family used by the quote wizard and montage capability checks. */
+  printCategory?: PrintCategory;
 }
 
 // ------------------------------- Pricing rules -----------------------------
@@ -182,24 +191,112 @@ export interface QuantityOption {
   marginPercent: number;
 }
 
-export interface DevisItem {
+export type ProductionStageKind = 'print' | 'cut' | 'assembly' | 'finishing' | 'packaging' | 'other';
+export type StageCalculationMode = 'automatic' | 'perUnit' | 'perSheet' | 'fixed';
+
+export interface StageCalculation {
+  mode: StageCalculationMode;
+  /** Rate for perUnit/perSheet, or total amount for fixed. */
+  rate: number;
+  /** Manual sheet count used by perSheet when there is no montage result. */
+  sheets?: number;
+  reason?: string;
+}
+
+export interface StagePaperSnapshot {
+  id?: string;
+  name: string;
+  gsm?: number;
+  pricePerSheet: number;
+}
+
+export interface StageMachineSnapshot {
+  id?: string;
+  name: string;
+  kind: MachineKind;
+  costPerFace: number;
+  margins: Machine['margins'];
+  priseDePince?: number;
+}
+
+export interface ProductionStage {
+  id: string;
+  order: number;
+  name: string;
+  kind: ProductionStageKind;
+  quantity: number;
+  notes?: string;
+  paper?: StagePaperSnapshot;
+  sheetSize?: SheetSize;
+  productSize?: DimensionValue;
+  printMethod?: PrintMethod;
+  colorLabel?: string;
+  calculation: StageCalculation;
+  machine?: StageMachineSnapshot;
+  montageState?: MontageState;
+  montageSignature?: string;
+  montageInput?: MontageInput;
+  montageResult?: MontageResult;
+  pricing: PriceBreakdown;
+  unitCost: number;
+  totalCost: number;
+}
+
+export interface CustomProjectTotals {
+  stagesCost: number;
+  marginAmount: number;
+  marginPercent: number;
+  priceHt: number;
+  unitPriceHt: number;
+}
+
+export interface CustomProjectSnapshot {
+  schemaVersion: 1;
+  completion: 'draft' | 'complete';
+  name: string;
+  description?: string;
+  sourceSectionId: string;
+  sourceSectionName: string;
+  printCategory: PrintCategory;
+  finalQuantity: number;
+  notes?: string;
+  stages: ProductionStage[];
+  marginPercent: number;
+  manualUnitPrice?: number;
+  manualPriceReason?: string;
+  totals: CustomProjectTotals;
+}
+
+export interface DevisItemBase {
   id: string;
   order?: number;
-  serviceId: string;
   serviceName: string;
   quantity: number;
-  fieldValues: Record<string, string | number | boolean | DimensionValue>;
-  attachments?: DevisAttachment[];
-  montageState?: MontageState;
   preflight?: PreflightCheck[];
-  quantityOptions?: QuantityOption[];
   discount?: DevisDiscount;
-  manualPriceReason?: string;
-  montageResult?: MontageResult;
   pricing: PriceBreakdown;
   unitPrice: number; // DA
   total: number; // DA
 }
+
+export interface ServiceDevisItem extends DevisItemBase {
+  /** Missing on persisted v1/v2 rows; normalized to service at read time. */
+  kind?: 'service';
+  serviceId: string;
+  fieldValues: Record<string, string | number | boolean | DimensionValue>;
+  attachments?: DevisAttachment[];
+  montageState?: MontageState;
+  quantityOptions?: QuantityOption[];
+  manualPriceReason?: string;
+  montageResult?: MontageResult;
+}
+
+export interface CustomProjectDevisItem extends DevisItemBase {
+  kind: 'custom-project';
+  customProject: CustomProjectSnapshot;
+}
+
+export type DevisItem = ServiceDevisItem | CustomProjectDevisItem;
 
 export interface Devis {
   id: string;

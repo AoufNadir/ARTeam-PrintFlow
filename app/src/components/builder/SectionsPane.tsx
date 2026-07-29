@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { Check, Copy, GripVertical, Pencil, Plus } from 'lucide-react';
-import type { Section, Service } from '@/lib/types';
+import type { PrintCategory, Section, Service } from '@/lib/types';
 import { db, uid } from '@/lib/storage';
 import { toast } from 'sonner';
 import { Chip, inputCls } from '@/components/settings/Overlay';
@@ -24,6 +24,7 @@ export default function SectionsPane({ sections, services, meta, setMeta, active
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState('');
   const [newIcon, setNewIcon] = useState('printer');
+  const [newCategory, setNewCategory] = useState<PrintCategory>('other');
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [dragId, setDragId] = useState<string | null>(null);
@@ -39,13 +40,14 @@ export default function SectionsPane({ sections, services, meta, setMeta, active
   const addSection = () => {
     const name = newName.trim();
     if (!name) return;
-    const s: Section = { id: uid('sec'), name, serviceIds: [] };
+    const s: Section = { id: uid('sec'), name, serviceIds: [], printCategory: newCategory };
     db.sections.create(s);
     setMeta({ sectionIcons: { ...meta.sectionIcons, [s.id]: newIcon } });
     logAudit('catalog', `أضاف قسمًا جديدًا «${name}»`, `قسم: ${name}`);
     toast.success(`أُضيف القسم «${name}»`);
     setAdding(false);
     setNewName('');
+    setNewCategory('other');
     refresh();
     onSelect(s.id);
   };
@@ -119,6 +121,15 @@ export default function SectionsPane({ sections, services, meta, setMeta, active
                 </button>
               ))}
             </div>
+            <select
+              value={newCategory}
+              onChange={(event) => setNewCategory(event.target.value as PrintCategory)}
+              className="mt-2 h-9 w-full rounded-[8px] border border-[var(--line-strong)] bg-white px-2 text-[12px]"
+            >
+              <option value="digital">طباعة رقمية</option>
+              <option value="offset">طباعة أوفست</option>
+              <option value="other">خدمات أخرى</option>
+            </select>
             <button
               type="button"
               onClick={addSection}
@@ -223,9 +234,28 @@ export default function SectionsPane({ sections, services, meta, setMeta, active
         })}
       </div>
 
-      <p className="border-t border-[var(--line)] px-4 py-3 text-[11px] leading-4 text-[var(--ink-400)]">
-        الترتيب هنا هو ترتيب الظهور في معالج Devis. الكتالوج الأولي قابل للتعديل أو التعطيل.
-      </p>
+      <div className="border-t border-[var(--line)] px-4 py-3">
+        {activeId && (
+          <label className="mb-2 block text-[11px] text-[var(--ink-500)]">
+            تصنيف الطباعة
+            <select
+              value={sections.find((section) => section.id === activeId)?.printCategory ?? 'other'}
+              onChange={(event) => {
+                db.sections.update(activeId, { printCategory: event.target.value as PrintCategory });
+                refresh();
+              }}
+              className="mt-1 h-8 w-full rounded-[7px] border border-[var(--line-strong)] bg-white px-2 text-[12px]"
+            >
+              <option value="digital">رقمية</option>
+              <option value="offset">أوفست</option>
+              <option value="other">خدمات أخرى</option>
+            </select>
+          </label>
+        )}
+        <p className="text-[11px] leading-4 text-[var(--ink-400)]">
+          الترتيب هنا هو ترتيب الظهور في معالج Devis. الكتالوج الأولي قابل للتعديل أو التعطيل.
+        </p>
+      </div>
     </div>
   );
 }

@@ -55,6 +55,8 @@ export default function ServicesPane({ section, services, meta, setMeta, activeI
       ],
       pricingRuleIds: ['rule-waste', 'rule-overhead', 'rule-margin'],
       stages: ['impression'],
+      montageMode: 'disabled',
+      designInputMode: 'standard',
     };
     if (template !== 'empty') {
       const tpl = services.find((s) => s.id === template);

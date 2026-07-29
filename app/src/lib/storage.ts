@@ -27,11 +27,12 @@ import type {
   Section,
   Service,
 } from './types';
+import { customProjectPreflight, isCustomProjectItem } from './custom-project';
 import { DEFAULT_TVA_RATE, devisTotals } from '@/components/devis/devis-utils';
 
 const PREFIX = 'arteam-printflow:';
 const SEEDED_KEY = `${PREFIX}seeded-v1`;
-const DATA_VERSION = 2;
+const DATA_VERSION = 4;
 const SCHEMA_VERSION_KEY = `${PREFIX}schema-version`;
 
 type EntityMap = {
@@ -180,22 +181,41 @@ export function exportLocalSnapshot() {
 // ------------------------------- migrations ----------------------------------
 
 function migrateItem(item: DevisItem, index: number): DevisItem {
-  const montageState = item.montageState ?? (item.montageResult ? 'confirmed' : 'estimated');
-  const preflight = item.preflight ?? [
-    {
-      key: 'montage',
-      label: 'المونتاج',
-      status: montageState === 'invalid' || montageState === 'stale' ? 'error' : montageState === 'estimated' ? 'warning' : 'ok',
-      message:
-        montageState === 'confirmed'
-          ? undefined
-          : montageState === 'estimated'
-            ? 'السعر تقديري لأن المونتاج غير مؤكد.'
-            : 'يحتاج المونتاج إلى مراجعة قبل الإرسال.',
-    },
-  ];
+  if (isCustomProjectItem(item)) {
+    const stages = (item.customProject.stages ?? [])
+      .map((stage, stageIndex) => ({ ...stage, order: stageIndex }))
+      .sort((a, b) => a.order - b.order);
+    const customProject = {
+      ...item.customProject,
+      schemaVersion: 1 as const,
+      completion: item.customProject.completion ?? 'draft',
+      stages,
+    };
+    const complete = customProject.completion === 'complete';
+    return {
+      ...item,
+      kind: 'custom-project',
+      order: item.order ?? index,
+      customProject,
+      preflight: customProjectPreflight(customProject),
+      unitPrice: complete ? item.unitPrice : 0,
+      total: complete ? item.total : 0,
+    };
+  }
+
+  const hasMontageData = Boolean(item.montageResult || item.montageState);
+  const montageState = item.montageState ?? (item.montageResult ? 'confirmed' : undefined);
+  const preflight = item.preflight ?? (hasMontageData && montageState
+    ? [{
+        key: 'montage',
+        label: 'المونتاج',
+        status: montageState === 'invalid' || montageState === 'stale' ? 'error' : montageState === 'estimated' ? 'warning' : 'ok',
+        message: montageState === 'confirmed' ? undefined : montageState === 'estimated' ? 'السعر تقديري لأن المونتاج غير مؤكد.' : 'يحتاج المونتاج إلى مراجعة قبل الإرسال.',
+      }]
+    : []);
   return {
     ...item,
+    kind: 'service',
     order: item.order ?? index,
     attachments: item.attachments ?? [],
     montageState,
@@ -235,22 +255,47 @@ function normalizeDevis(devis: Devis): Devis {
 
 function migrateStorage(): void {
   const current = Number(localStorage.getItem(SCHEMA_VERSION_KEY));
+  const sections = readAll<Section>('sections');
+  const migratedSections = sections.map((section) => {
+    if (section.printCategory) return section;
+    const key = `${section.id} ${section.name} ${section.latinName ?? ''}`.toLowerCase();
+    const printCategory = key.includes('offset') || key.includes('أوفست')
+      ? 'offset'
+      : key.includes('digital') || key.includes('numérique') || key.includes('رقمي')
+        ? 'digital'
+        : 'other';
+    return { ...section, printCategory } as Section;
+  });
+  const services = readAll<Service>('services');
+  const migratedServices = services.map((service) => ({
+    ...service,
+    montageMode: service.montageMode ?? 'disabled',
+    designInputMode: service.designInputMode ?? (service.id === 'svc-carte-visite' ? 'fixed-template' : 'standard'),
+  }));
   const rows = readAll<Devis>('devis');
   const migrated = rows.map(normalizeDevis);
   const changed =
     current !== DATA_VERSION ||
     rows.length !== migrated.length ||
     rows.some((row, index) => JSON.stringify(row) !== JSON.stringify(migrated[index]));
+  if (sections.some((row, index) => JSON.stringify(row) !== JSON.stringify(migratedSections[index]))) {
+    writeAll('sections', migratedSections);
+  }
+  if (services.some((row, index) => JSON.stringify(row) !== JSON.stringify(migratedServices[index]))) {
+    writeAll('services', migratedServices);
+  }
   if (changed) writeAll('devis', migrated);
   localStorage.setItem(SCHEMA_VERSION_KEY, String(DATA_VERSION));
 }
 
 function devisHasSendBlocker(devis: Devis): boolean {
   return devis.items.some(
-    (item) =>
-      item.montageState === 'invalid' ||
-      item.montageState === 'stale' ||
-      item.preflight?.some((check) => check.status === 'error'),
+    (item) => {
+      if (isCustomProjectItem(item)) {
+        return item.customProject.completion !== 'complete' || item.preflight?.some((check) => check.status === 'error');
+      }
+      return item.montageState === 'invalid' || item.montageState === 'stale' || item.preflight?.some((check) => check.status === 'error');
+    },
   );
 }
 
@@ -371,7 +416,7 @@ export const db = {
       const src = get('devis', id);
       if (!src) return undefined;
       const devis = normalizeDevis(src);
-      if (status === 'sent' && devisHasSendBlocker(devis)) return undefined;
+      if ((status === 'ready' || status === 'sent') && devisHasSendBlocker(devis)) return undefined;
       const now = new Date().toISOString();
       const patch: Partial<Devis> = { status, updatedAt: now };
       if (status === 'sent') {
