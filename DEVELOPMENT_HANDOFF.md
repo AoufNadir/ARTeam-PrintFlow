@@ -35,7 +35,8 @@ Last reviewed: 2026-09-06
 - RLS is enabled.
 - Row count at review time: `0`
 - Local schema file: `app/supabase/schema.sql`
-- Supabase migration history is currently empty, so future schema work should introduce formal migration files.
+- Remote Supabase migration history was empty at review time.
+- Local formal migration added: `app/supabase/migrations/20260906200223_init_printflow_records.sql`
 
 ## Vercel
 
@@ -77,9 +78,8 @@ Known build warning:
 
 ## Recommended Next Steps
 
-1. Commit the current app changes and this handoff file on `codex/project-unification-2026-09-06`.
-2. Push the branch to GitHub and use it as the clean continuation branch.
-3. Decide whether `ARTeam-PrintFlow-Test1` should replace `main`, or open a pull request into `main`.
-4. Re-link Vercel to `AoufNadir/ARTeam-PrintFlow` before deploying.
-5. Add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` to the final Vercel project.
-6. Convert `app/supabase/schema.sql` into a formal Supabase migration before future database changes.
+1. Use `codex/project-unification-2026-09-06` as the clean continuation branch.
+2. Decide whether `ARTeam-PrintFlow-Test1` should replace `main`, or open a pull request into `main`.
+3. Re-link Vercel to `AoufNadir/ARTeam-PrintFlow` before deploying.
+4. Add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` to the final Vercel project.
+5. Apply/repair Supabase migration history intentionally before future database changes, because the remote table existed before local migrations were introduced.
