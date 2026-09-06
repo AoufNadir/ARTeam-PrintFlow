@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { Plus } from 'lucide-react';
-import type { Section, Service } from '@/lib/types';
+import type { Section, Service, ServiceStageTemplate, ServiceWorkflow } from '@/lib/types';
 import { db, uid } from '@/lib/storage';
 import { toast } from 'sonner';
 import { Btn, Chip, FieldLabel, inputCls, Modal } from '@/components/settings/Overlay';
@@ -26,12 +26,13 @@ export default function ServicesPane({ section, services, meta, setMeta, activeI
   const [modal, setModal] = useState(false);
   const [name, setName] = useState('');
   const [latin, setLatin] = useState('');
-  const [basis, setBasis] = useState<'perCopy' | 'perM2' | 'fixed'>('perCopy');
+  const [basis, setBasis] = useState<'perCopy' | 'perM2' | 'perCm2' | 'fixed'>('perCopy');
+  const [workflow, setWorkflow] = useState<ServiceWorkflow>('standard');
   const [template, setTemplate] = useState('empty');
 
   if (!section) {
     return (
-      <div className="flex h-full w-[300px] shrink-0 items-center justify-center border-e border-[var(--line)] bg-[var(--paper-100)] px-6 text-center text-[13px] text-[var(--ink-400)]">
+      <div className="flex min-h-36 min-w-0 items-center justify-center border-b border-[var(--line)] bg-[var(--paper-100)] px-6 text-center text-[13px] text-[var(--ink-400)] xl:h-full xl:border-e xl:border-b-0">
         اختر قسمًا لعرض خدماته
       </div>
     );
@@ -47,16 +48,30 @@ export default function ServicesPane({ section, services, meta, setMeta, activeI
   const createService = () => {
     const n = name.trim();
     if (!n) return;
+    const defaultStageTemplates: ServiceStageTemplate[] = [
+      {
+        id: uid('stage'),
+        order: 0,
+        name: 'مرحلة الطباعة',
+        latinName: 'Impression',
+        kind: 'print',
+        montageMode: 'required',
+        printCategory: section.printCategory === 'other' ? undefined : section.printCategory,
+        fieldIds: [],
+      },
+    ];
     let base: Omit<Service, 'id' | 'sectionId'> = {
       name: n,
       latinName: latin.trim() || undefined,
-      fields: [
+      fields: workflow === 'multiStage' ? [] : [
         { id: 'quantity', label: 'الكمية', type: 'number', required: true, min: 1, step: 50, defaultValue: 500 },
       ],
       pricingRuleIds: ['rule-waste', 'rule-overhead', 'rule-margin'],
       stages: ['impression'],
       montageMode: 'disabled',
       designInputMode: 'standard',
+      workflow,
+      ...(workflow === 'multiStage' ? { stageTemplates: defaultStageTemplates, projectFieldIds: [] } : {}),
     };
     if (template !== 'empty') {
       const tpl = services.find((s) => s.id === template);
@@ -65,6 +80,8 @@ export default function ServicesPane({ section, services, meta, setMeta, activeI
           ...structuredClone(tpl),
           name: n,
           latinName: latin.trim() || tpl.latinName,
+          workflow,
+          ...(workflow === 'multiStage' && !tpl.stageTemplates?.length ? { stageTemplates: defaultStageTemplates } : {}),
         };
       }
     }
@@ -77,27 +94,32 @@ export default function ServicesPane({ section, services, meta, setMeta, activeI
     setModal(false);
     setName('');
     setLatin('');
+    setWorkflow('standard');
     setTemplate('empty');
     refresh();
     onSelect(svc.id);
   };
 
   return (
-    <div className="flex h-full w-[300px] shrink-0 flex-col border-e border-[var(--line)] bg-[var(--paper-100)]/50">
+    <div className="flex max-h-[46dvh] min-w-0 flex-col border-b border-[var(--line)] bg-[var(--paper-100)]/50 xl:h-full xl:max-h-none xl:border-e xl:border-b-0">
       <div className="flex items-center justify-between gap-2 px-4 pt-4 pb-2">
         <h3 className="min-w-0 truncate text-[17px] leading-[26px] font-semibold text-[var(--ink-900)]">
-          خدمات: {section.name}
+          الخدمات
         </h3>
         <Btn variant="secondary" size="sm" onClick={() => setModal(true)}>
           <Plus size={14} /> خدمة جديدة
         </Btn>
+      </div>
+      <div className="px-4 pb-2 text-[12px] text-[var(--ink-500)]">
+        {section.name}
       </div>
 
       <div className={cn('flex-1 space-y-2 overflow-y-auto px-3 pb-3 transition-opacity duration-250', sectionDisabled && 'pointer-events-none opacity-45')}>
         {ordered.map((s, i) => {
           const disabled = meta.disabledServices.includes(s.id);
           const active = s.id === activeId;
-          const stages = s.stages ?? [];
+          const stages = s.stageTemplates?.length ? s.stageTemplates : (s.stages ?? []);
+          const stageLabels = meta.stageLabels[s.id] ?? {};
           return (
             <motion.div
               key={s.id}
@@ -120,15 +142,15 @@ export default function ServicesPane({ section, services, meta, setMeta, activeI
                 <div className="min-w-0">
                   <div className={cn('truncate text-[14px] font-semibold', active ? 'text-[var(--ink-900)]' : 'text-[var(--ink-700)]')}>
                     {s.name}
-                    {s.latinName && (
-                      <span dir="ltr" className="font-latin ms-2 text-[11px] font-medium text-[var(--ink-400)]">
-                        {s.latinName}
-                      </span>
-                    )}
                   </div>
+                  {s.latinName && (
+                    <div dir="ltr" className="font-latin mt-0.5 truncate text-[11px] font-medium text-[var(--ink-400)]">
+                      {s.latinName}
+                    </div>
+                  )}
                   <div className="mt-1.5 flex flex-wrap items-center gap-1">
                     <Chip>{s.fields.length} حقول</Chip>
-                    <Chip>{s.pricingRuleIds.length} قواعد تسعير</Chip>
+                    {s.workflow === 'multiStage' && <Chip tint="cyan">مشروع مراحل</Chip>}
                     <Chip tint={stages.length > 1 ? 'violet' : 'paper'}>
                       {stages.length <= 1 ? 'مرحلة واحدة' : `${stages.length} مراحل`}
                     </Chip>
@@ -155,7 +177,9 @@ export default function ServicesPane({ section, services, meta, setMeta, activeI
               </div>
               {stages.length > 1 && (
                 <div dir="ltr" className="font-latin mt-2 truncate text-[10px] text-[var(--ink-400)]">
-                  {stages.map(stageLabel).join(' → ')}
+                  {stages
+                    .map((stage) => typeof stage === 'string' ? (stageLabels[stage] ?? stageLabel(stage)) : stage.name)
+                    .join(' → ')}
                 </div>
               )}
             </motion.div>
@@ -193,9 +217,33 @@ export default function ServicesPane({ section, services, meta, setMeta, activeI
             <input dir="ltr" value={latin} onChange={(e) => setLatin(e.target.value)} placeholder="Carte Visite" className={cn(inputCls, 'font-latin')} />
           </div>
           <div>
+            <FieldLabel>نوع الخدمة</FieldLabel>
+            <div className="grid grid-cols-2 gap-1.5">
+              {([
+                ['standard', 'خدمة عادية'],
+                ['multiStage', 'مشروع متعدد المراحل'],
+              ] as const).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setWorkflow(value)}
+                  className={cn(
+                    'h-9 rounded-[8px] border text-[13px] font-medium transition-colors',
+                    workflow === value ? 'border-[var(--cyan-600)] bg-[var(--cyan-100)] text-[var(--cyan-600)]' : 'border-[var(--line)] bg-white text-[var(--ink-500)] hover:bg-[var(--paper-100)]',
+                  )}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <p className="mt-1.5 text-[11px] leading-4 text-[var(--ink-400)]">
+              المشروع متعدد المراحل يستعمل نفس الحقول والتسعير، لكن يسمح بتقسيم الإنتاج إلى مراحل طباعة/قص/تشطيب.
+            </p>
+          </div>
+          <div>
             <FieldLabel>أساس التسعير</FieldLabel>
             <div className="flex gap-1.5">
-              {(['perCopy', 'perM2', 'fixed'] as const).map((b) => (
+              {(['perCopy', 'perM2', 'perCm2', 'fixed'] as const).map((b) => (
                 <button
                   key={b}
                   type="button"

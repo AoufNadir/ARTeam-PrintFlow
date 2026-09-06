@@ -11,7 +11,7 @@ export interface PriceChipProps {
   className?: string;
 }
 
-/** Signature pattern: option label + inline price delta: "Papier Couché 350g — +10 دج/نسخة" */
+/** Signature pattern: option label + inline price delta: "Papier Couché 350g — +10 دج/القطعة الواحدة" */
 export default function PriceChip({ label, latinLabel, delta, deltaUnit = 'perCopy', dark = false, className }: PriceChipProps) {
   return (
     <span

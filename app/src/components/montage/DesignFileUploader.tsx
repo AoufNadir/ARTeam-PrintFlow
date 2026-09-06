@@ -7,8 +7,6 @@ import {
   ImageIcon,
   Loader2,
   Ruler,
-  Scissors,
-  ShieldCheck,
   UploadCloud,
 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -151,7 +149,6 @@ export default function DesignFileUploader({
   onAttachCutContour,
 }: DesignFileUploaderProps) {
   const designInputRef = useRef<HTMLInputElement>(null);
-  const contourInputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [pending, setPending] = useState<PendingReview | null>(null);
@@ -318,47 +315,24 @@ export default function DesignFileUploader({
           void reviewFiles(Array.from(event.dataTransfer.files), 'design');
         }}
         className={cn(
-          'rounded-[12px] border border-dashed p-3 transition-colors',
+          'transition-colors',
           dragging
-            ? 'border-[var(--cyan-600)] bg-[var(--cyan-50)]'
-            : 'border-[var(--line-strong)] bg-white',
+            ? 'rounded-[12px] ring-2 ring-[var(--cyan-100)]'
+            : '',
         )}
       >
-        <div className="flex items-start gap-2.5">
-          <div className="grid h-10 w-10 shrink-0 place-items-center rounded-[10px] bg-[var(--cyan-50)] text-[var(--cyan-600)]">
-            {busy ? <Loader2 size={20} className="animate-spin" /> : <UploadCloud size={20} />}
-          </div>
-          <div className="min-w-0 flex-1">
-            <p className="text-[13px] font-semibold text-[var(--ink-800)]">ارفع التصميم لاكتشاف القياس</p>
-            <p className="mt-0.5 text-[11px] leading-5 text-[var(--ink-400)]">
-              PDF / SVG / AI المتوافق مع PDF / JPG — التحليل محلي على هذا الجهاز
-            </p>
-          </div>
-        </div>
-        <div className="mt-3 grid grid-cols-2 gap-2">
-          <button
-            type="button"
-            disabled={busy || availableSlots <= 0}
-            onClick={() => designInputRef.current?.click()}
-            className="flex h-9 items-center justify-center gap-1.5 rounded-[9px] bg-[var(--cyan-600)] px-2 text-[12px] font-semibold text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45"
-          >
-            <UploadCloud size={14} />
-            رفع تصميم
-          </button>
-          <button
-            type="button"
-            disabled={busy || stickers.length === 0}
-            onClick={() => contourInputRef.current?.click()}
-            className="flex h-9 items-center justify-center gap-1.5 rounded-[9px] border border-[var(--line-strong)] bg-white px-2 text-[12px] font-semibold text-[var(--ink-600)] transition-colors hover:border-[var(--cyan-600)] hover:text-[var(--cyan-600)] disabled:cursor-not-allowed disabled:opacity-45"
-          >
-            <Scissors size={14} />
-            رفع tracé découpe
-          </button>
-        </div>
-        <p className="mt-2 flex items-center gap-1 text-[10px] text-[var(--ink-400)]">
-          <ShieldCheck size={11} />
-          لا تُرسل الملفات إلى الإنترنت. الحد الأقصى 100MB للملف.
-        </p>
+        <button
+          type="button"
+          disabled={busy || availableSlots <= 0}
+          onClick={() => designInputRef.current?.click()}
+          className={cn(
+            'flex h-10 w-full items-center justify-center gap-2 rounded-[10px] bg-[var(--cyan-600)] px-4 text-[13px] font-semibold text-white transition-all hover:bg-[var(--cyan-500)] disabled:cursor-not-allowed disabled:opacity-45',
+            dragging && 'bg-[var(--cyan-500)]',
+          )}
+        >
+          {busy ? <Loader2 size={15} className="animate-spin" /> : <UploadCloud size={15} />}
+          رفع الملف
+        </button>
         <input
           ref={designInputRef}
           className="hidden"
@@ -367,16 +341,6 @@ export default function DesignFileUploader({
           multiple
           onChange={(event) => {
             void reviewFiles(Array.from(event.target.files ?? []), 'design');
-            event.target.value = '';
-          }}
-        />
-        <input
-          ref={contourInputRef}
-          className="hidden"
-          type="file"
-          accept={ACCEPTED_FILES}
-          onChange={(event) => {
-            void reviewFiles(Array.from(event.target.files ?? []), 'contour');
             event.target.value = '';
           }}
         />

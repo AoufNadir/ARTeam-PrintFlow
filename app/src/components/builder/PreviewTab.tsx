@@ -1,16 +1,16 @@
 import { useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import type { DimensionValue, Service } from '@/lib/types';
+import type { DimensionValue, ProductionStageKind, Service, ServiceStageTemplate } from '@/lib/types';
 import { db } from '@/lib/storage';
 import { formatDA } from '@/lib/units';
-import { priceItem, type FieldValues } from '@/lib/pricing-engine';
+import { firstQuantityFieldId, isQuantityField, priceItem, readServiceQuantity, type FieldValues } from '@/lib/pricing-engine';
 import DimensionGroup from '@/components/ds/DimensionGroup';
 import NumberField from '@/components/ds/NumberField';
 import SelectWithPrice from '@/components/ds/SelectWithPrice';
 import YesNoToggle from '@/components/ds/YesNoToggle';
 import { useUnit } from '@/components/layout-context';
 import { CropMarks } from '@/components/ds/SectionCard';
-import { inputCls } from '@/components/settings/Overlay';
+import { Chip, inputCls } from '@/components/settings/Overlay';
 
 interface Props {
   service: Service;
@@ -47,11 +47,26 @@ export default function PreviewTab({ service, rulesKey }: Props) {
   const price = useMemo(() => {
     const rules = db.currentRules();
     const vals = { ...values };
-    // preview drives the quantity by the test strip unless the service has its own quantity field value
-    if (typeof vals['quantity'] !== 'number' || !vals['quantity']) vals['quantity'] = testQty;
+    const quantityId = firstQuantityFieldId(service);
+    const currentQuantity = quantityId ? vals[quantityId] : vals.quantity;
+    if (typeof currentQuantity !== 'number' || !currentQuantity) {
+      if (quantityId) vals[quantityId] = testQty;
+      else vals.quantity = testQty;
+    }
     return priceItem(service, vals, rules);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [service, values, testQty, rulesKey]);
+
+  const previewQuantity = useMemo(() => {
+    const quantityId = firstQuantityFieldId(service);
+    const vals = { ...values };
+    const currentQuantity = quantityId ? vals[quantityId] : vals.quantity;
+    if (typeof currentQuantity !== 'number' || !currentQuantity) {
+      if (quantityId) vals[quantityId] = testQty;
+      else vals.quantity = testQty;
+    }
+    return readServiceQuantity(service, vals);
+  }, [service, values, testQty]);
 
   const set = (id: string, v: string | number | boolean | DimensionValue) => setValues((prev) => ({ ...prev, [id]: v }));
 
@@ -86,7 +101,7 @@ export default function PreviewTab({ service, rulesKey }: Props) {
                     label={f.label + (f.required ? ' *' : '')}
                     value={typeof values[f.id] === 'number' ? (values[f.id] as number) : undefined}
                     onChange={(v) => set(f.id, v)}
-                    presets={f.id === 'quantity' ? [100, 250, 500, 1000] : undefined}
+                    presets={isQuantityField(f) ? [100, 250, 500, 1000] : undefined}
                     min={f.min}
                     step={f.step}
                   />
@@ -106,6 +121,7 @@ export default function PreviewTab({ service, rulesKey }: Props) {
                     options={f.options ?? []}
                     value={typeof values[f.id] === 'string' ? (values[f.id] as string) : undefined}
                     onChange={(id) => set(f.id, id)}
+                    showPrices={false}
                   />
                 )}
                 {f.type === 'yesno' && (
@@ -115,8 +131,7 @@ export default function PreviewTab({ service, rulesKey }: Props) {
                       onChange={(v) => set(f.id, v)}
                       label={f.label}
                       latinLabel={f.latinName}
-                      priceDelta={f.options?.[0]?.priceDelta}
-                      deltaUnit={f.options?.[0]?.deltaUnit as 'perCopy' | 'perSheet' | 'perM2' | 'fixed' | 'percent' | undefined}
+                      showPrice={false}
                     />
                   </div>
                 )}
@@ -164,7 +179,7 @@ export default function PreviewTab({ service, rulesKey }: Props) {
         </div>
 
         <div className="rounded-[10px] bg-[var(--paper-100)] p-3">
-          <div className="text-[11px] text-[var(--ink-400)]">سعر النسخة</div>
+          <div className="text-[11px] text-[var(--ink-400)]">سعر القطعة</div>
           <AnimatePresence mode="wait">
             <motion.div
               key={price.unitPrice}
@@ -188,7 +203,7 @@ export default function PreviewTab({ service, rulesKey }: Props) {
           className="rounded-[10px] border border-[var(--line)] p-3"
         >
           <div className="text-[11px] text-[var(--ink-400)]">
-            الإجمالي (<span dir="ltr" className="font-latin">{testQty}</span> نسخة)
+            الإجمالي (<span dir="ltr" className="font-latin">{previewQuantity}</span> قطعة)
           </div>
           <div dir="ltr" className="font-latin text-[26px] leading-8 font-semibold tabular-nums text-[var(--cyan-600)]">
             {formatDA(price.total)}
@@ -215,7 +230,51 @@ export default function PreviewTab({ service, rulesKey }: Props) {
             </div>
           ))}
         </dl>
+        {service.workflow === 'multiStage' && (
+          <div className="border-t border-[var(--line)] pt-3">
+            <div className="mb-2 text-[12px] font-semibold text-[var(--ink-700)]">مراحل القالب</div>
+            <div className="space-y-1.5">
+              {serviceStageSummary(service).map((stage, index) => (
+                <div key={stage.id} className="flex items-center gap-2 rounded-[8px] bg-[var(--paper-100)] px-2.5 py-2 text-[12px] text-[var(--ink-600)]">
+                  <Chip tint="cyan">
+                    <span dir="ltr" className="font-latin">{index + 1}</span>
+                  </Chip>
+                  <span className="min-w-0 flex-1 truncate">{stage.name}</span>
+                  <span className="text-[10px] text-[var(--ink-400)]">{stageKindLabel(stage.kind)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
+}
+
+function serviceStageSummary(service: Service): ServiceStageTemplate[] {
+  if (service.stageTemplates?.length) return [...service.stageTemplates].sort((a, b) => a.order - b.order);
+  return (service.stages?.length ? service.stages : ['impression']).map((stageId, index) => ({
+    id: `legacy-${stageId}-${index}`,
+    order: index,
+    name: stageId === 'impression' ? 'مرحلة الطباعة' : stageId,
+    kind: legacyStageKind(stageId),
+  }));
+}
+
+function legacyStageKind(stageId: string): ProductionStageKind {
+  if (stageId === 'impression') return 'print';
+  if (stageId === 'coupe' || stageId === 'cutcontour') return 'cut';
+  if (stageId === 'pliage') return 'assembly';
+  if (stageId === 'livraison') return 'packaging';
+  if (stageId === 'pelliculage' || stageId === 'finition') return 'finishing';
+  return 'other';
+}
+
+function stageKindLabel(kind: ProductionStageKind): string {
+  if (kind === 'print') return 'طباعة';
+  if (kind === 'cut') return 'قص';
+  if (kind === 'assembly') return 'تجميع';
+  if (kind === 'finishing') return 'تشطيب';
+  if (kind === 'packaging') return 'تغليف';
+  return 'أخرى';
 }

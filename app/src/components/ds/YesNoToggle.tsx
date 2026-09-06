@@ -10,10 +10,11 @@ export interface YesNoToggleProps {
   priceDelta?: number;
   deltaUnit?: keyof typeof DELTA_UNIT_LABELS;
   className?: string;
+  showPrice?: boolean;
 }
 
-/** Spring-knob switch with optional inline price delta: "Pelliculage Mat — +3 دج/نسخة" */
-export default function YesNoToggle({ checked, onChange, label, latinLabel, priceDelta, deltaUnit = 'perCopy', className }: YesNoToggleProps) {
+/** Spring-knob switch with optional inline price delta: "Pelliculage Mat — +3 دج/القطعة الواحدة" */
+export default function YesNoToggle({ checked, onChange, label, latinLabel, priceDelta, deltaUnit = 'perCopy', className, showPrice = true }: YesNoToggleProps) {
   return (
     <div className={cn('flex items-center justify-between gap-3', className)}>
       <span className="flex min-w-0 items-center gap-2 text-[14px] text-[var(--ink-700)]">
@@ -23,7 +24,7 @@ export default function YesNoToggle({ checked, onChange, label, latinLabel, pric
             {latinLabel}
           </span>
         )}
-        {priceDelta !== undefined && priceDelta !== 0 && (
+        {showPrice && priceDelta !== undefined && priceDelta !== 0 && (
           <span dir="ltr" className="font-latin shrink-0 font-semibold text-[var(--cyan-600)]">
             {formatDelta(priceDelta, DELTA_UNIT_LABELS[deltaUnit])}
           </span>

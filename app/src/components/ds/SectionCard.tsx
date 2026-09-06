@@ -12,6 +12,7 @@ export interface SectionCardProps {
   document?: boolean;
   defaultCollapsed?: boolean;
   accent?: 'default' | 'warning';
+  allowOverflow?: boolean;
 }
 
 /** 4 corner L crop-marks (traits de coupe), 12x12, 1.5px stroke. Place inside a relative container. */
@@ -49,6 +50,7 @@ export default function SectionCard({
   document = false,
   defaultCollapsed = false,
   accent = 'default',
+  allowOverflow = false,
 }: SectionCardProps) {
   const [collapsed, setCollapsed] = useState(defaultCollapsed);
   return (
@@ -83,7 +85,7 @@ export default function SectionCard({
             animate={{ height: 'auto', opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
             transition={{ duration: 0.2 }}
-            className="overflow-hidden"
+            className={allowOverflow ? 'overflow-visible' : 'overflow-hidden'}
           >
             <div className="px-5 pb-5">{children}</div>
           </motion.div>

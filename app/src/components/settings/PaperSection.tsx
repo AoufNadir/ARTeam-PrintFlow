@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { Check, Pencil, Plus, X } from 'lucide-react';
+import { Check, Pencil, Plus, Trash2, X } from 'lucide-react';
 import { toast } from 'sonner';
-import type { PaperType } from '@/lib/types';
+import type { MachineKind, PaperType, PaperVariant } from '@/lib/types';
 import { db, uid } from '@/lib/storage';
 import { formatDA, parseDecimal } from '@/lib/units';
 import SectionCard from '@/components/ds/SectionCard';
@@ -42,6 +42,7 @@ export default function PaperSection({ papers, refresh }: Props) {
   const [priceDraft, setPriceDraft] = useState('');
   const [flashId, setFlashId] = useState<string | null>(null);
   const [modal, setModal] = useState(false);
+  const [editingPaper, setEditingPaper] = useState<PaperType | null>(null);
   const [fresh, setFresh] = useState<Record<string, string>>({});
 
   const rows = useMemo(() => papers, [papers]);
@@ -167,8 +168,7 @@ export default function PaperSection({ papers, refresh }: Props) {
                         type="button"
                         aria-label="تعديل السعر"
                         onClick={() => {
-                          setEditingId(p.id);
-                          setPriceDraft(String(p.pricePerSheet));
+                          setEditingPaper(p);
                         }}
                         className="grid h-7 w-7 place-items-center rounded-[6px] text-[var(--ink-400)] transition-colors hover:bg-[var(--paper-100)] hover:text-[var(--cyan-600)]"
                       >
@@ -191,6 +191,15 @@ export default function PaperSection({ papers, refresh }: Props) {
           setModal(false);
         }}
       />
+      <PaperVariantsModal
+        key={editingPaper?.id ?? 'closed'}
+        paper={editingPaper}
+        onClose={() => setEditingPaper(null)}
+        onSaved={() => {
+          refresh();
+          setEditingPaper(null);
+        }}
+      />
     </SectionCard>
   );
 }
@@ -199,12 +208,24 @@ function NewPaperModal({ open, onClose, onCreated }: { open: boolean; onClose: (
   const [name, setName] = useState('');
   const [gsm, setGsm] = useState('300');
   const [price, setPrice] = useState('');
+  const [width, setWidth] = useState('320');
+  const [height, setHeight] = useState('450');
+  const [sizeLabel, setSizeLabel] = useState('32×45 cm');
 
   const save = () => {
     const g = Number(gsm) || 0;
     const v = parseDecimal(price);
     if (!name.trim() || Number.isNaN(v)) return;
-    db.papers.create({ id: uid('paper'), name: name.trim(), gsm: g, pricePerSheet: v, enabled: true });
+    const paperId = uid('paper');
+    db.papers.create({
+      id: paperId,
+      name: name.trim(),
+      gsm: g,
+      pricePerSheet: v,
+      variants: [{ id: uid('paper-size'), label: sizeLabel.trim() || `${width}×${height} mm`, widthMm: Number(width) || 0, heightMm: Number(height) || 0, pricePerSheet: v, enabled: true }],
+      allowedMachineKinds: ['digital', 'offset'],
+      enabled: true,
+    });
     logAudit('catalog', `أضاف ورقًا جديدًا «${name.trim()}»`, `ورق: ${name.trim()}`);
     toast.success('أُضيف الورق إلى الكتالوج');
     setName('');
@@ -242,6 +263,76 @@ function NewPaperModal({ open, onClose, onCreated }: { open: boolean; onClose: (
             <FieldLabel required>السعر (دج)</FieldLabel>
             <input dir="ltr" inputMode="decimal" value={price} onChange={(e) => setPrice(e.target.value)} placeholder="40" className={cn(inputCls, 'font-latin')} />
           </div>
+        </div>
+        <div className="rounded-[10px] border border-[var(--line)] bg-[var(--paper-50)] p-3">
+          <FieldLabel>أول مقاس للورق</FieldLabel>
+          <div className="mt-2 grid grid-cols-3 gap-2">
+            <input value={sizeLabel} onChange={(event) => setSizeLabel(event.target.value)} placeholder="32×45 cm" className={inputCls} />
+            <input dir="ltr" type="number" min={1} value={width} onChange={(event) => setWidth(event.target.value)} placeholder="العرض mm" className={cn(inputCls, 'font-latin')} />
+            <input dir="ltr" type="number" min={1} value={height} onChange={(event) => setHeight(event.target.value)} placeholder="الارتفاع mm" className={cn(inputCls, 'font-latin')} />
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function PaperVariantsModal({ paper, onClose, onSaved }: { paper: PaperType | null; onClose: () => void; onSaved: () => void }) {
+  const [draft, setDraft] = useState<PaperType | null>(paper);
+  if (paper && paper.id !== draft?.id) setDraft(structuredClone(paper));
+  if (!draft) return <Modal open={false} onClose={onClose} title="مقاسات الورق">{null}</Modal>;
+  const variants = draft.variants?.length
+    ? draft.variants
+    : [{ id: uid('paper-size'), label: 'كل المقاسات', widthMm: 0, heightMm: 0, pricePerSheet: draft.pricePerSheet, enabled: true }];
+  const patchVariants = (next: PaperVariant[]) => setDraft({ ...draft, variants: next, pricePerSheet: next[0]?.pricePerSheet ?? draft.pricePerSheet });
+  const toggleKind = (kind: MachineKind) => {
+    const current = draft.allowedMachineKinds ?? ['digital', 'offset'];
+    const next = current.includes(kind) ? current.filter((value) => value !== kind) : [...current, kind];
+    setDraft({ ...draft, allowedMachineKinds: next });
+  };
+  const save = () => {
+    db.papers.update(draft.id, {
+      name: draft.name,
+      gsm: draft.gsm,
+      variants,
+      pricePerSheet: variants[0]?.pricePerSheet ?? draft.pricePerSheet,
+      allowedMachineKinds: draft.allowedMachineKinds,
+      enabled: draft.enabled,
+    });
+    logAudit('catalog', `عدّل مقاسات وأسعار «${draft.name}»`, `ورق: ${draft.name}`);
+    toast.success('حُفظت مقاسات وأسعار الورق');
+    onSaved();
+  };
+  return (
+    <Modal
+      open={Boolean(paper)}
+      onClose={onClose}
+      title="مقاسات وأسعار الورق"
+      size="lg"
+      footer={<><Btn variant="ghost" onClick={onClose}>إلغاء</Btn><Btn onClick={save}>حفظ</Btn></>}
+    >
+      <div className="space-y-4">
+        <div className="grid grid-cols-2 gap-3">
+          <label><FieldLabel>اسم الورق</FieldLabel><input dir="ltr" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} className={cn(inputCls, 'font-latin')} /></label>
+          <label><FieldLabel>الغراماج</FieldLabel><input dir="ltr" type="number" value={draft.gsm} onChange={(event) => setDraft({ ...draft, gsm: Number(event.target.value) || 0 })} className={cn(inputCls, 'font-latin')} /></label>
+        </div>
+        <div>
+          <FieldLabel>متوافق مع</FieldLabel>
+          <div className="mt-2 flex gap-2">
+            {([['digital', 'رقمية'], ['offset', 'أوفست']] as const).map(([kind, label]) => <button key={kind} type="button" onClick={() => toggleKind(kind)} className={cn('rounded-[8px] border px-3 py-2 text-[12px]', (draft.allowedMachineKinds ?? ['digital', 'offset']).includes(kind) ? 'border-[var(--cyan-600)] bg-[var(--cyan-50)] text-[var(--cyan-600)]' : 'border-[var(--line)] text-[var(--ink-500)]')}>{label}</button>)}
+          </div>
+        </div>
+        <div className="space-y-2">
+          {variants.map((variant) => (
+            <div key={variant.id} className="grid grid-cols-[minmax(0,1fr)_100px_100px_110px_34px] items-end gap-2 max-md:grid-cols-2">
+              <label className="text-[11px] text-[var(--ink-500)]">اسم المقاس<input value={variant.label} onChange={(event) => patchVariants(variants.map((row) => row.id === variant.id ? { ...row, label: event.target.value } : row))} className={cn(inputCls, 'mt-1')} /></label>
+              <label className="text-[11px] text-[var(--ink-500)]">العرض mm<input dir="ltr" type="number" min={0} value={variant.widthMm} onChange={(event) => patchVariants(variants.map((row) => row.id === variant.id ? { ...row, widthMm: Number(event.target.value) || 0 } : row))} className={cn(inputCls, 'font-latin mt-1')} /></label>
+              <label className="text-[11px] text-[var(--ink-500)]">الارتفاع mm<input dir="ltr" type="number" min={0} value={variant.heightMm} onChange={(event) => patchVariants(variants.map((row) => row.id === variant.id ? { ...row, heightMm: Number(event.target.value) || 0 } : row))} className={cn(inputCls, 'font-latin mt-1')} /></label>
+              <label className="text-[11px] text-[var(--ink-500)]">دج/ورقة<input dir="ltr" type="number" min={0} step="0.01" value={variant.pricePerSheet} onChange={(event) => patchVariants(variants.map((row) => row.id === variant.id ? { ...row, pricePerSheet: Number(event.target.value) || 0 } : row))} className={cn(inputCls, 'font-latin mt-1')} /></label>
+              <button type="button" aria-label="حذف" disabled={variants.length === 1} onClick={() => patchVariants(variants.filter((row) => row.id !== variant.id))} className="mb-1 grid h-9 place-items-center rounded-[8px] text-[var(--danger-600)] hover:bg-red-50 disabled:opacity-30"><Trash2 size={14} /></button>
+            </div>
+          ))}
+          <Btn type="button" variant="secondary" size="sm" onClick={() => patchVariants([...variants, { id: uid('paper-size'), label: 'مقاس جديد', widthMm: 320, heightMm: 450, pricePerSheet: variants[0]?.pricePerSheet ?? 0, enabled: true }])}><Plus size={13} /> إضافة مقاس</Btn>
         </div>
       </div>
     </Modal>

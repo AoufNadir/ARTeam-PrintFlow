@@ -97,7 +97,7 @@ export function formatDALatin(amount: number): string {
   return `${numFormatter.format(round2(amount))} DA`;
 }
 
-/** Signed price delta for chips: "+10 دج/نسخة", "-2.1%". */
+/** Signed price delta for chips: "+10 دج/القطعة الواحدة", "-2.1%". */
 export function formatDelta(delta: number, unitLabel = ''): string {
   const sign = delta > 0 ? '+' : delta < 0 ? '-' : '';
   const abs = trimNumber(round2(Math.abs(delta)));
@@ -110,19 +110,21 @@ export function formatPercent(p: number, decimals = 1): string {
 }
 
 export const DELTA_UNIT_LABELS: Record<string, string> = {
-  perCopy: 'دج/نسخة',
+  fixed: 'دج/الخدمة',
+  perCopy: 'دج/القطعة الواحدة',
   perSheet: 'دج/ورقة',
   perFace: 'دج/وجه',
   perM2: 'دج/م²',
-  fixed: 'دج',
+  perCm2: 'دج/سم²',
   percent: '%',
 };
 
 export const BASIS_LABELS: Record<string, string> = {
+  fixed: 'للخدمة',
+  perCopy: 'لكل قطعة',
   perSheet: 'لكل ورقة',
   perFace: 'لكل وجه',
   perM2: 'لكل م²',
-  perCopy: 'لكل نسخة',
-  fixed: 'ثابت',
+  perCm2: 'لكل سم²',
   percent: '%',
 };

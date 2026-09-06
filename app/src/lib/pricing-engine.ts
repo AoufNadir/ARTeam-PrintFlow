@@ -30,7 +30,7 @@ export interface PriceInput {
   sheetsNeeded?: number;
   /** printed faces per sheet (1 recto, 2 otherwise) */
   facesPerSheet?: 1 | 2;
-  /** area of ONE piece in m² (for perM2 bases) */
+  /** area of ONE piece in m² (for perM2/perCm2 bases) */
   pieceAreaM2?: number;
   /** size of ONE piece in mm — used to estimate sheets when no montage ran */
   pieceSize?: DimensionValue;
@@ -133,6 +133,7 @@ export function computePrice(input: PriceInput): PriceBreakdown {
   const sheets = input.sheetsNeeded ?? estimateSheets(quantity, input.pieceSize);
   const faces = input.facesPerSheet ?? 1;
   const totalM2 = (input.pieceAreaM2 ?? 0) * quantity;
+  const totalCm2 = totalM2 * 10000;
 
   const out = { ...EMPTY };
 
@@ -145,7 +146,7 @@ export function computePrice(input: PriceInput): PriceBreakdown {
     }
   };
 
-  // 1) option deltas (per-copy / per-sheet / per-face / per-m² / fixed)
+  // 1) option deltas (per-service / per-copy / per-sheet / per-face / per-m² / per-cm²)
   //    — 'percent' option deltas are applied after base costs (step 3).
   for (const od of input.optionDeltas ?? []) {
     switch (od.unit) {
@@ -153,6 +154,7 @@ export function computePrice(input: PriceInput): PriceBreakdown {
       case 'perSheet': addTo(od.category, od.delta * sheets); break;
       case 'perFace': addTo(od.category, od.delta * sheets * faces); break;
       case 'perM2': addTo(od.category, od.delta * totalM2); break;
+      case 'perCm2': addTo(od.category, od.delta * totalCm2); break;
       case 'fixed': addTo(od.category, od.delta); break;
       default: break;
     }
@@ -165,6 +167,7 @@ export function computePrice(input: PriceInput): PriceBreakdown {
       case 'perSheet': addTo(cat, rule.value * sheets); break;
       case 'perFace': addTo(cat, rule.value * sheets * faces); break;
       case 'perM2': addTo(cat, rule.value * totalM2); break;
+      case 'perCm2': addTo(cat, rule.value * totalCm2); break;
       case 'perCopy': addTo(cat, rule.value * quantity); break;
       case 'fixed': addTo(cat, rule.value); break;
       default: break;
@@ -213,6 +216,49 @@ export function computePrice(input: PriceInput): PriceBreakdown {
 
 export type FieldValues = Record<string, string | number | boolean | DimensionValue>;
 
+const QUANTITY_TOKENS = [
+  'quantity',
+  'quantite',
+  'qty',
+  'qte',
+  'copies',
+  'copy',
+  'exemplaire',
+  'الكمية',
+  'الكميه',
+  'كمية',
+  'كميه',
+  'نسخة',
+  'نسخ',
+];
+
+function semanticText(...parts: Array<string | undefined>): string {
+  return parts
+    .filter(Boolean)
+    .join(' ')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+export function isQuantityField(field: Pick<Service['fields'][number], 'id' | 'label' | 'latinName' | 'placeholder' | 'type'>): boolean {
+  if (field.type !== 'number') return false;
+  const text = semanticText(field.id, field.label, field.latinName, field.placeholder);
+  return QUANTITY_TOKENS.some((token) => text.includes(token));
+}
+
+export function firstQuantityFieldId(service: { fields: Service['fields'] } | undefined): string | undefined {
+  return service?.fields.find(isQuantityField)?.id;
+}
+
+export function readServiceQuantity(service: { fields: Service['fields'] } | undefined, fieldValues: FieldValues): number {
+  const quantityId = firstQuantityFieldId(service);
+  const raw = (quantityId ? fieldValues[quantityId] : undefined) ?? fieldValues.quantity;
+  const quantity = typeof raw === 'number' ? raw : Number(raw);
+  return Number.isFinite(quantity) && quantity > 0 ? quantity : 1;
+}
+
 function isDimension(v: unknown): v is DimensionValue {
   return typeof v === 'object' && v !== null && 'widthMm' in v && 'heightMm' in v;
 }
@@ -245,14 +291,20 @@ export function priceItem(
   montage?: MontageResult | null,
   papers?: PaperType[],
 ): PriceBreakdown {
-  const quantityRaw = fieldValues['quantity'];
-  const quantity = typeof quantityRaw === 'number' ? quantityRaw : Number(quantityRaw) || 1;
+  const quantity = readServiceQuantity(service, fieldValues);
 
   const optionDeltas: PriceInput['optionDeltas'] = [];
   let pieceAreaM2: number | undefined;
   let pieceSize: DimensionValue | undefined;
+  let dimensionPricingSize: DimensionValue | undefined;
   let facesPerSheet: 1 | 2 | undefined;
   let paperRate: number | undefined;
+  const dimensionPricing =
+    service.dimensionPricing &&
+    service.dimensionPricing.mode !== 'none' &&
+    service.fields.some((field) => field.id === service.dimensionPricing?.fieldId && field.type === 'dimensions')
+      ? service.dimensionPricing
+      : undefined;
 
   for (const field of service.fields) {
     const v = fieldValues[field.id];
@@ -287,6 +339,9 @@ export function priceItem(
     if (field.type === 'dimensions' && isDimension(v)) {
       pieceSize = { widthMm: v.widthMm, heightMm: v.heightMm };
       pieceAreaM2 = (v.widthMm / 1000) * (v.heightMm / 1000);
+      if (field.id === dimensionPricing?.fieldId) {
+        dimensionPricingSize = { widthMm: v.widthMm, heightMm: v.heightMm };
+      }
     }
   }
   if (service.designInputMode === 'fixed-template' && service.defaultPieceSize) {
@@ -301,6 +356,24 @@ export function priceItem(
   }
   if (!pieceAreaM2 && pieceSize) {
     pieceAreaM2 = (pieceSize.widthMm / 1000) * (pieceSize.heightMm / 1000);
+  }
+
+  if (!dimensionPricingSize && dimensionPricing) {
+    const defaultValue = service.fields.find((field) => field.id === dimensionPricing.fieldId)?.defaultValue;
+    if (isDimension(defaultValue)) {
+      dimensionPricingSize = { widthMm: defaultValue.widthMm, heightMm: defaultValue.heightMm };
+    }
+  }
+
+  if (dimensionPricing && dimensionPricing.value > 0 && dimensionPricingSize) {
+    const area =
+      dimensionPricing.mode === 'perM2'
+        ? (dimensionPricingSize.widthMm / 1000) * (dimensionPricingSize.heightMm / 1000)
+        : (dimensionPricingSize.widthMm / 10) * (dimensionPricingSize.heightMm / 10);
+    const amount = Math.max(dimensionPricing.minTotal ?? 0, area * quantity * dimensionPricing.value);
+    if (Number.isFinite(amount) && amount > 0) {
+      optionDeltas.push({ delta: amount, unit: 'fixed', category: 'finishing' });
+    }
   }
 
   // keep only the rules attached to the service (fall back to all)

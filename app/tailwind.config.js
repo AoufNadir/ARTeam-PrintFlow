@@ -86,7 +86,7 @@ module.exports = {
       },
       fontFamily: {
         sans: ["Cairo", "ui-sans-serif", "system-ui", "sans-serif"],
-        latin: ["'Space Grotesk'", "ui-monospace", "monospace"],
+        latin: ["Cairo", "ui-sans-serif", "system-ui", "sans-serif"],
       },
       borderRadius: {
         xl: "calc(var(--radius) + 4px)",

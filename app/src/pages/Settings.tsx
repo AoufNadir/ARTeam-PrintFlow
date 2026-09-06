@@ -92,7 +92,7 @@ export default function Settings() {
       </nav>
 
       {/* content */}
-      <div className="min-w-0 max-w-[900px] flex-1 space-y-6">
+      <div className="min-w-0 flex-1 space-y-6">
         <h1 className="text-[27px] leading-9 font-bold text-[var(--ink-900)] lg:hidden">الإعدادات</h1>
         <motion.section id="company" key="company" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }} className={cn('scroll-mt-24', flash === 'company' && 'rounded-[14px] ring-2 ring-[var(--cyan-100)]')}>
           <CompanySection />

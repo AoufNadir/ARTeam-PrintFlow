@@ -8,8 +8,16 @@ export interface BuilderMeta {
   disabledServices: string[];
   sectionOrder: string[];
   sectionIcons: Record<string, string>;
-  serviceBasis: Record<string, 'perCopy' | 'perM2' | 'fixed'>;
+  serviceBasis: Record<string, 'perCopy' | 'perM2' | 'perCm2' | 'fixed'>;
+  stageLabels: Record<string, Record<string, string>>;
+  stageConditions: Record<string, Record<string, StageCondition>>;
   conditionalStages: Record<string, string[]>;
+}
+
+export interface StageCondition {
+  fieldId: string;
+  optionId?: string;
+  value?: boolean;
 }
 
 const KEY = 'arteam-printflow:builder-meta';
@@ -24,6 +32,8 @@ const DEFAULT_META: BuilderMeta = {
     'sec-grand-format': 'flag',
   },
   serviceBasis: {},
+  stageLabels: {},
+  stageConditions: {},
   conditionalStages: {},
 };
 
@@ -104,7 +114,8 @@ export function stageLabel(id: string): string {
 }
 
 export const SERVICE_BASIS_LABELS: Record<string, string> = {
-  perCopy: 'لكل نسخة',
+  perCopy: 'لكل قطعة',
   perM2: 'لكل م²',
-  fixed: 'ثابت',
+  perCm2: 'لكل سم²',
+  fixed: 'للخدمة',
 };

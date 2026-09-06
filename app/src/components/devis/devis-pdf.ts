@@ -51,7 +51,7 @@ async function renderDevisCanvas(devis: Devis, client?: Client, project?: Projec
         }),
       );
     });
-    // wait for webfonts (Cairo / Space Grotesk) and the logo SVG
+    // wait for Cairo webfont and the logo SVG
     await document.fonts.ready;
     const imgs = Array.from(host.querySelectorAll('img'));
     await Promise.all(

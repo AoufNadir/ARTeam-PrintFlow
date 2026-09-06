@@ -9,11 +9,12 @@ export type Unit = 'mm' | 'cm';
 export type PrintCategory = 'digital' | 'offset' | 'other';
 export type MontageMode = 'disabled' | 'optional' | 'required';
 export type DesignInputMode = 'standard' | 'fixed-template';
+export type ServiceWorkflow = 'standard' | 'multiStage';
 
 export type FieldType = 'number' | 'select' | 'yesno' | 'text' | 'dimensions';
 
-/** Unit basis shown next to a price delta, e.g. "+10 دج/نسخة" */
-export type DeltaUnit = 'perCopy' | 'perSheet' | 'perFace' | 'perM2' | 'fixed' | 'percent';
+/** Unit basis shown next to a price delta, e.g. "+10 دج/القطعة الواحدة" */
+export type DeltaUnit = 'fixed' | 'perCopy' | 'perSheet' | 'perFace' | 'perM2' | 'perCm2' | 'percent';
 
 export interface FieldOption {
   id: string;
@@ -37,6 +38,46 @@ export interface ServiceField {
   placeholder?: string;
 }
 
+export type DimensionPricingMode = 'none' | 'perM2' | 'perCm2';
+
+export interface DimensionPricing {
+  /** Dimensions field used as the surface source. */
+  fieldId: string;
+  mode: DimensionPricingMode;
+  /** DA per selected area unit. */
+  value: number;
+  /** Optional minimum total amount for this area-priced part. */
+  minTotal?: number;
+}
+
+export interface ServiceStageCondition {
+  fieldId: string;
+  optionId?: string;
+  value?: boolean;
+}
+
+export interface ServiceStageFieldBindings {
+  quantityFieldId?: string;
+  paperFieldId?: string;
+  productSizeFieldId?: string;
+  sheetSizeFieldId?: string;
+  printMethodFieldId?: string;
+}
+
+export interface ServiceStageTemplate {
+  id: string;
+  order: number;
+  name: string;
+  latinName?: string;
+  kind: ProductionStageKind;
+  /** Extra service-builder fields rendered inside this stage. */
+  fieldIds?: string[];
+  printCategory?: PrintCategory;
+  montageMode?: MontageMode;
+  condition?: ServiceStageCondition;
+  fieldBindings?: ServiceStageFieldBindings;
+}
+
 export interface Service {
   id: string;
   sectionId: string;
@@ -47,10 +88,18 @@ export interface Service {
   pricingRuleIds: string[];
   defaultPieceSize?: { widthMm: number; heightMm: number };
   defaultBleedMm?: number;
+  /** Optional service-local area pricing: width × height × quantity × value. */
+  dimensionPricing?: DimensionPricing;
   /** Explicit opt-in for quote montage. Missing legacy values normalize to disabled. */
   montageMode?: MontageMode;
   /** Fixed-template services already know their final format and do not ask for artwork sizing in Devis. */
   designInputMode?: DesignInputMode;
+  /** Standard card or a configurable multi-stage project template. */
+  workflow?: ServiceWorkflow;
+  /** Rich production stages used by multi-stage services. Legacy `stages` stays for old services and summaries. */
+  stageTemplates?: ServiceStageTemplate[];
+  /** Fields shown once in the project-information step. Unassigned legacy fields normalize here. */
+  projectFieldIds?: string[];
   stages?: string[]; // e.g. ["impression", "pelliculage", "coupe"]
 }
 
@@ -66,7 +115,7 @@ export interface Section {
 
 // ------------------------------- Pricing rules -----------------------------
 
-export type PricingBasis = 'perSheet' | 'perFace' | 'perM2' | 'perCopy' | 'fixed' | 'percent';
+export type PricingBasis = 'perSheet' | 'perFace' | 'perM2' | 'perCm2' | 'perCopy' | 'fixed' | 'percent';
 
 export interface PricingRule {
   id: string;
@@ -192,7 +241,7 @@ export interface QuantityOption {
 }
 
 export type ProductionStageKind = 'print' | 'cut' | 'assembly' | 'finishing' | 'packaging' | 'other';
-export type StageCalculationMode = 'automatic' | 'perUnit' | 'perSheet' | 'fixed';
+export type StageCalculationMode = 'automatic' | 'perUnit' | 'perSheet' | 'perFace' | 'perM2' | 'perCm2' | 'fixed';
 
 export interface StageCalculation {
   mode: StageCalculationMode;
@@ -207,7 +256,20 @@ export interface StagePaperSnapshot {
   id?: string;
   name: string;
   gsm?: number;
+  variantId?: string;
+  variantLabel?: string;
+  widthMm?: number;
+  heightMm?: number;
   pricePerSheet: number;
+}
+
+export type MachinePricingBasis = 'perFace' | 'perSheet' | 'per1000Faces';
+
+export interface MachinePricing {
+  basis: MachinePricingBasis;
+  rate: number;
+  setupCost?: number;
+  minimumCharge?: number;
 }
 
 export interface StageMachineSnapshot {
@@ -215,15 +277,23 @@ export interface StageMachineSnapshot {
   name: string;
   kind: MachineKind;
   costPerFace: number;
+  pricing?: MachinePricing;
   margins: Machine['margins'];
   priseDePince?: number;
 }
 
 export interface ProductionStage {
   id: string;
+  templateStageId?: string;
+  /** Conditional template stages stay stored but do not price/validate while inactive. */
+  enabled?: boolean;
   order: number;
   name: string;
   kind: ProductionStageKind;
+  /** Printing family is selected independently for every print stage. */
+  printCategory?: MachineKind;
+  /** Values of builder-defined fields scoped to this stage. */
+  fieldValues?: Record<string, string | number | boolean | DimensionValue>;
   quantity: number;
   notes?: string;
   paper?: StagePaperSnapshot;
@@ -244,6 +314,7 @@ export interface ProductionStage {
 
 export interface CustomProjectTotals {
   stagesCost: number;
+  projectOptionsCost?: number;
   marginAmount: number;
   marginPercent: number;
   priceHt: number;
@@ -251,13 +322,17 @@ export interface CustomProjectTotals {
 }
 
 export interface CustomProjectSnapshot {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   completion: 'draft' | 'complete';
   name: string;
   description?: string;
   sourceSectionId: string;
   sourceSectionName: string;
   printCategory: PrintCategory;
+  templateServiceId?: string;
+  templateServiceName?: string;
+  templateSnapshot?: Service;
+  projectFieldValues?: Record<string, string | number | boolean | DimensionValue>;
   finalQuantity: number;
   notes?: string;
   stages: ProductionStage[];
@@ -498,6 +573,17 @@ export interface Machine {
   priseDePince?: number;
   sheetSizes: SheetSize[];
   costPerFace?: number; // DA
+  /** Current production tariff. `costPerFace` remains as a legacy fallback. */
+  pricing?: MachinePricing;
+  enabled: boolean;
+}
+
+export interface PaperVariant {
+  id: string;
+  label: string;
+  widthMm: number;
+  heightMm: number;
+  pricePerSheet: number;
   enabled: boolean;
 }
 
@@ -507,6 +593,9 @@ export interface PaperType {
   gsm: number;
   pricePerSheet: number; // DA
   sheetSizeId?: string;
+  /** Size-specific stock prices. Empty/missing keeps the legacy single-price behavior. */
+  variants?: PaperVariant[];
+  allowedMachineKinds?: MachineKind[];
   enabled: boolean;
 }
 

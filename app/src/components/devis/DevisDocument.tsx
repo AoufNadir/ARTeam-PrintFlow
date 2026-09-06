@@ -153,7 +153,7 @@ export default function DevisDocument({ devis, client, project, unit, animated =
                     {custom && (
                       <div className="mt-2 overflow-hidden rounded-[7px] border border-[var(--line)] text-[10px] font-normal">
                         <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-2 bg-[var(--paper-100)] px-2 py-1 text-[var(--ink-500)]"><span>المرحلة</span><span>الكمية</span><span>الأوراق</span></div>
-                        {item.customProject.stages.map((stage) => (
+                        {item.customProject.stages.filter((stage) => stage.enabled !== false).map((stage) => (
                           <div key={stage.id} className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-2 border-t border-[var(--line)] px-2 py-1.5">
                             <span><span className="block">{stage.name} — {PRODUCTION_STAGE_LABELS[stage.kind]}</span>{stagePublicSpec(stage, unit) && <span className="mt-0.5 block text-[9px] text-[var(--ink-400)]">{stagePublicSpec(stage, unit)}</span>}</span>
                             <span dir="ltr" className="font-latin">{stage.quantity}</span>

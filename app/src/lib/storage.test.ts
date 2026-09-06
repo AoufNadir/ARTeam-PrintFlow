@@ -78,7 +78,7 @@ describe('local devis repository migration', () => {
   it('normalizes legacy quotes without losing the commercial total', () => {
     const created = db.devis.create(legacyDevis());
 
-    expect(created.dataVersion).toBe(4);
+    expect(created.dataVersion).toBe(6);
     expect(created.revision).toBe(1);
     expect(created.items[0].order).toBe(0);
     expect(created.items[0].kind).toBe('service');
@@ -108,11 +108,69 @@ describe('local devis repository migration', () => {
     expect(db.sections.get('sec-other-old')?.printCategory).toBe('other');
     expect(db.services.get('svc-old')?.montageMode).toBe('disabled');
     expect(db.services.get('svc-old')?.designInputMode).toBe('standard');
-    expect(localStorage.getItem('arteam-printflow:schema-version')).toBe('4');
+    expect(localStorage.getItem('arteam-printflow:schema-version')).toBe('6');
   });
 
   it('marks the seeded Carte Visite service as a fixed template', () => {
     expect(db.services.get('svc-carte-visite')?.designInputMode).toBe('fixed-template');
+  });
+
+  it('normalizes machine tariffs and paper size variants for the v6 catalog', () => {
+    expect(db.machines.list().every((machine) => Boolean(machine.pricing))).toBe(true);
+    expect(db.machines.list().find((machine) => machine.kind === 'offset')?.pricing?.basis).toBe('per1000Faces');
+    expect(db.papers.list().every((paper) => Boolean(paper.variants?.length))).toBe(true);
+  });
+
+  it('drops service area pricing when the linked dimensions field no longer exists', () => {
+    localStorage.clear();
+    localStorage.setItem('arteam-printflow:seeded-v1', '1');
+    localStorage.setItem('arteam-printflow:schema-version', '4');
+    localStorage.setItem('arteam-printflow:sections', JSON.stringify([
+      { id: 'sec-digital', name: 'طباعة رقمية', printCategory: 'digital', serviceIds: ['svc-card'] },
+    ]));
+    localStorage.setItem('arteam-printflow:services', JSON.stringify([
+      {
+        id: 'svc-card',
+        sectionId: 'sec-digital',
+        name: 'بطاقة زيارة',
+        fields: [{ id: 'quantity', label: 'الكمية', type: 'number', required: true }],
+        pricingRuleIds: [],
+        dimensionPricing: { fieldId: 'format', mode: 'perCm2', value: 18 },
+      },
+    ]));
+    localStorage.setItem('arteam-printflow:devis', '[]');
+
+    db.ensureSeeded();
+
+    expect(db.services.get('svc-card')?.dimensionPricing).toBeUndefined();
+  });
+
+  it('migrates multi-stage services to editable stage templates', () => {
+    localStorage.clear();
+    localStorage.setItem('arteam-printflow:seeded-v1', '1');
+    localStorage.setItem('arteam-printflow:schema-version', '4');
+    localStorage.setItem('arteam-printflow:sections', JSON.stringify([
+      { id: 'sec-digital', name: 'طباعة رقمية', printCategory: 'digital', serviceIds: ['svc-project'] },
+    ]));
+    localStorage.setItem('arteam-printflow:services', JSON.stringify([
+      {
+        id: 'svc-project',
+        sectionId: 'sec-digital',
+        name: 'مشروع حر',
+        workflow: 'multiStage',
+        fields: [{ id: 'quantity', label: 'الكمية', type: 'number', required: true }],
+        pricingRuleIds: [],
+        stages: ['impression', 'coupe'],
+      },
+    ]));
+    localStorage.setItem('arteam-printflow:devis', '[]');
+
+    db.ensureSeeded();
+
+    const service = db.services.get('svc-project');
+    expect(service?.workflow).toBe('multiStage');
+    expect(service?.stageTemplates?.map((stage) => stage.kind)).toEqual(['print', 'cut']);
+    expect(service?.stageTemplates?.find((stage) => stage.kind === 'print')?.montageMode).toBe('required');
   });
 
   it('blocks ready and sent when a line has stale montage or preflight errors', () => {

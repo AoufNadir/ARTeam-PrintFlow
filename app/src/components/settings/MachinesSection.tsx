@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { Plus, Star } from 'lucide-react';
+import { Plus, Star, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 import type { Machine, MachineKind } from '@/lib/types';
 import { db, uid } from '@/lib/storage';
@@ -36,6 +36,7 @@ export default function MachinesSection({ machines, refresh }: Props) {
       priseDePince: kind === 'offset' ? 10 : undefined,
       sheetSizes: [{ id: uid('sheet'), widthMm: 320, heightMm: 450, label: '32×45 cm' }],
       costPerFace: kind === 'digital' ? 12 : 7,
+      pricing: { basis: kind === 'digital' ? 'perFace' : 'per1000Faces', rate: kind === 'digital' ? 12 : 7, setupCost: 0, minimumCharge: 0 },
       enabled: true,
     };
     db.machines.create(m);
@@ -108,6 +109,7 @@ export default function MachinesSection({ machines, refresh }: Props) {
                           </Chip>
                         )}
                         {defaultId === m.id && <Chip tint="cyan">افتراضية</Chip>}
+                        <Chip>{m.pricing?.basis === 'per1000Faces' ? 'دج/1000 وجه' : m.pricing?.basis === 'perSheet' ? 'دج/ورقة' : 'دج/وجه'}</Chip>
                         {!m.enabled && <Chip tint="danger">موقوفة</Chip>}
                       </div>
                     </motion.div>
@@ -145,6 +147,8 @@ function MachineDrawer({ machine, onClose, refresh }: { machine: Machine | null;
   if (!m) return <Drawer open={false} onClose={onClose}>{null}</Drawer>;
 
   const patch = (p: Partial<Machine>) => setM({ ...m, ...p });
+  const tariff = m.pricing ?? { basis: m.kind === 'offset' ? 'per1000Faces' as const : 'perFace' as const, rate: m.costPerFace ?? 0, setupCost: 0, minimumCharge: 0 };
+  const patchTariff = (patchValue: Partial<NonNullable<Machine['pricing']>>) => patch({ pricing: { ...tariff, ...patchValue } });
   const patchMargins = (side: keyof Machine['margins'], v: number) => {
     const margins = linked ? { top: v, bottom: v, left: v, right: v } : { ...m.margins, [side]: v };
     patch({ margins });
@@ -156,6 +160,8 @@ function MachineDrawer({ machine, onClose, refresh }: { machine: Machine | null;
       margins: m.margins,
       priseDePince: m.priseDePince,
       costPerFace: m.costPerFace,
+      pricing: m.pricing,
+      sheetSizes: m.sheetSizes,
       enabled: m.enabled,
     });
     logAudit('catalog', `عدّل هوامش ماكينة «${m.name}»`, `ماكينة: ${m.name}`);
@@ -235,13 +241,47 @@ function MachineDrawer({ machine, onClose, refresh }: { machine: Machine | null;
           <NumberField label="Prise de pince (مم)" value={m.priseDePince ?? 10} onChange={(v) => patch({ priseDePince: v })} unitSuffix="مم" min={0} />
         )}
 
-        <NumberField
-          label={m.kind === 'digital' ? 'سعر الوجه الافتراضي (دج)' : 'التكلفة لكل 1000 (دج)'}
-          value={m.costPerFace ?? 0}
-          onChange={(v) => patch({ costPerFace: v })}
-          unitSuffix="دج"
-          min={0}
-        />
+        <div className="rounded-[10px] border border-[var(--line)] bg-[var(--paper-50)] p-3">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <FieldLabel>طريقة تسعير الماكينة</FieldLabel>
+            <Chip tint="cyan">بعد المونتاج</Chip>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="text-[12px] font-medium text-[var(--ink-700)]">
+              أساس الحساب
+              <select value={tariff.basis} onChange={(event) => patchTariff({ basis: event.target.value as NonNullable<Machine['pricing']>['basis'] })} className={cn(inputCls, 'mt-1.5 bg-white')}>
+                <option value="perFace">دج/وجه مطبوع</option>
+                <option value="perSheet">دج/ورقة مطبوعة</option>
+                <option value="per1000Faces">دج/1000 وجه مطبوع</option>
+              </select>
+            </label>
+            <NumberField label="السعر" value={tariff.rate} onChange={(value) => { patchTariff({ rate: value }); patch({ costPerFace: value, pricing: { ...tariff, rate: value } }); }} unitSuffix="دج" min={0} />
+            <NumberField label="تكلفة الإعداد" value={tariff.setupCost ?? 0} onChange={(value) => patchTariff({ setupCost: value })} unitSuffix="دج" min={0} />
+            <NumberField label="الحد الأدنى" value={tariff.minimumCharge ?? 0} onChange={(value) => patchTariff({ minimumCharge: value })} unitSuffix="دج" min={0} />
+          </div>
+        </div>
+
+        <div className="rounded-[10px] border border-[var(--line)] bg-white p-3">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <div>
+              <FieldLabel>مقاسات الورق المدعومة</FieldLabel>
+              <p className="mt-1 text-[11px] text-[var(--ink-400)]">تظهر هذه المقاسات داخل مرحلة الطباعة والمونتاج.</p>
+            </div>
+            <Btn type="button" variant="secondary" size="sm" onClick={() => patch({ sheetSizes: [...m.sheetSizes, { id: uid('sheet'), label: 'مقاس جديد', widthMm: 320, heightMm: 450 }] })}>
+              <Plus size={13} /> مقاس
+            </Btn>
+          </div>
+          <div className="space-y-2">
+            {m.sheetSizes.map((sheet) => (
+              <div key={sheet.id} className="grid grid-cols-[minmax(0,1fr)_90px_90px_32px] items-end gap-2 max-sm:grid-cols-2">
+                <label className="text-[11px] text-[var(--ink-500)]">الاسم<input value={sheet.label} onChange={(event) => patch({ sheetSizes: m.sheetSizes.map((row) => row.id === sheet.id ? { ...row, label: event.target.value } : row) })} className={cn(inputCls, 'mt-1')} /></label>
+                <label className="text-[11px] text-[var(--ink-500)]">العرض mm<input dir="ltr" type="number" min={1} value={sheet.widthMm} onChange={(event) => patch({ sheetSizes: m.sheetSizes.map((row) => row.id === sheet.id ? { ...row, widthMm: Number(event.target.value) || 0 } : row) })} className={cn(inputCls, 'font-latin mt-1')} /></label>
+                <label className="text-[11px] text-[var(--ink-500)]">الارتفاع mm<input dir="ltr" type="number" min={1} value={sheet.heightMm} onChange={(event) => patch({ sheetSizes: m.sheetSizes.map((row) => row.id === sheet.id ? { ...row, heightMm: Number(event.target.value) || 0 } : row) })} className={cn(inputCls, 'font-latin mt-1')} /></label>
+                <button type="button" aria-label="حذف المقاس" disabled={m.sheetSizes.length === 1} onClick={() => patch({ sheetSizes: m.sheetSizes.filter((row) => row.id !== sheet.id) })} className="mb-1 grid h-9 w-8 place-items-center rounded-[8px] text-[var(--danger-600)] hover:bg-red-50 disabled:opacity-30"><Trash2 size={14} /></button>
+              </div>
+            ))}
+          </div>
+        </div>
 
         <YesNoToggle checked={m.enabled} onChange={(v) => patch({ enabled: v })} label="ماكينة نشطة" />
       </div>
@@ -294,7 +334,7 @@ function SheetDiagram({ margins, pince }: { margins: Machine['margins']; pince?:
       {pince !== undefined && (
         <rect x={10} y={6} width={Math.min(pince * scale, 30)} height={H - 12} fill="#DB2777" opacity="0.18" rx="3" />
       )}
-      <text x={W / 2} y={H + 6} textAnchor="middle" fontSize="9" fill="#9AA1AF" fontFamily="Space Grotesk">
+      <text x={W / 2} y={H + 6} textAnchor="middle" fontSize="9" fill="#9AA1AF" fontFamily="Cairo">
         printable area
       </text>
     </svg>

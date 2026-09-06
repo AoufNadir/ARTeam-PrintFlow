@@ -12,10 +12,11 @@ export interface SelectWithPriceProps {
   label?: string;
   placeholder?: string;
   className?: string;
+  showPrices?: boolean;
 }
 
-/** Custom dropdown where every option row shows its price delta inline. */
-export default function SelectWithPrice({ options, value, onChange, label, placeholder = 'اختر…', className }: SelectWithPriceProps) {
+/** Custom dropdown. Price deltas are optional because customer-facing flows hide internal pricing logic. */
+export default function SelectWithPrice({ options, value, onChange, label, placeholder = 'اختر…', className, showPrices = true }: SelectWithPriceProps) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const selected = options.find((o) => o.id === value);
@@ -29,7 +30,7 @@ export default function SelectWithPrice({ options, value, onChange, label, place
   }, []);
 
   const deltaText = (o: FieldOption) =>
-    o.priceDelta !== 0 ? formatDelta(o.priceDelta, DELTA_UNIT_LABELS[o.deltaUnit]) : null;
+    showPrices && o.priceDelta !== 0 ? formatDelta(o.priceDelta, DELTA_UNIT_LABELS[o.deltaUnit]) : null;
 
   return (
     <div ref={ref} className={cn('relative', className)}>

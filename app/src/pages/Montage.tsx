@@ -440,7 +440,7 @@ export default function Montage() {
   const advisor = useMemo(() => computeMontageAdvisor(state, rules), [state, rules]);
 
   return (
-    <div className="grid items-start gap-4 xl:grid-cols-[340px_minmax(0,1fr)_360px]">
+    <div className="grid items-start gap-4 xl:grid-cols-[minmax(320px,0.85fr)_minmax(0,1.8fr)_minmax(340px,0.95fr)] 2xl:grid-cols-[minmax(380px,0.9fr)_minmax(0,2fr)_minmax(420px,1fr)]">
       {/* Zone 1 — controls (right / start) */}
       <motion.div
         initial={{ x: 32, opacity: 0 }}

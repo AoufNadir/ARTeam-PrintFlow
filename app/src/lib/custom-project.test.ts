@@ -2,17 +2,19 @@ import { describe, expect, it } from 'vitest';
 import { devisTotals } from '@/components/devis/devis-utils';
 import {
   buildCustomProjectItem,
+  applyProjectStageConditions,
   emptyProductionStage,
   duplicateProductionStage,
   isBillableDevisItem,
   montageSignatureForStage,
   moveProductionStage,
+  projectFromServiceTemplate,
   removeProductionStage,
   repriceCustomProject,
   repriceProductionStage,
   validateCustomProject,
 } from './custom-project';
-import type { CustomProjectSnapshot, MontageResult, PricingRule, ProductionStage } from './types';
+import type { CustomProjectSnapshot, MontageResult, PricingRule, ProductionStage, Section, Service } from './types';
 
 const rules: PricingRule[] = [
   { id: 'rule-waste', name: 'waste', basis: 'percent', value: 5, appliesTo: 'global', kind: 'waste', enabled: true },
@@ -132,5 +134,53 @@ describe('custom project pricing', () => {
     expect(complete.total).toBe(125);
     expect(draft.total).toBe(0);
     expect(totals.ht).toBe(175);
+  });
+
+  it('supports configurable per-sheet and per-1000-faces machine tariffs after montage', () => {
+    const montage: MontageResult = {
+      placed: [], copiesPerSheet: 10, sheetsNeeded: 100, wastePercent: 0,
+      printableArea: { x: 0, y: 0, w: 320, h: 450 }, sheetWidthMm: 320, sheetHeightMm: 450,
+      rotated: false, method: 'recto-verso', facesPerSheet: 2, alternatives: [],
+    };
+    const base: ProductionStage = {
+      ...emptyProductionStage('print-tariff', 0, 'print', 1000, 'offset'),
+      printCategory: 'offset',
+      paper: { id: 'paper', name: 'Offset', pricePerSheet: 1 },
+      sheetSize: { id: 'sheet', label: '32x45', widthMm: 320, heightMm: 450 },
+      productSize: { widthMm: 100, heightMm: 100 },
+      calculation: { mode: 'automatic', rate: 0 },
+      montageResult: montage,
+      montageState: 'confirmed',
+      machine: { id: 'offset', name: 'Offset', kind: 'offset', costPerFace: 0, pricing: { basis: 'per1000Faces', rate: 1000, setupCost: 200, minimumCharge: 500 }, margins: { top: 0, bottom: 0, left: 0, right: 0 } },
+    };
+    const confirmed = { ...base, montageSignature: montageSignatureForStage(base) };
+    const perThousand = repriceProductionStage(confirmed, []);
+    expect(perThousand.pricing.paper).toBe(100);
+    expect(perThousand.pricing.printing).toBe(500);
+    expect(perThousand.totalCost).toBe(600);
+
+    const perSheetInput = { ...confirmed, machine: { ...confirmed.machine!, pricing: { basis: 'perSheet' as const, rate: 3 } } };
+    const perSheet = { ...perSheetInput, montageSignature: montageSignatureForStage(perSheetInput) };
+    expect(repriceProductionStage(perSheet, []).pricing.printing).toBe(300);
+  });
+
+  it('creates an editable mixed-print project from a builder template and applies stage conditions', () => {
+    const section: Section = { id: 'projects', name: 'مشاريع', serviceIds: ['book'], printCategory: 'other' };
+    const service: Service = {
+      id: 'book', sectionId: section.id, name: 'كتاب متعدد المراحل', workflow: 'multiStage', pricingRuleIds: [],
+      fields: [{ id: 'cover', label: 'إضافة غلاف', type: 'yesno', defaultValue: false, required: false }],
+      projectFieldIds: ['cover'],
+      stageTemplates: [
+        { id: 'inside', order: 0, name: 'الداخلي', kind: 'print', printCategory: 'digital', montageMode: 'required' },
+        { id: 'cover-stage', order: 1, name: 'الغلاف', kind: 'print', printCategory: 'offset', montageMode: 'required', condition: { fieldId: 'cover', value: true } },
+      ],
+    };
+    const draft = projectFromServiceTemplate(section, service, 20);
+    expect(draft.schemaVersion).toBe(2);
+    expect(draft.stages.map((stage) => stage.printCategory)).toEqual(['digital', 'offset']);
+    expect(draft.stages[1].enabled).toBe(false);
+
+    const enabled = applyProjectStageConditions({ ...draft, projectFieldValues: { cover: true } });
+    expect(enabled.stages[1].enabled).toBe(true);
   });
 });

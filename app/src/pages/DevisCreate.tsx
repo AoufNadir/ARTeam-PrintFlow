@@ -26,6 +26,7 @@ import {
   X,
 } from 'lucide-react';
 import { toast } from 'sonner';
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import {
   DimensionGroup,
   EmptyState,
@@ -66,7 +67,15 @@ import { logAudit } from '@/components/settings/audit';
 import { designNameFromAsset, type DesignFileAsset } from '@/lib/design-file-types';
 import { computeMontage } from '@/lib/montage-engine';
 import { resolveMontageMode } from '@/lib/montage-policy';
-import { DESIGN_SIZE_FIELD, percentRule, priceItem, type FieldValues } from '@/lib/pricing-engine';
+import {
+  DESIGN_SIZE_FIELD,
+  firstQuantityFieldId,
+  isQuantityField,
+  percentRule,
+  priceItem,
+  readServiceQuantity,
+  type FieldValues,
+} from '@/lib/pricing-engine';
 import {
   consumeMontageCommit,
   makeMontageSessionId,
@@ -83,18 +92,22 @@ import type {
   CustomProjectDevisItem,
   DevisStatus,
   DimensionValue,
+  Machine,
   MachineKind,
   MontageResult,
   MontageState,
   MontageInput,
   PreflightCheck,
+  PaperType,
   PrintMethod,
   ProductionStage,
+  ProductionStageKind,
   Project,
   QuantityOption,
   Section,
   Service,
   ServiceDevisItem,
+  ServiceStageTemplate,
   SheetAlternative,
 } from '@/lib/types';
 import { formatDA, formatPercent, round2 } from '@/lib/units';
@@ -219,8 +232,13 @@ function phaseForStep(step: number): number {
   return 4;
 }
 
-function isDesignField(fieldId: string, type: Service['fields'][number]['type']): boolean {
-  return fieldId === 'quantity' || type === 'dimensions';
+function isDesignField(field: Service['fields'][number]): boolean {
+  return isQuantityField(field) || field.type === 'dimensions';
+}
+
+function withServiceQuantity(service: Service | undefined, values: FieldValues, quantity: number): FieldValues {
+  const id = firstQuantityFieldId(service);
+  return id ? { ...values, [id]: quantity } : { ...values, quantity };
 }
 
 function serviceAllowsMultipleDesigns(service: Service | undefined): boolean {
@@ -231,6 +249,31 @@ function serviceAllowsMultipleDesigns(service: Service | undefined): boolean {
 
 function isFixedTemplateService(service: Service | undefined): boolean {
   return service?.designInputMode === 'fixed-template';
+}
+
+function isMultiStageService(service: Service | undefined): boolean {
+  return service?.workflow === 'multiStage';
+}
+
+function legacyStageKind(stageId: string): ProductionStageKind {
+  if (stageId === 'impression') return 'print';
+  if (stageId === 'coupe' || stageId === 'cutcontour') return 'cut';
+  if (stageId === 'pliage') return 'assembly';
+  if (stageId === 'livraison') return 'packaging';
+  if (stageId === 'pelliculage' || stageId === 'finition') return 'finishing';
+  return 'other';
+}
+
+function serviceStageTemplates(service: Service | undefined): ServiceStageTemplate[] {
+  if (!service) return [];
+  if (service.stageTemplates?.length) return [...service.stageTemplates].sort((a, b) => a.order - b.order);
+  return (service.stages?.length ? service.stages : ['impression']).map((stageId, index) => ({
+    id: `legacy-${stageId}-${index}`,
+    order: index,
+    name: stageId === 'impression' ? 'مرحلة الطباعة' : stageId,
+    kind: legacyStageKind(stageId),
+    montageMode: stageId === 'impression' ? service.montageMode ?? 'disabled' : 'disabled',
+  }));
 }
 
 function machineKindFromSection(section: Section | undefined, service: Service | undefined): MachineKind {
@@ -690,6 +733,8 @@ export default function DevisCreate() {
   const [serviceSearch, setServiceSearch] = useState('');
   const [customMode, setCustomMode] = useState(false);
   const [customEditingItemId, setCustomEditingItemId] = useState<string | null>(null);
+  const [customTemplateServiceId, setCustomTemplateServiceId] = useState<string | null>(null);
+  const [customTemplateChooserOpen, setCustomTemplateChooserOpen] = useState(false);
 
   // step 3 — general info (hydrated from the edited draft when present)
   const [clientId, setClientId] = useState(() => editDevis?.clientId ?? '');
@@ -763,25 +808,29 @@ export default function DevisCreate() {
   const allowsMontage = serviceMontageMode !== 'disabled';
   const requiresMontage = serviceMontageMode === 'required';
   const fixedTemplate = isFixedTemplateService(service);
+  const quantityFieldId = useMemo(() => firstQuantityFieldId(service), [service]);
+  const hasDimensionField = useMemo(() => service?.fields.some((field) => field.type === 'dimensions') ?? false, [service]);
   const designFields = useMemo(
-    () => service?.fields.filter((field) => isDesignField(field.id, field.type)) ?? [],
+    () => service?.fields.filter(isDesignField) ?? [],
     [service],
   );
+  const machines = useMemo<Machine[]>(
+    () => (editDevis?.machinesSnapshot?.length ? editDevis.machinesSnapshot : db.machines.list()),
+    [editDevis],
+  );
   const productionFields = useMemo(
-    () => service?.fields.filter((field) => !isDesignField(field.id, field.type)) ?? [],
+    () => service?.fields.filter((field) => !isDesignField(field)) ?? [],
     [service],
   );
   const montageKind = useMemo(() => machineKindFromSection(section, service), [section, service]);
 
-  const quantity = useMemo(() => {
-    const q = fieldValues['quantity'];
-    return (typeof q === 'number' ? q : Number(q)) || 1;
-  }, [fieldValues]);
+  const quantity = useMemo(() => readServiceQuantity(service, fieldValues), [service, fieldValues]);
 
   const currentDims = useMemo((): DimensionValue | undefined => {
     if (!service) return undefined;
     if (isFixedTemplateService(service) && service.defaultPieceSize) return service.defaultPieceSize;
     const df = service.fields.find((f) => f.type === 'dimensions');
+    if (!df) return undefined;
     const v = df ? fieldValues[df.id] : undefined;
     const detected = fieldValues[DESIGN_SIZE_FIELD];
     if (isDim(v)) return v;
@@ -936,6 +985,7 @@ export default function DevisCreate() {
     () => (editingItem && !isCustomProjectItem(editingItem) ? db.services.get(editingItem.serviceId) : undefined),
     [editingItem],
   );
+  const editingQuantityFieldId = firstQuantityFieldId(editingService);
   const editingDimFieldId = firstDimensionFieldId(editingService);
   const editingDims = editingDimFieldId && editingItem && !isCustomProjectItem(editingItem) && isDim(editingItem.fieldValues[editingDimFieldId])
     ? editingItem.fieldValues[editingDimFieldId]
@@ -1019,6 +1069,9 @@ export default function DevisCreate() {
     const v: FieldValues = {};
     svc.fields.forEach((f) => {
       if (f.defaultValue !== undefined) v[f.id] = f.defaultValue as FieldValues[string];
+      else if (isQuantityField(f)) v[f.id] = f.min ?? 1;
+      else if (f.type === 'select') v[f.id] = f.options?.[0]?.id ?? '';
+      else if (f.type === 'yesno') v[f.id] = false;
     });
     return v;
   };
@@ -1042,6 +1095,16 @@ export default function DevisCreate() {
   const selectService = (id: string) => {
     const svc = db.services.get(id);
     if (!svc) return;
+    if (isMultiStageService(svc)) {
+      setServiceId(null);
+      setCustomTemplateServiceId(svc.id);
+      setCustomMode(true);
+      setCustomEditingItemId(null);
+      setCustomTemplateChooserOpen(false);
+      setStep(3);
+      setMaxStep((current) => Math.max(current, 3));
+      return;
+    }
     setServiceId(id);
     setFieldValues(initFieldValues(svc));
     setMontage(null);
@@ -1061,9 +1124,15 @@ export default function DevisCreate() {
   };
 
   const selectCustomProject = () => {
+    setCustomTemplateChooserOpen(true);
+  };
+
+  const startBlankCustomProject = () => {
     setServiceId(null);
+    setCustomTemplateServiceId(null);
     setCustomMode(true);
     setCustomEditingItemId(null);
+    setCustomTemplateChooserOpen(false);
     setStep(3);
     setMaxStep((current) => Math.max(current, 3));
   };
@@ -1174,8 +1243,8 @@ export default function DevisCreate() {
   };
 
   const openCustomStageStudio = (itemId: string, stage: ProductionStage) => {
-    if (!sectionId || !stage.machine || !stage.sheetSize || !stage.productSize) {
-      toast.error('اختر الماكينة والورقة والمقاس النهائي قبل فتح الاستوديو');
+    if (!sectionId || !stage.printCategory || !stage.machine || !stage.paper || !stage.sheetSize || !stage.productSize) {
+      toast.error('اختر نوع الطباعة والماكينة والورق والمقاس النهائي قبل فتح الاستوديو');
       return;
     }
     const bleed = stage.montageInput?.bleedMm ?? { top: 2, bottom: 2, left: 2, right: 2 };
@@ -1255,7 +1324,7 @@ export default function DevisCreate() {
   const quantityOptions = useMemo<QuantityOption[]>(() => {
     if (!service) return [];
     return QUANTITY_COMPARE.map((q) => {
-      const values = { ...fieldValues, quantity: q };
+      const values = withServiceQuantity(service, fieldValues, q);
       const priced = priceItem(service, values, rules, montage, papers);
       const rawTotal = priced.subtotal * (1 + effectiveMargin / 100);
       const unitPrice = round2(rawTotal / q);
@@ -1746,6 +1815,7 @@ export default function DevisCreate() {
       s.name.includes(serviceSearch) ||
       (s.latinName ?? '').toLowerCase().includes(serviceSearch.toLowerCase()),
   );
+  const customProjectTemplates = db.services.list().filter((candidate) => isMultiStageService(candidate) && !isServiceDisabled(candidate.id));
 
   const stepService = (
     <div>
@@ -1787,7 +1857,14 @@ export default function DevisCreate() {
         <span className="min-w-0 flex-1">
           <span className="block text-[16px] font-bold text-[var(--ink-900)]">مشروع مخصص</span>
           <span dir="ltr" className="font-latin block text-start text-[12px] text-[var(--cyan-600)]">Projet personnalisé</span>
-          <span className="mt-1 block text-[12px] leading-5 text-[var(--ink-500)]">استعمل هذا الخيار عندما يكون المشروع مكوّنًا من عدة مراحل طباعة أو عدة أنواع ورق أو يحتاج حسابًا خاصًا.</span>
+          <span className="mt-1 block text-[12px] leading-5 text-[var(--ink-500)]">
+            استعمل هذا الخيار عندما يكون المشروع مكوّنًا من عدة مراحل طباعة أو عدة أنواع ورق. اختر قالبًا جاهزًا أو ابدأ مشروعًا فارغًا.
+          </span>
+          {customProjectTemplates.length > 0 && (
+            <span className="mt-2 inline-flex rounded-full bg-white px-2 py-0.5 text-[11px] font-medium text-[var(--cyan-600)]">
+              <span dir="ltr" className="font-latin me-1">{customProjectTemplates.length}</span> قوالب متاحة
+            </span>
+          )}
         </span>
         <ChevronLeft size={17} className="mt-3 shrink-0 text-[var(--cyan-600)]" />
       </button>
@@ -1830,9 +1907,14 @@ export default function DevisCreate() {
                           {s.latinName}
                         </span>
                       )}
-                      {s.stages && s.stages.length > 1 && (
+                      {isMultiStageService(s) && (
+                        <span className="rounded-full bg-[var(--cyan-50)] px-2 py-0.5 text-[11px] font-medium text-[var(--cyan-600)]">
+                          مشروع مراحل
+                        </span>
+                      )}
+                      {serviceStageTemplates(s).length > 1 && (
                         <span className="rounded-full bg-[var(--paper-100)] px-2 py-0.5 text-[11px] text-[var(--ink-500)]">
-                          <span dir="ltr" className="font-latin">{s.stages.length}</span> مراحل
+                          <span dir="ltr" className="font-latin">{serviceStageTemplates(s).length}</span> مراحل
                         </span>
                       )}
                     </span>
@@ -1843,7 +1925,7 @@ export default function DevisCreate() {
                     <span dir="ltr" className="font-latin font-semibold text-[var(--cyan-600)]">
                       {formatDA(startingPrice(s))}
                     </span>
-                    /نسخة
+                    /قطعة
                   </span>
                   <ChevronLeft size={16} className="shrink-0 text-[var(--ink-400)] transition-transform group-hover:-translate-x-0.5" />
                 </button>
@@ -1870,7 +1952,7 @@ export default function DevisCreate() {
   );
 
   const stepInfo = (
-    <SectionCard title="معلومات العرض">
+    <SectionCard title="معلومات العرض" allowOverflow>
       <div className="grid gap-4 md:grid-cols-2">
         <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0, duration: 0.35, ease: EASE }}>
           {fieldLabel('العميل', true)}
@@ -2027,6 +2109,7 @@ export default function DevisCreate() {
 
   const renderServiceField = (f: Service['fields'][number], i: number) => {
     const v = fieldValues[f.id];
+    const quantityField = isQuantityField(f);
     const anim = {
       initial: { opacity: 0, y: 16 },
       animate: { opacity: 1, y: 0 },
@@ -2042,8 +2125,8 @@ export default function DevisCreate() {
             min={f.min}
             max={f.max}
             step={f.step ?? 1}
-            unitSuffix={f.id === 'quantity' ? 'نسخة' : undefined}
-            presets={f.id === 'quantity' ? QTY_PRESETS : undefined}
+            unitSuffix={quantityField ? 'قطعة' : undefined}
+            presets={quantityField ? QTY_PRESETS : undefined}
           />
         </motion.div>
       );
@@ -2083,20 +2166,13 @@ export default function DevisCreate() {
                         ? 'border-[var(--cyan-600)] bg-[var(--cyan-50)] font-semibold text-[var(--ink-900)]'
                         : 'border-[var(--line-strong)] bg-white text-[var(--ink-700)] hover:border-[var(--cyan-500)]',
                     )}
-                  >
-                    {active && <Check size={14} className="text-[var(--cyan-600)]" />}
-                    <span dir="ltr" className="font-latin">{o.latinLabel ?? o.label}</span>
-                    <span className="text-[13px] text-[var(--ink-500)]">{o.label}</span>
-                    {o.priceDelta !== 0 ? (
-                      <span dir="ltr" className="font-latin text-[13px] font-semibold text-[var(--cyan-600)]">
-                        +{o.priceDelta} دج/نسخة
-                      </span>
-                    ) : (
-                      <span className="text-[12px] text-[var(--ink-400)]">أساسي</span>
-                    )}
-                  </button>
-                );
-              })}
+                    >
+                      {active && <Check size={14} className="text-[var(--cyan-600)]" />}
+                      <span dir="ltr" className="font-latin">{o.latinLabel ?? o.label}</span>
+                      <span className="text-[13px] text-[var(--ink-500)]">{o.label}</span>
+                    </button>
+                  );
+                })}
             </div>
             {montage && f.id === 'faces' && (
               <p className="mt-2 text-[11px] text-[var(--ink-400)]">تغيير نوع الطباعة بعد المونتاج سيجعل المخطط يحتاج إعادة حساب.</p>
@@ -2111,6 +2187,7 @@ export default function DevisCreate() {
             options={f.options}
             value={typeof v === 'string' ? v : undefined}
             onChange={(id) => setField(f.id, id)}
+            showPrices={false}
           />
         </motion.div>
       );
@@ -2126,6 +2203,7 @@ export default function DevisCreate() {
             latinLabel={f.latinName}
             priceDelta={opt?.priceDelta}
             deltaUnit={opt?.deltaUnit}
+            showPrice={false}
           />
           {montage && f.id.includes('contour') && (
             <p className="mt-2 text-[11px] text-[var(--ink-400)]">تغيير طريقة القص بعد المونتاج يحتاج إعادة حساب للتأكد من صلاحية المخطط.</p>
@@ -2148,11 +2226,12 @@ export default function DevisCreate() {
 
   const stepDesign = service && (
     <SectionCard
+      allowOverflow
       title={fixedTemplate ? `تفاصيل ${service.name}` : `خيارات الخدمة — ${service.name}`}
       actions={
-        fixedTemplate && currentDims ? (
+        fixedTemplate ? (
           <span className="rounded-full bg-[var(--cyan-50)] px-2.5 py-1 text-[11px] font-medium text-[var(--cyan-600)]">
-            قالب ثابت · <span dir="ltr" className="font-latin">{round2(currentDims.widthMm)}×{round2(currentDims.heightMm)} mm</span>
+            قالب ثابت
           </span>
         ) : (
           <span className="rounded-full bg-[var(--paper-100)] px-2.5 py-1 text-[11px] font-medium text-[var(--ink-500)]">
@@ -2165,38 +2244,13 @@ export default function DevisCreate() {
         <div className="space-y-6">
           <div className="space-y-5">
             <div className="flex items-center justify-between gap-3">
-              <h3 className="text-[16px] leading-6 font-semibold text-[var(--ink-900)]">الكمية والقالب</h3>
+              <h3 className="text-[16px] leading-6 font-semibold text-[var(--ink-900)]">{fixedTemplate ? 'الكمية' : 'الكمية والقالب'}</h3>
               {service.latinName && <span dir="ltr" className="font-latin text-[12px] text-[var(--ink-400)]">{service.latinName}</span>}
             </div>
             {designFields.map(renderServiceField)}
-            {fixedTemplate && currentDims && (
-              <motion.div
-                initial={{ opacity: 0, y: 16 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: designFields.length * 0.05, duration: 0.3, ease: EASE }}
-                className="flex flex-wrap items-center justify-between gap-3 rounded-[10px] border border-[var(--line)] bg-[var(--paper-50)] px-4 py-3 text-[13px]"
-              >
-                <span className="font-medium text-[var(--ink-700)]">مقاس Carte Visite المعتمد</span>
-                <span dir="ltr" className="font-latin font-semibold text-[var(--ink-900)]">
-                  {round2(currentDims.widthMm)} × {round2(currentDims.heightMm)} mm
-                </span>
-              </motion.div>
-            )}
-            {!fixedTemplate && !designFields.some((field) => field.type === 'dimensions') && currentDims && (
-              <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: designFields.length * 0.05, duration: 0.3, ease: EASE }}>
-                <p className="mb-1 text-[11px] text-[var(--ink-400)]">المقاس النهائي بعد القص، بدون Bleed.</p>
-                <DimensionGroup
-                  label="مقاس التصميم *"
-                  value={currentDims}
-                  onChange={(d) => setField(DESIGN_SIZE_FIELD, d)}
-                  unit={unit}
-                  onUnitChange={setUnit}
-                />
-              </motion.div>
-            )}
-            {!fixedTemplate && (
+            {!fixedTemplate && hasDimensionField && (
               <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: (designFields.length + 1) * 0.05, duration: 0.3, ease: EASE }}>
-                {fieldLabel('ملفات التصميم و tracé découpe')}
+                {fieldLabel('ملف التصميم')}
                 <DesignFileUploader
                   stickers={uploadStickers}
                   maxDesigns={allowsMultipleDesigns ? maxDesigns : Math.max(1, uploadStickers.length + 1)}
@@ -2244,6 +2298,7 @@ export default function DevisCreate() {
               />
             )}
           </div>
+
         </div>
 
         <div className="border-t border-[var(--line)] pt-4 md:border-s md:border-t-0 md:ps-6 md:pt-0">
@@ -2255,7 +2310,7 @@ export default function DevisCreate() {
             transition={{ duration: 0.5 }}
             className="mt-2 rounded-[10px] p-3"
           >
-            <div className="text-[12px] text-[var(--ink-500)]">سعر النسخة</div>
+            <div className="text-[12px] text-[var(--ink-500)]">سعر القطعة</div>
             <div className="font-latin text-[22px] leading-7 font-semibold text-[var(--ink-900)]">
               <FlipNumber value={final?.unitPrice ?? 0} /> <span className="text-[13px] font-normal text-[var(--ink-500)]">دج</span>
             </div>
@@ -2266,12 +2321,6 @@ export default function DevisCreate() {
           </motion.div>
           <div className="mt-2 space-y-1 text-[11px] text-[var(--ink-400)]">
             <div className="flex justify-between"><span>الكمية</span><span dir="ltr" className="font-latin">{quantity}</span></div>
-            {fixedTemplate && currentDims && (
-              <div className="flex justify-between">
-                <span>القالب</span>
-                <span dir="ltr" className="font-latin">{round2(currentDims.widthMm)}×{round2(currentDims.heightMm)} mm</span>
-              </div>
-            )}
             {montage && (
               <div className="flex justify-between"><span>الأوراق</span><span dir="ltr" className="font-latin">{montage.sheetsNeeded}</span></div>
             )}
@@ -2293,7 +2342,7 @@ export default function DevisCreate() {
                       <span dir="ltr" className="font-latin font-semibold">{Math.round(montage.sheetWidthMm)}×{Math.round(montage.sheetHeightMm)} mm</span>
                     </div>
                     <div className="flex justify-between">
-                      <span>نسخ/ورقة</span>
+                      <span>قطع/ورقة</span>
                       <span dir="ltr" className="font-latin font-semibold">{montage.copiesPerSheet}</span>
                     </div>
                     <div className="flex justify-between">
@@ -2399,7 +2448,7 @@ export default function DevisCreate() {
                   <span dir="ltr" className="font-latin">
                     {Math.round(montage.sheetWidthMm / 10)}×{Math.round(montage.sheetHeightMm / 10)} cm
                   </span>{' '}
-                  — <span dir="ltr" className="font-latin">{montage.copiesPerSheet}</span> نسخة/ورقة —{' '}
+                  — <span dir="ltr" className="font-latin">{montage.copiesPerSheet}</span> قطعة/ورقة —{' '}
                   <span dir="ltr" className="font-latin">{montage.sheetsNeeded}</span> ورقة
                 </p>
                 <div className="mt-3 flex flex-wrap gap-2">
@@ -2407,7 +2456,7 @@ export default function DevisCreate() {
                     { label: 'الهدر', value: formatPercent(montage.wastePercent) },
                     { label: 'تكلفة الورق', value: formatDA(breakdown?.paper ?? 0) },
                     { label: 'الأوجه/ورقة', value: String(montage.facesPerSheet) },
-                    { label: 'نسخ/ورقة', value: String(montage.copiesPerSheet) },
+                    { label: 'قطع/ورقة', value: String(montage.copiesPerSheet) },
                   ].map((chip, i) => (
                     <motion.span
                       key={chip.label}
@@ -2466,7 +2515,7 @@ export default function DevisCreate() {
                       {Math.round(alt.sheetWidthMm / 10)}×{Math.round(alt.sheetHeightMm / 10)} cm
                     </span>
                     <span className="text-[var(--ink-500)]">
-                      <span dir="ltr" className="font-latin">{alt.copiesPerSheet}</span> نسخة/ورقة ·{' '}
+                      <span dir="ltr" className="font-latin">{alt.copiesPerSheet}</span> قطعة/ورقة ·{' '}
                       <span dir="ltr" className="font-latin">{alt.sheetsNeeded}</span> ورقة
                     </span>
                     <span className="flex h-2 w-20 overflow-hidden rounded-full bg-[var(--paper-100)]">
@@ -2503,7 +2552,7 @@ export default function DevisCreate() {
         { id: 'paper', label: 'الورق', basis: montage ? `${montage.sheetsNeeded} ورقة` : 'تقدير من المقاس', amount: breakdown.paper, color: '#0284C7' },
         { id: 'printing', label: 'الطباعة', basis: montage ? `${montage.sheetsNeeded} ورقة × ${montage.facesPerSheet} وجه` : 'تقدير من المقاس', amount: breakdown.printing, color: '#0D9488' },
         { id: 'cutting', label: 'القص', basis: montage ? `${montage.sheetsNeeded} ورقة` : 'تقدير من المقاس', amount: breakdown.cutting, color: '#7C3AED' },
-        { id: 'finishing', label: 'التشطيب', basis: `${quantity} نسخة`, amount: breakdown.finishing, color: '#D97706' },
+        { id: 'finishing', label: 'التشطيب', basis: `${quantity} قطعة`, amount: breakdown.finishing, color: '#D97706' },
         { id: 'waste', label: 'الهدر', basis: `${percentRule(rules, 'waste')?.value ?? 0}% من تكلفة الإنتاج`, amount: breakdown.waste, color: '#9AA1AF' },
         { id: 'overhead', label: 'المصاريف العامة', basis: `${percentRule(rules, 'overhead')?.value ?? 8}%`, amount: breakdown.overhead, color: '#6B7280' },
         { id: 'margin', label: 'هامش الربح', basis: `${effectiveMargin}%`, amount: final?.margin ?? 0, color: '#16A34A' },
@@ -2564,7 +2613,7 @@ export default function DevisCreate() {
         <div className="border-t border-[var(--line)] pt-4 lg:border-s lg:border-t-0 lg:ps-6 lg:pt-0">
           {manualPrice !== null && (
             <div className="mb-4">
-              <NumberField label="سعر الوحدة اليدوي (دج)" value={manualPrice} onChange={setManualPrice} min={0} step={0.5} unitSuffix="دج/نسخة" />
+              <NumberField label="سعر الوحدة اليدوي (دج)" value={manualPrice} onChange={setManualPrice} min={0} step={0.5} unitSuffix="دج/قطعة" />
             </div>
           )}
           {negativeMargin && (
@@ -2577,7 +2626,7 @@ export default function DevisCreate() {
           )}
           <div className="space-y-2.5">
             <div className="flex items-baseline justify-between text-[14px]">
-              <span className="text-[var(--ink-500)]">سعر النسخة</span>
+              <span className="text-[var(--ink-500)]">سعر القطعة</span>
               <span className="font-latin text-[22px] leading-7 font-semibold text-[var(--ink-900)]">
                 <FlipNumber value={final.unitPrice} /> <span className="text-[13px] font-normal text-[var(--ink-500)]">دج</span>
               </span>
@@ -2652,7 +2701,7 @@ export default function DevisCreate() {
                 <button
                   key={option.quantity}
                   type="button"
-                  onClick={() => setField('quantity', option.quantity)}
+                  onClick={() => setField(quantityFieldId ?? 'quantity', option.quantity)}
                   className={cn(
                     'rounded-[10px] border px-3 py-2 text-start transition-colors',
                     quantity === option.quantity
@@ -2681,12 +2730,12 @@ export default function DevisCreate() {
                     <div className="min-w-0">
                       <div className="truncate font-medium text-[var(--ink-800)]">{row.name}</div>
                       <div className="text-[11px] text-[var(--ink-400)]">
-                        <span dir="ltr" className="font-latin">{row.quantity}</span> نسخة
+                        <span dir="ltr" className="font-latin">{row.quantity}</span> قطعة
                       </div>
                     </div>
                     <div className="text-end">
                       <div dir="ltr" className="font-latin font-semibold text-[var(--ink-900)]">{formatDA(row.amount)}</div>
-                      <div dir="ltr" className="font-latin text-[11px] text-[var(--ink-400)]">{formatDA(row.unitPrice)} / نسخة</div>
+                      <div dir="ltr" className="font-latin text-[11px] text-[var(--ink-400)]">{formatDA(row.unitPrice)} / قطعة</div>
                     </div>
                   </div>
                 ))}
@@ -2721,7 +2770,7 @@ export default function DevisCreate() {
               <span dir="ltr" className="font-latin">{lastItem.serviceName}</span>
             </div>
             <div className="text-[12px] text-[var(--ink-500)]">
-              <span dir="ltr" className="font-latin">{lastItem.quantity}</span> نسخة
+              <span dir="ltr" className="font-latin">{lastItem.quantity}</span> قطعة
             </div>
           </div>
           <div dir="ltr" className="font-latin text-[17px] font-semibold tabular-nums text-[var(--cyan-600)]">
@@ -2773,6 +2822,8 @@ export default function DevisCreate() {
   const customInitialItem = customEditingItemId
     ? items.find((item): item is CustomProjectDevisItem => item.id === customEditingItemId && isCustomProjectItem(item))
     : undefined;
+  const customTemplateService = customInitialItem?.customProject.templateSnapshot
+    ?? (customTemplateServiceId ? db.services.get(customTemplateServiceId) : undefined);
 
   const upsertCustomItem = (item: CustomProjectDevisItem, completed: boolean) => {
     const index = items.findIndex((row) => row.id === item.id);
@@ -2785,6 +2836,7 @@ export default function DevisCreate() {
       setCustomEditingItemId(item.id);
       flashSaved();
       setCustomMode(false);
+      setCustomTemplateServiceId(null);
       setStep(6);
       setMaxStep(6);
       toast.success('تمت إضافة المشروع المخصص إلى العرض');
@@ -2793,19 +2845,22 @@ export default function DevisCreate() {
 
   const customProjectContent = customMode && section ? (
     <CustomProjectWizard
-      key={customInitialItem?.id ?? `${section.id}-new`}
+      key={customInitialItem?.id ?? `${section.id}-${customTemplateService?.id ?? 'blank'}-new`}
       section={section}
       rules={rules}
       defaultMargin={defaultMargin}
       taxRate={taxRate}
       unit={unit}
       onUnitChange={setUnit}
+      templateService={customTemplateService}
+      papersCatalog={papers as PaperType[]}
+      machinesCatalog={machines}
       initialItem={customInitialItem}
       order={customInitialItem?.order ?? items.length}
       onDraftChange={(item) => upsertCustomItem(item, false)}
       onComplete={(item) => upsertCustomItem(item, true)}
       onOpenStudio={openCustomStageStudio}
-      onBack={() => { setCustomMode(false); setStep(2); }}
+      onBack={() => { setCustomMode(false); setCustomTemplateServiceId(null); setStep(2); }}
     />
   ) : null;
 
@@ -2878,9 +2933,9 @@ export default function DevisCreate() {
         </div>
       </div>}
 
-      <div className="grid grid-cols-1 items-start gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
+      <div className="grid grid-cols-1 items-start gap-6 xl:grid-cols-[minmax(0,1.8fr)_minmax(340px,0.85fr)] 2xl:grid-cols-[minmax(0,2.3fr)_minmax(420px,0.9fr)]">
         {/* main wizard column */}
-        <div className="w-full max-w-[860px]">
+        <div className="min-w-0 w-full">
           <AnimatePresence mode="wait">
             <motion.div
               key={step}
@@ -2999,7 +3054,7 @@ export default function DevisCreate() {
                       <div className="text-[11px] text-[var(--ink-400)]">
                         {isCustomProjectItem(it) ? (
                           <><span dir="ltr" className="font-latin">{it.customProject.stages.length}</span> مراحل · <span dir="ltr" className="font-latin">{it.quantity}</span> وحدة {it.customProject.completion === 'draft' && <span className="ms-1 rounded-full bg-amber-50 px-1.5 text-amber-700">قيد الإعداد</span>}</>
-                        ) : <><span dir="ltr" className="font-latin">{it.quantity}</span> نسخة</>}
+                        ) : <><span dir="ltr" className="font-latin">{it.quantity}</span> قطعة</>}
                       </div>
                     </div>
                     <span dir="ltr" className="font-latin shrink-0 text-[13px] font-semibold tabular-nums text-[var(--ink-900)]">
@@ -3238,6 +3293,28 @@ export default function DevisCreate() {
         </aside>
       </div>
 
+      <Dialog open={customTemplateChooserOpen} onOpenChange={setCustomTemplateChooserOpen}>
+        <DialogContent dir="rtl" className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>ابدأ مشروعًا متعدد المراحل</DialogTitle>
+            <DialogDescription>اختر قالبًا من منشئ الخدمات أو ابدأ مشروعًا فارغًا. يمكن تعديل المراحل لاحقًا داخل Devis.</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {customProjectTemplates.map((template) => (
+              <button key={template.id} type="button" onClick={() => selectService(template.id)} className="rounded-[12px] border border-[var(--line)] bg-white p-4 text-start transition-colors hover:border-[var(--cyan-600)] hover:bg-[var(--cyan-50)]">
+                <div className="font-semibold text-[var(--ink-900)]">{template.name}</div>
+                {template.latinName && <div dir="ltr" className="font-latin mt-0.5 text-start text-[11px] text-[var(--ink-400)]">{template.latinName}</div>}
+                <div className="mt-2 text-[11px] text-[var(--ink-500)]"><span dir="ltr" className="font-latin">{serviceStageTemplates(template).length}</span> مراحل افتراضية</div>
+              </button>
+            ))}
+            <button type="button" onClick={startBlankCustomProject} className="rounded-[12px] border-2 border-dashed border-[var(--cyan-500)] bg-[var(--cyan-50)] p-4 text-start">
+              <div className="font-semibold text-[var(--cyan-700)]">مشروع فارغ</div>
+              <div className="mt-1 text-[11px] leading-5 text-[var(--ink-500)]">أضف مراحل الطباعة والقص والتجميع حسب هذا العرض.</div>
+            </button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* new client modal */}
       <NewClientModal
         open={clientModal}
@@ -3337,8 +3414,12 @@ export default function DevisCreate() {
                   onChange={(q) =>
                     updateExistingItem(editingItem.id, (item) => {
                       if (isCustomProjectItem(item)) return item;
-                      const fields = { ...item.fieldValues, quantity: Math.max(1, Math.floor(q)) };
-                      return recalcItem(item, fields, Math.max(1, Math.floor(q)));
+                      const nextQuantity = Math.max(1, Math.floor(q));
+                      const fields = {
+                        ...item.fieldValues,
+                        [editingQuantityFieldId ?? 'quantity']: nextQuantity,
+                      };
+                      return recalcItem(item, fields, nextQuantity);
                     })
                   }
                 />
@@ -3396,7 +3477,7 @@ export default function DevisCreate() {
                   value={editingItem.unitPrice}
                   min={0}
                   step={0.5}
-                  unitSuffix="دج/نسخة"
+                  unitSuffix="دج/قطعة"
                   onChange={(price) =>
                     updateExistingItem(editingItem.id, (item) => {
                       const total = round2(price * item.quantity);

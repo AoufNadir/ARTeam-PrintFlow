@@ -78,16 +78,16 @@ export default function SectionsPane({ sections, services, meta, setMeta, active
   };
 
   return (
-    <div className="flex h-full w-[260px] shrink-0 flex-col border-e border-[var(--line)] bg-white">
-      <div className="flex items-center justify-between px-4 pt-4 pb-2">
+    <div className="flex max-h-[42dvh] min-w-0 flex-col border-b border-[var(--line)] bg-white xl:h-full xl:max-h-none xl:border-e xl:border-b-0">
+      <div className="flex items-center justify-between gap-2 px-4 pt-4 pb-2">
         <h3 className="text-[17px] leading-[26px] font-semibold text-[var(--ink-900)]">الأقسام</h3>
         <button
           type="button"
           onClick={() => setAdding((v) => !v)}
-          aria-label="قسم جديد"
-          className="grid h-8 w-8 place-items-center rounded-[8px] text-[var(--ink-500)] transition-colors hover:bg-[var(--paper-100)] hover:text-[var(--cyan-600)]"
+          className="inline-flex h-8 items-center gap-1 rounded-[8px] px-2 text-[12px] font-semibold text-[var(--cyan-600)] transition-colors hover:bg-[var(--cyan-50)]"
         >
           <Plus size={17} />
+          قسم جديد
         </button>
       </div>
 

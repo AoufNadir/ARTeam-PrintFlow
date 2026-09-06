@@ -273,7 +273,7 @@ export default function Home() {
       </div>
 
       {/* ---------------- Section 3: main grid ---------------- */}
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[1fr_380px]">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.7fr)_minmax(360px,0.8fr)] 2xl:grid-cols-[minmax(0,1.8fr)_minmax(430px,0.8fr)]">
         <motion.div initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.15, duration: 0.45, ease: EASE }}>
           <SectionCard
             title="أحدث عروض الأسعار"
@@ -396,7 +396,7 @@ export default function Home() {
       </div>
 
       {/* ---------------- Section 4: chart + onboarding ---------------- */}
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[1fr_380px]">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.7fr)_minmax(360px,0.8fr)] 2xl:grid-cols-[minmax(0,1.8fr)_minmax(430px,0.8fr)]">
         <motion.div initial={{ opacity: 0, y: 24 }} whileInView={{ opacity: 1, y: 0 }} viewport={{ once: true, margin: '-15%' }} transition={{ duration: 0.45, ease: EASE }}>
           <SectionCard
             title="نشاط الأسبوع"
@@ -426,7 +426,7 @@ export default function Home() {
                 <ComposedChart data={WEEK} margin={{ top: 8, right: 8, bottom: 0, left: -18 }}>
                   <CartesianGrid stroke="#E6E2D6" vertical={false} />
                   <XAxis dataKey="day" tick={{ fill: '#9AA1AF', fontSize: 12, fontFamily: 'Cairo' }} axisLine={{ stroke: '#E6E2D6' }} tickLine={false} />
-                  <YAxis tick={{ fill: '#9AA1AF', fontSize: 11, fontFamily: 'Space Grotesk' }} axisLine={false} tickLine={false} />
+                  <YAxis tick={{ fill: '#9AA1AF', fontSize: 11, fontFamily: 'Cairo' }} axisLine={false} tickLine={false} />
                   <Tooltip
                     cursor={{ fill: 'rgba(21,23,30,0.04)' }}
                     contentStyle={{ background: '#fff', border: '1px solid #E6E2D6', borderRadius: 10, boxShadow: 'var(--shadow-pop)', fontFamily: 'Cairo', fontSize: 13 }}

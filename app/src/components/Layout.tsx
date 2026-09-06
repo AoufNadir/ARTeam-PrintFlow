@@ -21,7 +21,6 @@ export default function Layout() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { pathname } = useLocation();
-
   // close the mobile drawer on navigation — adjust state during render
   // (React-sanctioned pattern; avoids setState inside an effect)
   const [prevPath, setPrevPath] = useState(pathname);
@@ -68,7 +67,9 @@ export default function Layout() {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <Topbar unit={unit} onUnitChange={setUnit} onOpenPalette={() => setPaletteOpen(true)} onOpenSidebar={() => setSidebarOpen(true)} />
-        <main className="mx-auto w-full max-w-[1480px] flex-1 px-4 py-4 sm:px-6 sm:py-6 md:px-8 md:py-8">
+        <main
+          className="w-full max-w-none flex-1 px-4 py-4 sm:px-6 sm:py-6 md:px-8 md:py-8"
+        >
           <Outlet context={{ unit, setUnit }} />
         </main>
       </div>

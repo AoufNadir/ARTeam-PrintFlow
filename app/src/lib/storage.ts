@@ -23,16 +23,23 @@ import type {
   PaperType,
   PricingRule,
   PricingRulesVersion,
+  ProductionStageKind,
   Project,
   Section,
   Service,
+  ServiceStageTemplate,
 } from './types';
-import { customProjectPreflight, isCustomProjectItem } from './custom-project';
+import {
+  buildCustomProjectItem,
+  customProjectPreflight,
+  isCustomProjectItem,
+  projectFromServiceTemplate,
+} from './custom-project';
 import { DEFAULT_TVA_RATE, devisTotals } from '@/components/devis/devis-utils';
 
 const PREFIX = 'arteam-printflow:';
 const SEEDED_KEY = `${PREFIX}seeded-v1`;
-const DATA_VERSION = 4;
+const DATA_VERSION = 6;
 const SCHEMA_VERSION_KEY = `${PREFIX}schema-version`;
 
 type EntityMap = {
@@ -183,12 +190,21 @@ export function exportLocalSnapshot() {
 function migrateItem(item: DevisItem, index: number): DevisItem {
   if (isCustomProjectItem(item)) {
     const stages = (item.customProject.stages ?? [])
-      .map((stage, stageIndex) => ({ ...stage, order: stageIndex }))
+      .map((stage, stageIndex) => ({
+        ...stage,
+        order: stageIndex,
+        printCategory:
+          stage.kind === 'print'
+            ? stage.printCategory ?? stage.machine?.kind ?? (item.customProject.printCategory === 'digital' || item.customProject.printCategory === 'offset' ? item.customProject.printCategory : undefined)
+            : undefined,
+        fieldValues: stage.fieldValues ?? {},
+      }))
       .sort((a, b) => a.order - b.order);
     const customProject = {
       ...item.customProject,
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
       completion: item.customProject.completion ?? 'draft',
+      projectFieldValues: item.customProject.projectFieldValues ?? {},
       stages,
     };
     const complete = customProject.completion === 'complete';
@@ -253,6 +269,35 @@ function normalizeDevis(devis: Devis): Devis {
   };
 }
 
+function legacyStageKind(stageId: string): ProductionStageKind {
+  if (stageId === 'impression') return 'print';
+  if (stageId === 'coupe' || stageId === 'cutcontour') return 'cut';
+  if (stageId === 'pliage') return 'assembly';
+  if (stageId === 'pelliculage' || stageId === 'finition') return 'finishing';
+  if (stageId === 'livraison') return 'packaging';
+  return 'other';
+}
+
+function legacyStageTemplate(service: Service, stageId: string, index: number): ServiceStageTemplate {
+  const labelMap: Record<string, string> = {
+    impression: 'مرحلة الطباعة',
+    pliage: 'مرحلة الطي',
+    pelliculage: 'مرحلة Pelliculage',
+    coupe: 'مرحلة القص',
+    cutcontour: 'مرحلة CutContour',
+    finition: 'مرحلة التشطيب',
+    livraison: 'مرحلة التسليم',
+  };
+  return {
+    id: uid('stage'),
+    order: index,
+    name: labelMap[stageId] ?? stageId,
+    kind: legacyStageKind(stageId),
+    montageMode: stageId === 'impression' ? service.montageMode ?? 'disabled' : 'disabled',
+    fieldBindings: stageId === 'impression' ? { quantityFieldId: service.fields.find((field) => field.id === 'quantity')?.id } : undefined,
+  };
+}
+
 function migrateStorage(): void {
   const current = Number(localStorage.getItem(SCHEMA_VERSION_KEY));
   const sections = readAll<Section>('sections');
@@ -267,13 +312,82 @@ function migrateStorage(): void {
     return { ...section, printCategory } as Section;
   });
   const services = readAll<Service>('services');
-  const migratedServices = services.map((service) => ({
-    ...service,
-    montageMode: service.montageMode ?? 'disabled',
-    designInputMode: service.designInputMode ?? (service.id === 'svc-carte-visite' ? 'fixed-template' : 'standard'),
+  const migratedServices = services.map((service) => {
+    const dimensionPricingFieldStillExists =
+      service.dimensionPricing &&
+      service.fields.some((field) => field.id === service.dimensionPricing?.fieldId && field.type === 'dimensions');
+    const stageTemplates = service.workflow === 'multiStage'
+      ? (service.stageTemplates?.length
+          ? service.stageTemplates
+          : (service.stages?.length ? service.stages : ['impression']).map((stageId, index) => legacyStageTemplate(service, stageId, index)))
+          .map((stage) => ({
+            ...stage,
+            montageMode: stage.kind === 'print' ? 'required' as const : 'disabled' as const,
+            fieldIds: stage.fieldIds ?? [],
+          }))
+      : service.stageTemplates;
+    const assignedFieldIds = new Set(stageTemplates?.flatMap((stage) => [
+      ...(stage.fieldIds ?? []),
+      ...Object.values(stage.fieldBindings ?? {}).filter((value): value is string => Boolean(value)),
+    ]) ?? []);
+    return {
+      ...service,
+      montageMode: service.montageMode ?? 'disabled',
+      designInputMode: service.designInputMode ?? (service.id === 'svc-carte-visite' ? 'fixed-template' : 'standard'),
+      workflow: service.workflow ?? 'standard',
+      ...(stageTemplates ? { stageTemplates } : {}),
+      ...(service.workflow === 'multiStage'
+        ? { projectFieldIds: service.projectFieldIds ?? service.fields.filter((field) => !assignedFieldIds.has(field.id)).map((field) => field.id) }
+        : {}),
+      ...(service.dimensionPricing && !dimensionPricingFieldStillExists ? { dimensionPricing: undefined } : {}),
+    };
+  });
+  const machines = readAll<Machine>('machines');
+  const migratedMachines = machines.map((machine) => ({
+    ...machine,
+    pricing: machine.pricing ?? {
+      basis: machine.kind === 'offset' ? 'per1000Faces' as const : 'perFace' as const,
+      rate: Math.max(0, machine.costPerFace ?? 0),
+      setupCost: 0,
+      minimumCharge: 0,
+    },
+  }));
+  const papers = readAll<PaperType>('papers');
+  const migratedPapers = papers.map((paper) => ({
+    ...paper,
+    variants: paper.variants?.length
+      ? paper.variants
+      : [{
+          id: `${paper.id}-legacy-size`,
+          label: 'كل المقاسات',
+          widthMm: 0,
+          heightMm: 0,
+          pricePerSheet: paper.pricePerSheet,
+          enabled: paper.enabled,
+        }],
   }));
   const rows = readAll<Devis>('devis');
-  const migrated = rows.map(normalizeDevis);
+  const serviceMap = new Map(migratedServices.map((service) => [service.id, service]));
+  const sectionMap = new Map(migratedSections.map((section) => [section.id, section]));
+  const migrated = rows.map(normalizeDevis).map((devis) => {
+    if (devis.status !== 'draft') return devis;
+    let converted = false;
+    const items = devis.items.map((item, index) => {
+      if (isCustomProjectItem(item)) return item;
+      const source = serviceMap.get(item.serviceId);
+      const sourceSection = source ? sectionMap.get(source.sectionId) : undefined;
+      if (!source || source.workflow !== 'multiStage' || !sourceSection) return item;
+      converted = true;
+      const marginPercent = devis.rulesSnapshot?.find((rule) => rule.enabled && rule.basis === 'percent' && (rule.kind === 'margin' || rule.id.includes('margin')))?.value ?? 0;
+      const project = projectFromServiceTemplate(sourceSection, source, marginPercent);
+      project.name = source.name;
+      project.finalQuantity = Math.max(1, item.quantity || 1);
+      project.projectFieldValues = { ...(item.fieldValues ?? {}) };
+      project.stages = project.stages.map((stage) => ({ ...stage, quantity: project.finalQuantity, montageState: undefined, montageResult: undefined }));
+      return buildCustomProjectItem(item.id, item.order ?? index, project, devis.rulesSnapshot ?? []);
+    });
+    return converted ? normalizeDevis({ ...devis, items }) : devis;
+  });
   const changed =
     current !== DATA_VERSION ||
     rows.length !== migrated.length ||
@@ -283,6 +397,12 @@ function migrateStorage(): void {
   }
   if (services.some((row, index) => JSON.stringify(row) !== JSON.stringify(migratedServices[index]))) {
     writeAll('services', migratedServices);
+  }
+  if (machines.some((row, index) => JSON.stringify(row) !== JSON.stringify(migratedMachines[index]))) {
+    writeAll('machines', migratedMachines);
+  }
+  if (papers.some((row, index) => JSON.stringify(row) !== JSON.stringify(migratedPapers[index]))) {
+    writeAll('papers', migratedPapers);
   }
   if (changed) writeAll('devis', migrated);
   localStorage.setItem(SCHEMA_VERSION_KEY, String(DATA_VERSION));

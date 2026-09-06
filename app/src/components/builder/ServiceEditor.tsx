@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { motion } from 'framer-motion';
 import { Archive, Copy, Eye, MoreHorizontal, Pencil } from 'lucide-react';
 import { toast } from 'sonner';
-import type { DesignInputMode, MontageMode, Section, Service } from '@/lib/types';
+import type { DesignInputMode, MontageMode, Section, Service, ServiceWorkflow } from '@/lib/types';
 import { db, uid } from '@/lib/storage';
 import { Chip, Modal, Btn } from '@/components/settings/Overlay';
 import { SERVICE_BASIS_LABELS, type BuilderMeta } from './meta';
@@ -14,13 +14,14 @@ import { logAudit } from '@/components/settings/audit';
 import { cn } from '@/lib/utils';
 
 const TABS = [
-  { id: 'fields', label: 'الحقول' },
-  { id: 'rules', label: 'قواعد التسعير' },
-  { id: 'stages', label: 'المراحل' },
-  { id: 'preview', label: 'معاينة' },
+  { id: 'fields', label: 'الحقول', hint: 'الأسئلة والاختيارات التي تظهر عند إنشاء Devis.' },
+  { id: 'rules', label: 'التسعير', hint: 'السعر المعتمد لكل اختيار داخل هذه الخدمة.' },
+  { id: 'stages', label: 'الإنتاج', hint: 'ترتيب العمل داخل الورشة، بدون تفاصيل مالية.' },
+  { id: 'preview', label: 'معاينة', hint: 'جرّب الخدمة كما ستظهر للمستخدم اليومي.' },
 ] as const;
 
 type TabId = (typeof TABS)[number]['id'];
+type ServiceBasis = 'perCopy' | 'perM2' | 'perCm2' | 'fixed';
 
 interface Props {
   service: Service | null;
@@ -30,6 +31,14 @@ interface Props {
   refresh: () => void;
   rulesKey: number;
   onRulesChanged: () => void;
+}
+
+function inferServiceBasis(service: Service): ServiceBasis {
+  if (service.dimensionPricing?.mode === 'perCm2') return 'perCm2';
+  if (service.dimensionPricing && service.dimensionPricing.mode !== 'none') return 'perM2';
+  if (service.fields.some((field) => field.options?.some((option) => option.deltaUnit === 'perCm2'))) return 'perCm2';
+  if (service.fields.some((field) => field.options?.some((option) => option.deltaUnit === 'perM2'))) return 'perM2';
+  return 'perCopy';
 }
 
 /** Pane 3 — service editor with 4 tabs. */
@@ -42,7 +51,7 @@ export default function ServiceEditor({ service, section, meta, setMeta, refresh
 
   if (!service) {
     return (
-      <div className="grid flex-1 place-items-center bg-[var(--paper-50)] text-[13px] text-[var(--ink-400)]">
+      <div className="grid min-w-0 place-items-center bg-[var(--paper-50)] text-[13px] text-[var(--ink-400)]">
         اختر خدمة من القائمة — أو أنشئ خدمة جديدة
       </div>
     );
@@ -78,7 +87,8 @@ export default function ServiceEditor({ service, section, meta, setMeta, refresh
     refresh();
   };
 
-  const basis = meta.serviceBasis[service.id] ?? 'perCopy';
+  const basis = meta.serviceBasis[service.id] ?? inferServiceBasis(service);
+  const activeTab = TABS.find((item) => item.id === tab) ?? TABS[0];
 
   return (
     <motion.div
@@ -89,7 +99,8 @@ export default function ServiceEditor({ service, section, meta, setMeta, refresh
       className="flex min-w-0 flex-1 flex-col overflow-y-auto bg-[var(--paper-50)]"
     >
       {/* header */}
-      <div className="flex flex-wrap items-center gap-3 border-b border-[var(--line)] bg-white px-5 py-4">
+      <div className="border-b border-[var(--line)] bg-white px-5 py-4">
+        <div className="flex flex-wrap items-start gap-3">
         {renaming ? (
           <input
             autoFocus
@@ -120,38 +131,13 @@ export default function ServiceEditor({ service, section, meta, setMeta, refresh
             {service.latinName}
           </span>
         )}
-        <Chip tint="cyan">{SERVICE_BASIS_LABELS[basis]}</Chip>
-        <label className="flex items-center gap-2 text-[11px] text-[var(--ink-500)]">
-          المونتاج في Devis
-          <select
-            value={section?.printCategory === 'other' ? 'disabled' : service.montageMode ?? 'disabled'}
-            disabled={!section || section.printCategory === 'other'}
-            onChange={(event) => update({ montageMode: event.target.value as MontageMode })}
-            className="h-8 rounded-[7px] border border-[var(--line-strong)] bg-white px-2 text-[12px] disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <option value="disabled">معطل</option>
-            <option value="optional">اختياري</option>
-            <option value="required">إجباري</option>
-          </select>
-        </label>
-        <label className="flex items-center gap-2 text-[11px] text-[var(--ink-500)]">
-          مدخل التصميم
-          <select
-            value={service.designInputMode ?? 'standard'}
-            onChange={(event) => update({ designInputMode: event.target.value as DesignInputMode })}
-            className="h-8 rounded-[7px] border border-[var(--line-strong)] bg-white px-2 text-[12px]"
-          >
-            <option value="standard">عادي</option>
-            <option value="fixed-template">قالب ثابت</option>
-          </select>
-        </label>
         <div className="ms-auto flex items-center gap-1.5">
           <button
             type="button"
             onClick={() => setTab('preview')}
             className="flex h-9 items-center gap-1.5 rounded-[8px] px-3 text-[13px] font-medium text-[var(--ink-500)] transition-colors hover:bg-[var(--paper-100)] hover:text-[var(--cyan-600)]"
           >
-            <Eye size={15} /> معاينة في المعالج
+            <Eye size={15} /> معاينة
           </button>
           <div className="relative">
             <button
@@ -174,11 +160,51 @@ export default function ServiceEditor({ service, section, meta, setMeta, refresh
             )}
           </div>
         </div>
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-center gap-2 rounded-[10px] bg-[var(--paper-100)] px-3 py-2">
+          <label className="flex items-center gap-2 text-[12px] text-[var(--ink-600)]">
+            نوع الخدمة
+            <select
+              value={service.workflow ?? 'standard'}
+              onChange={(event) => update({ workflow: event.target.value as ServiceWorkflow })}
+              className="h-8 rounded-[7px] border border-[var(--line-strong)] bg-white px-2 text-[12px]"
+            >
+              <option value="standard">خدمة عادية</option>
+              <option value="multiStage">مشروع متعدد المراحل</option>
+            </select>
+          </label>
+          <Chip tint="cyan">التسعير: {SERVICE_BASIS_LABELS[basis]}</Chip>
+        <label className="flex items-center gap-2 text-[12px] text-[var(--ink-600)]">
+          المونتاج
+          <select
+            value={section?.printCategory === 'other' ? 'disabled' : service.montageMode ?? 'disabled'}
+            disabled={!section || section.printCategory === 'other'}
+            onChange={(event) => update({ montageMode: event.target.value as MontageMode })}
+            className="h-8 rounded-[7px] border border-[var(--line-strong)] bg-white px-2 text-[12px] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <option value="disabled">معطل</option>
+            <option value="optional">اختياري</option>
+            <option value="required">إجباري</option>
+          </select>
+        </label>
+        <label className="flex items-center gap-2 text-[12px] text-[var(--ink-600)]">
+          نوع القالب
+          <select
+            value={service.designInputMode ?? 'standard'}
+            onChange={(event) => update({ designInputMode: event.target.value as DesignInputMode })}
+            className="h-8 rounded-[7px] border border-[var(--line-strong)] bg-white px-2 text-[12px]"
+          >
+            <option value="standard">خدمة عادية</option>
+            <option value="fixed-template">قالب ثابت</option>
+          </select>
+        </label>
+        </div>
       </div>
 
       {/* tabs */}
       <div className="border-b border-[var(--line)] bg-white px-5">
-        <div className="flex gap-1">
+        <div className="flex gap-1 overflow-x-auto">
           {TABS.map((t) => (
             <button
               key={t.id}
@@ -200,11 +226,18 @@ export default function ServiceEditor({ service, section, meta, setMeta, refresh
             </button>
           ))}
         </div>
+        <p className="pb-3 text-[12px] text-[var(--ink-500)]">{activeTab.hint}</p>
       </div>
 
-      <div className="flex-1 p-5">
-        {tab === 'fields' && <FieldsTab service={service} onUpdate={update} />}
-        {tab === 'rules' && <RulesTab service={service} rulesKey={rulesKey} onRulesChanged={onRulesChanged} />}
+      <div className="min-w-0 flex-1 overflow-x-hidden p-5">
+        {tab === 'fields' && (
+          <FieldsTab
+            service={service}
+            pricingBasis={basis}
+            onUpdate={update}
+          />
+        )}
+        {tab === 'rules' && <RulesTab service={service} rulesKey={rulesKey} onRulesChanged={onRulesChanged} onUpdate={update} />}
         {tab === 'stages' && <StagesTab service={service} meta={meta} setMeta={setMeta} onUpdate={update} />}
         {tab === 'preview' && <PreviewTab service={service} rulesKey={rulesKey} />}
       </div>
